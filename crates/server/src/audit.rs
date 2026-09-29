@@ -35,6 +35,9 @@ pub enum Action {
     PolicyUpdate,
     EnrollmentCreate,
     AgentEnroll,
+    ViewerSessionCreate,
+    ViewerConnect,
+    ViewerDisconnect,
 }
 
 impl Action {
@@ -48,6 +51,9 @@ impl Action {
             Action::PolicyUpdate => "policy.update",
             Action::EnrollmentCreate => "enrollment.create",
             Action::AgentEnroll => "agent.enroll",
+            Action::ViewerSessionCreate => "viewer.session_create",
+            Action::ViewerConnect => "viewer.connect",
+            Action::ViewerDisconnect => "viewer.disconnect",
         }
     }
 }

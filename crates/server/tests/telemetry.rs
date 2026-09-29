@@ -79,8 +79,12 @@ async fn heartbeat_telemetry_is_stored_and_served_by_the_api() {
     let (acks_tx, mut acks) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move { agent.run(Some(acks_tx)).await });
     timeout(Duration::from_secs(10), async {
-        for _ in 0..3 {
-            acks.recv().await.unwrap();
+        // Count heartbeat acks only (the agent also sees ListMonitors).
+        let mut n = 0;
+        while n < 3 {
+            if let agent::AgentEvent::Ack { .. } = acks.recv().await.unwrap() {
+                n += 1;
+            }
         }
     })
     .await

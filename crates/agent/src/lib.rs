@@ -14,6 +14,7 @@
 pub mod core;
 pub mod credstore;
 pub mod enroll;
+pub mod media;
 pub mod paths;
 pub mod session;
 pub mod telemetry;
@@ -27,12 +28,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::Identity;
+use protocol::media::VideoPayload;
 use protocol::{close_code, read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use quinn::rustls::pki_types::CertificateDer;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
+use crate::media::source::{MediaCommand, MediaEvent, MediaLink};
 use crate::telemetry::TelemetrySource;
 
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -53,12 +56,18 @@ pub struct AgentConfig {
     pub bind_addr: Option<SocketAddr>,
     /// Telemetry to attach to heartbeats, if any.
     pub telemetry: Option<Arc<dyn TelemetrySource>>,
+    /// Screen source for streaming, if any (Windows: the session helper).
+    pub media: Option<Arc<MediaLink>>,
 }
 
 /// What the agent observed, for tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
-    Ack { seq: u64 },
+    Ack {
+        seq: u64,
+    },
+    /// A streaming command arrived from the server.
+    Media(MediaCommand),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +97,7 @@ pub struct AgentSession {
     agent_id: String,
     heartbeat_interval: Duration,
     telemetry: Option<Arc<dyn TelemetrySource>>,
+    media: Option<Arc<MediaLink>>,
 }
 
 /// Connect to the server and complete the mutual-TLS handshake.
@@ -112,6 +122,7 @@ pub async fn connect(config: &AgentConfig) -> Result<AgentSession, AgentError> {
         agent_id: config.agent_id.clone(),
         heartbeat_interval: config.heartbeat_interval,
         telemetry: config.telemetry.clone(),
+        media: config.media.clone(),
     })
 }
 
@@ -147,24 +158,37 @@ impl AgentSession {
         self.endpoint.rebind(socket)
     }
 
-    /// Send Hello, then heartbeat until the connection or stream ends.
+    /// Send Hello, then heartbeat until the connection or stream ends,
+    /// serving the server's streaming commands if a media source is attached.
     ///
     /// Only returns on failure; a healthy session runs forever.
     pub async fn run(&self, events: Option<UnboundedSender<AgentEvent>>) -> Result<(), AgentError> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &Message::Hello {
-                agent_id: self.agent_id.clone(),
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await?;
+        // Everything written on the control stream goes through one channel,
+        // so heartbeats, monitor lists and replies never interleave.
+        let (outbox_tx, mut outbox) = mpsc::unbounded_channel::<Message>();
+        let _ = outbox_tx.send(Message::Hello {
+            agent_id: self.agent_id.clone(),
+            version: PROTOCOL_VERSION,
+        });
+        if let Some(media) = &self.media {
+            // Fresh connection, fresh start: any stream from a previous
+            // connection has no viewers any more.
+            let _ = media.commands.send(MediaCommand::Stop);
+        }
+
+        let writer = async {
+            while let Some(msg) = outbox.recv().await {
+                write_frame(&mut send, &msg).await?;
+            }
+            Ok::<(), AgentError>(())
+        };
 
         let heartbeats = async {
             let mut ticker = tokio::time::interval(self.heartbeat_interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            for seq in 0u64.. {
+            let mut seq = 0u64;
+            loop {
                 ticker.tick().await;
                 let telemetry = match &self.telemetry {
                     Some(source) => {
@@ -175,39 +199,99 @@ impl AgentSession {
                     }
                     None => None,
                 };
-                write_frame(
-                    &mut send,
-                    &Message::Heartbeat {
-                        ts: unix_millis(),
-                        seq,
-                        telemetry,
-                    },
-                )
-                .await?;
+                let heartbeat = Message::Heartbeat {
+                    ts: unix_millis(),
+                    seq,
+                    telemetry,
+                };
+                if outbox_tx.send(heartbeat).is_err() {
+                    // The writer has stopped; it reports why.
+                    return Ok::<(), AgentError>(());
+                }
+                seq += 1;
             }
-            unreachable!("heartbeat sequence exhausted")
         };
 
-        let acks = async {
+        let reader = async {
             loop {
-                match read_frame(&mut recv).await? {
-                    Some(Message::HeartbeatAck { seq }) => {
+                let msg = match read_frame(&mut recv).await? {
+                    Some(msg) => msg,
+                    None => return Err(AgentError::StreamClosed),
+                };
+                let command = match msg {
+                    Message::HeartbeatAck { seq } => {
                         info!(seq, "heartbeat acked");
                         if let Some(tx) = &events {
                             let _ = tx.send(AgentEvent::Ack { seq });
                         }
+                        continue;
                     }
-                    Some(other) => return Err(AgentError::Unexpected(other)),
-                    None => return Err(AgentError::StreamClosed),
+                    Message::ListMonitors => MediaCommand::ListMonitors,
+                    Message::StartStream { monitor } => MediaCommand::Start { monitor },
+                    Message::StopStream => MediaCommand::Stop,
+                    Message::RequestKeyframe => MediaCommand::ForceKeyframe,
+                    other => return Err(AgentError::Unexpected(other)),
+                };
+                info!(?command, "stream command from server");
+                if let Some(tx) = &events {
+                    let _ = tx.send(AgentEvent::Media(command.clone()));
+                }
+                match &self.media {
+                    Some(media) => {
+                        let _ = media.commands.send(command);
+                    }
+                    None => warn!(
+                        "server asked for screen streaming, but this agent has no capture source"
+                    ),
                 }
             }
         };
 
+        // Monitor lists go on the control stream; frames on a video stream,
+        // opened on the first frame and reused for the connection.
+        let pump = async {
+            let Some(media) = &self.media else {
+                return std::future::pending::<Result<(), AgentError>>().await;
+            };
+            let mut source = media.events.lock().await;
+            let mut video: Option<quinn::SendStream> = None;
+            let mut seq = 0u64;
+            while let Some(event) = source.recv().await {
+                match event {
+                    MediaEvent::Monitors(monitors) => {
+                        let _ = outbox_tx.send(Message::MonitorList { monitors });
+                    }
+                    MediaEvent::Frame(frame) => {
+                        let stream = match &mut video {
+                            Some(stream) => stream,
+                            None => {
+                                info!(monitor = frame.monitor, "opening video stream to server");
+                                video.insert(self.connection.open_uni().await?)
+                            }
+                        };
+                        let payload = VideoPayload {
+                            monitor: frame.monitor,
+                            pts_us: frame.pts_us,
+                            width: frame.width,
+                            height: frame.height,
+                            h264: frame.h264,
+                        };
+                        write_frame(stream, &payload.to_frame(seq, frame.keyframe)).await?;
+                        seq += 1;
+                    }
+                }
+            }
+            // The source went away; keep the control connection up anyway.
+            std::future::pending().await
+        };
+
         // Each branch only finishes on error. read_frame is not cancel-safe,
-        // which is fine: the loser is dropped along with the session.
+        // which is fine: the losers are dropped along with the session.
         let result: Result<(), AgentError> = tokio::select! {
+            res = writer => res,
             res = heartbeats => res,
-            res = acks => res,
+            res = reader => res,
+            res = pump => res,
         };
         if let Err(AgentError::Unexpected(msg)) = &result {
             warn!(?msg, "closing connection after protocol violation");

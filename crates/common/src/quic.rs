@@ -45,6 +45,16 @@ fn transport(keep_alive: Option<Duration>) -> quinn::TransportConfig {
                 .expect("idle timeout fits in VarInt"),
         ))
         .keep_alive_interval(keep_alive);
+    // UDP segmentation offload (GSO on Linux, USO on Windows) lets quinn
+    // hand the NIC one large buffer to split into many packets. On Windows it
+    // is only as good as the NIC driver, and some drivers get it wrong: on a
+    // QEMU/virtio-net VM every segmented batch was silently dropped, so the
+    // first video burst stalled the whole connection (heartbeats included)
+    // until the idle timeout. At our bitrates the CPU it saves is negligible,
+    // so Windows endpoints do not use it.
+    if cfg!(windows) {
+        transport.enable_segmentation_offload(false);
+    }
     transport
 }
 

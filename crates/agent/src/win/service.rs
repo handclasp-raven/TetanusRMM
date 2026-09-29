@@ -20,10 +20,12 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
+use super::bridge::Bridge;
 use super::{acl, pipe, process};
 use crate::core::{self, CoreOptions};
 use crate::credstore::{Credential, CredentialStore};
 use crate::enroll::{self, EnrollRequest};
+use crate::media::source::media_channel;
 use crate::session::{Action, Backoff, Supervisor};
 use crate::telemetry::SystemTelemetry;
 use crate::update::VerifiedUpdate;
@@ -299,10 +301,13 @@ async fn service_body(
 
     let (status_tx, status_rx) = watch::channel(core::initial_status(None));
     let helper_pid = Arc::new(AtomicU32::new(0));
+    // Screen streaming: the core talks to the helper through the bridge.
+    let (media_link, media_source) = media_channel();
+    let bridge = Bridge::start(media_source);
     tokio::spawn({
         let helper_pid = helper_pid.clone();
         async move {
-            if let Err(e) = pipe::serve(status_rx, helper_pid).await {
+            if let Err(e) = pipe::serve(status_rx, helper_pid, Some(bridge)).await {
                 error!("helper pipe server stopped: {e}");
             }
         }
@@ -322,6 +327,7 @@ async fn service_body(
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             update_interval: UPDATE_INTERVAL,
             telemetry: Some(Arc::new(SystemTelemetry::new())),
+            media: Some(Arc::new(media_link)),
         };
         core::run(&credential, options, status_tx).await
     };

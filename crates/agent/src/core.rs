@@ -25,6 +25,8 @@ pub struct CoreOptions {
     /// Zero disables update checks.
     pub update_interval: Duration,
     pub telemetry: Option<Arc<dyn TelemetrySource>>,
+    /// Screen source for streaming (Windows service: the session helper).
+    pub media: Option<Arc<crate::media::source::MediaLink>>,
 }
 
 pub fn version() -> &'static str {
@@ -48,6 +50,7 @@ pub async fn run(
 ) -> anyhow::Result<VerifiedUpdate> {
     let mut config = credential.agent_config(options.heartbeat_interval)?;
     config.telemetry = options.telemetry;
+    config.media = options.media;
     tokio::select! {
         () = connect_forever(&config, &status) => unreachable!("connect_forever never returns"),
         update = update_loop(credential, options.update_interval) => Ok(update),

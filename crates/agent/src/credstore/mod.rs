@@ -58,6 +58,7 @@ impl Credential {
             heartbeat_interval,
             bind_addr: None,
             telemetry: None,
+            media: None,
         })
     }
 }

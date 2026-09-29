@@ -33,6 +33,21 @@ enum Command {
     /// Session helper started by the service in the user's session (internal).
     #[command(hide = true)]
     Helper,
+    /// Capture and encode the screen to a raw .h264 file (development aid;
+    /// Windows only, run in an interactive session).
+    #[command(hide = true)]
+    CaptureTest {
+        #[arg(long, default_value_t = 0)]
+        monitor: u32,
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        #[arg(long, default_value = "capture.h264")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        #[arg(long, default_value_t = 4_000_000)]
+        bitrate: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +131,13 @@ fn main() -> anyhow::Result<()> {
         // These two set up their own logging (to files) and runtimes.
         Command::Service(ServiceCommand::Run) => service_run(),
         Command::Helper => helper(),
+        Command::CaptureTest {
+            monitor,
+            seconds,
+            out,
+            fps,
+            bitrate,
+        } => capture_test(monitor, seconds, &out, fps, bitrate),
         command => {
             common::logging::init();
             tokio::runtime::Runtime::new()?.block_on(console(command))
@@ -128,7 +150,7 @@ async fn console(command: Command) -> anyhow::Result<()> {
         Command::Enroll(args) => enroll(args).await,
         Command::Run(args) => run(args).await,
         Command::Service(command) => service(command),
-        Command::Helper => unreachable!(),
+        Command::Helper | Command::CaptureTest { .. } => unreachable!(),
     }
 }
 
@@ -176,6 +198,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         heartbeat_interval: Duration::from_secs(args.heartbeat_secs.max(1)),
         update_interval: Duration::from_secs(args.update_interval_secs),
         telemetry: Some(Arc::new(SystemTelemetry::new())),
+        media: None,
     };
     tokio::select! {
         update = agent::core::run(&credential, options, status) => install_and_relaunch(&paths, update?),
@@ -223,6 +246,23 @@ fn service_run() -> anyhow::Result<()> {
 #[cfg(windows)]
 fn helper() -> anyhow::Result<()> {
     agent::win::helper::run()
+}
+
+#[cfg(windows)]
+fn capture_test(
+    monitor: u32,
+    seconds: u64,
+    out: &std::path::Path,
+    fps: u32,
+    bitrate: u32,
+) -> anyhow::Result<()> {
+    common::logging::init();
+    agent::win::capture_test::run(monitor, seconds, out, fps, bitrate)
+}
+
+#[cfg(not(windows))]
+fn capture_test(_: u32, _: u64, _: &std::path::Path, _: u32, _: u32) -> anyhow::Result<()> {
+    bail!("screen capture is only available on Windows")
 }
 
 #[cfg(not(windows))]

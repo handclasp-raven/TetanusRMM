@@ -34,6 +34,8 @@ totp-rs.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+openh264.workspace = true
+viewer = { path = "../viewer" }
 rcgen.workspace = true
 x509-parser = "0.18"
 tempfile.workspace = true

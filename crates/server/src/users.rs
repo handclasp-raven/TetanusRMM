@@ -28,6 +28,11 @@ impl Role {
         matches!(self, Role::Admin)
     }
 
+    /// Whether this role may watch agents' screens.
+    pub fn can_view_desktop(self) -> bool {
+        matches!(self, Role::Admin | Role::SupportEngineer)
+    }
+
     /// Whether this role may create agent download links.
     pub fn can_create_enrollment_links(self) -> bool {
         matches!(self, Role::Admin | Role::SupportEngineer)
@@ -141,6 +146,13 @@ mod tests {
         assert!(Role::Admin.can_edit_policies());
         assert!(!Role::SupportEngineer.can_edit_policies());
         assert!(!Role::Auditor.can_edit_policies());
+    }
+
+    #[test]
+    fn auditors_cannot_view_desktops() {
+        assert!(Role::Admin.can_view_desktop());
+        assert!(Role::SupportEngineer.can_view_desktop());
+        assert!(!Role::Auditor.can_view_desktop());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 pub mod framing;
 pub mod ipc;
+pub mod media;
 pub mod update;
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,9 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 /// - 1: Phase 1-3.
 /// - 2: `Heartbeat` gained `telemetry`. A version-1 agent's heartbeats no
 ///   longer decode, so it is disconnected; it can still self-update over HTTPS.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// - 3: screen streaming messages (appended variants only; a version-2 agent
+///   still works, it just cannot stream).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// ALPN identifier negotiated during the TLS handshake. Both ends must agree.
 pub const ALPN: &[u8] = b"rmm/1";
@@ -53,6 +56,41 @@ pub enum Message {
         /// Base URL of the server's HTTPS API (for updates).
         api_url: String,
     },
+
+    // --- Screen streaming (Phase 5) -------------------------------------
+    //
+    // Viewers connect to the server, never to the agent (agents are behind
+    // NAT). The server relays; see `media` for the video streams themselves.
+    /// Viewer's first message on its control stream: a short-lived,
+    /// single-use viewer-session token from the HTTPS API.
+    ViewerHello { token: String, version: u32 },
+    /// Server to viewer after a valid `ViewerHello`.
+    ViewerWelcome {
+        agent_id: String,
+        monitors: Vec<media::MonitorInfo>,
+        /// Monitor currently being streamed, if a stream is running.
+        active_monitor: Option<u32>,
+    },
+    /// Agent to server (and server to viewers): the agent's displays.
+    /// Sent in reply to `ListMonitors` and whenever they change.
+    MonitorList { monitors: Vec<media::MonitorInfo> },
+    /// Server to agent: send a fresh `MonitorList`.
+    ListMonitors,
+    /// Viewer to server: show this monitor. The server turns it into
+    /// `StartStream` for the agent; the choice is shared by all viewers of
+    /// that agent, since the agent encodes a single stream.
+    SelectMonitor { monitor: u32 },
+    /// Server to agent: capture and encode `monitor`, sending frames on a new
+    /// unidirectional stream. Replaces any stream already running.
+    StartStream { monitor: u32 },
+    /// Server to agent: no viewers left; stop capturing.
+    StopStream,
+    /// Server to agent (or viewer to server): encode a keyframe as soon as
+    /// possible, e.g. because a viewer joined mid-stream.
+    RequestKeyframe,
+    /// Server to viewer: the stream now shows `monitor` (another viewer may
+    /// have switched it).
+    StreamMonitor { monitor: u32 },
 }
 
 /// Agent health sample, sent on each heartbeat.
@@ -77,6 +115,8 @@ pub mod close_code {
     /// Enrollment token rejected, or client certificate not (or no longer)
     /// registered to the claimed agent.
     pub const UNAUTHORIZED: u32 = 2;
+    /// A viewer asked for an agent that is not connected (or disconnected).
+    pub const AGENT_OFFLINE: u32 = 3;
 }
 
 #[cfg(test)]

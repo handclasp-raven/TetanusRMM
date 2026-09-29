@@ -144,6 +144,16 @@ pub async fn start_api(pool: PgPool) -> Api {
 
 /// HTTPS API presenting `certs`' server certificate and serving `updates_dir`.
 pub async fn start_api_with(pool: PgPool, certs: &DevCerts, updates_dir: PathBuf) -> Api {
+    start_api_full(pool, certs, updates_dir, None).await
+}
+
+/// [`start_api_with`], sharing the QUIC server's relay hub.
+pub async fn start_api_full(
+    pool: PgPool,
+    certs: &DevCerts,
+    updates_dir: PathBuf,
+    hub: Option<Arc<server::relay::Hub>>,
+) -> Api {
     let tls = common::tls::https_server_config(&certs.server_identity().unwrap()).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!(
@@ -156,6 +166,7 @@ pub async fn start_api_with(pool: PgPool, certs: &DevCerts, updates_dir: PathBuf
         auth: AuthSettings::default(),
         public_url: base.clone(),
         updates_dir,
+        hub,
     });
     tokio::spawn(api::serve(listener, tls, app, handle.clone()));
 

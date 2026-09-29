@@ -21,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, QS_ALLINPUT,
 };
 
+use super::stream::{self, WorkerCommand};
 use crate::core;
 
 /// Windows error code when all pipe instances are busy.
@@ -62,31 +63,62 @@ fn current_session_id() -> Option<u32> {
     Some(session)
 }
 
+/// Frames and monitor lists queued for the service. Small: if the service
+/// is not keeping up, the capture worker drops frames instead.
+const OUT_QUEUE: usize = 8;
+
 async fn pipe_client(ui: &mpsc::Sender<UiEvent>, session_id: u32) -> std::io::Result<()> {
-    let mut pipe = connect().await?;
-    write_frame(
-        &mut pipe,
-        &IpcMessage::HelperHello {
+    let pipe = connect().await?;
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<IpcMessage>(OUT_QUEUE);
+    // Hello first; the channel keeps order.
+    let _ = out_tx
+        .send(IpcMessage::HelperHello {
             pid: std::process::id(),
             session_id,
             version: core::version().to_owned(),
-        },
-    )
-    .await
-    .map_err(std::io::Error::other)?;
+        })
+        .await;
+    let worker = stream::spawn(out_tx);
     info!("connected to service");
-    while let Some(message) = read_frame::<_, IpcMessage>(&mut pipe)
-        .await
-        .map_err(std::io::Error::other)?
-    {
-        if let IpcMessage::Status(status) = message {
-            info!(tooltip = %status.tooltip(), "status from service");
-            if ui.send(UiEvent::Status(status)).is_err() {
+
+    let write = async {
+        while let Some(message) = out_rx.recv().await {
+            write_frame(&mut writer, &message)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let read = async {
+        while let Some(message) = read_frame::<_, IpcMessage>(&mut reader)
+            .await
+            .map_err(std::io::Error::other)?
+        {
+            let command = match message {
+                IpcMessage::Status(status) => {
+                    info!(tooltip = %status.tooltip(), "status from service");
+                    if ui.send(UiEvent::Status(status)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                IpcMessage::ListMonitors => WorkerCommand::ListMonitors,
+                IpcMessage::StartCapture { monitor } => WorkerCommand::Start { monitor },
+                IpcMessage::StopCapture => WorkerCommand::Stop,
+                IpcMessage::ForceKeyframe => WorkerCommand::ForceKeyframe,
+                _ => continue,
+            };
+            if worker.send(command).is_err() {
                 break;
             }
         }
+        Ok(())
+    };
+    tokio::select! {
+        r = write => r,
+        r = read => r,
     }
-    Ok(())
 }
 
 async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {

@@ -11,6 +11,7 @@
 //! | GET    | /api/agents/{id}/policy     | session         |
 //! | PUT    | /api/agents/{id}/policy     | session (admin) |
 //! | POST   | /api/enrollment-links       | session (admin, support_engineer) |
+//! | POST   | /api/agents/{id}/viewer-sessions | session (admin, support_engineer) |
 //! | GET    | /api/download/{platform}?token= | enrollment token |
 //! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
 //! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
@@ -41,6 +42,7 @@ use crate::enroll;
 use crate::registry::{self, Agent, DevicePolicy, PolicyError};
 use crate::updates;
 use crate::users::User;
+use crate::viewers::{self, ViewerError};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,6 +52,8 @@ pub struct AppState {
     pub public_url: String,
     /// Where published agent updates live (see `crate::updates`).
     pub updates_dir: PathBuf,
+    /// The media relay, to report whether an agent is online.
+    pub hub: Option<Arc<crate::relay::Hub>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -62,6 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(list_agents))
         .route("/api/agents/{id}/policy", get(get_policy).put(put_policy))
         .route("/api/enrollment-links", post(create_enrollment_link))
+        .route(
+            "/api/agents/{id}/viewer-sessions",
+            post(create_viewer_session),
+        )
         .route("/api/download/{platform}", get(download_agent))
         .route("/api/updates/{platform}/manifest", get(update_manifest))
         .route("/api/updates/{platform}/binary", get(update_binary))
@@ -401,4 +409,36 @@ async fn serve_update_file(dir: &FsPath, platform: &str, name: &str) -> Result<R
         Body::from_stream(tokio_util::io::ReaderStream::new(file)),
     )
         .into_response())
+}
+
+#[derive(Serialize)]
+struct ViewerSessionResponse {
+    /// Pass to the viewer (`--token` or `RMM_VIEWER_TOKEN`). Single use.
+    token: String,
+    expires_at: DateTime<Utc>,
+    agent_id: String,
+    /// Whether the agent is connected right now.
+    online: bool,
+}
+
+/// Mint a short-lived token for watching one agent's screen.
+async fn create_viewer_session(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+) -> Result<Json<ViewerSessionResponse>, ApiError> {
+    let minted = viewers::create(&state.pool, &session.user, &agent_id)
+        .await
+        .map_err(|e| match e {
+            ViewerError::Forbidden => ApiError::Forbidden,
+            ViewerError::UnknownAgent => ApiError::NotFound,
+            ViewerError::InvalidToken => ApiError::Internal(e.to_string()),
+            ViewerError::Db(e) => e.into(),
+        })?;
+    Ok(Json(ViewerSessionResponse {
+        token: minted.token,
+        expires_at: minted.expires_at,
+        online: state.hub.as_ref().is_some_and(|h| h.is_online(&agent_id)),
+        agent_id,
+    }))
 }

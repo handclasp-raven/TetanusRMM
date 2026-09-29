@@ -41,6 +41,7 @@ fn agent_config(server_addr: SocketAddr, trust: &DevCerts, client: &DevCerts) ->
         heartbeat_interval: HEARTBEAT,
         bind_addr: Some(LOOPBACK.parse().unwrap()),
         telemetry: None,
+        media: None,
     }
 }
 
@@ -101,8 +102,15 @@ async fn agent_says_hello_and_heartbeats_are_acked() {
         heartbeats(e).len() >= 2
     })
     .await;
-    let mut acks = Vec::new();
-    collect_until(&mut agent_rx, &mut acks, |a| a.len() >= 2).await;
+    // Besides acks the agent sees the server's ListMonitors request (it has
+    // no screen source here); only the acks matter for this test.
+    let is_ack = |e: &&AgentEvent| matches!(e, AgentEvent::Ack { .. });
+    let mut events = Vec::new();
+    collect_until(&mut agent_rx, &mut events, |e| {
+        e.iter().filter(is_ack).count() >= 2
+    })
+    .await;
+    let acks: Vec<AgentEvent> = events.iter().filter(is_ack).cloned().collect();
 
     match &server_seen[0] {
         ServerEvent::Hello {

@@ -16,13 +16,14 @@ use std::sync::Arc;
 use protocol::ipc::{AgentStatus, IpcMessage, PIPE_NAME};
 use protocol::{read_frame, write_frame};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
 use super::acl::SecurityDescriptor;
+use super::bridge::Bridge;
 
 /// SYSTEM and Administrators: full. Interactive users: read/write.
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
@@ -39,8 +40,9 @@ fn client_pid(pipe: &NamedPipeServer) -> Option<u32> {
 pub async fn serve(
     status: watch::Receiver<AgentStatus>,
     helper_pid: Arc<AtomicU32>,
+    bridge: Option<Arc<Bridge>>,
 ) -> std::io::Result<()> {
-    serve_on(PIPE_NAME, status, helper_pid).await
+    serve_on(PIPE_NAME, status, helper_pid, bridge).await
 }
 
 /// [`serve`] on a given pipe name (tests use a unique one).
@@ -48,6 +50,7 @@ pub async fn serve_on(
     pipe_name: &str,
     status: watch::Receiver<AgentStatus>,
     helper_pid: Arc<AtomicU32>,
+    bridge: Option<Arc<Bridge>>,
 ) -> std::io::Result<()> {
     let sd = SecurityDescriptor::from_sddl(PIPE_SDDL).map_err(std::io::Error::other)?;
     let mut first = true;
@@ -77,7 +80,7 @@ pub async fn serve_on(
         match client_pid(&server) {
             Some(pid) if pid == expected && pid != 0 => {
                 info!(pid, "helper connected");
-                tokio::spawn(serve_helper(server, status.clone()));
+                tokio::spawn(serve_helper(server, status.clone(), bridge.clone()));
             }
             other => {
                 warn!(client = ?other, expected, "rejected pipe client that is not our helper");
@@ -86,8 +89,13 @@ pub async fn serve_on(
     }
 }
 
-async fn serve_helper(mut pipe: NamedPipeServer, mut status: watch::Receiver<AgentStatus>) {
-    match read_frame::<_, IpcMessage>(&mut pipe).await {
+async fn serve_helper(
+    pipe: NamedPipeServer,
+    mut status: watch::Receiver<AgentStatus>,
+    bridge: Option<Arc<Bridge>>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+    match read_frame::<_, IpcMessage>(&mut reader).await {
         Ok(Some(IpcMessage::HelperHello {
             pid,
             session_id,
@@ -98,18 +106,55 @@ async fn serve_helper(mut pipe: NamedPipeServer, mut status: watch::Receiver<Age
             return;
         }
     }
-    loop {
-        let current = status.borrow_and_update().clone();
-        if write_frame(&mut pipe, &IpcMessage::Status(current))
-            .await
-            .is_err()
-        {
-            break;
-        }
-        if status.changed().await.is_err() {
-            break;
-        }
+
+    // Commands for the helper from the media bridge.
+    let (to_helper, mut outbox) = mpsc::unbounded_channel::<IpcMessage>();
+    if let Some(bridge) = &bridge {
+        bridge.attach(to_helper.clone());
     }
+
+    // The first status goes out immediately.
+    status.mark_changed();
+    let write = async {
+        loop {
+            let message = tokio::select! {
+                changed = status.changed() => {
+                    if changed.is_err() { break; }
+                    IpcMessage::Status(status.borrow_and_update().clone())
+                }
+                Some(message) = outbox.recv() => message,
+            };
+            if write_frame(&mut writer, &message).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    let read = async {
+        loop {
+            match read_frame::<_, IpcMessage>(&mut reader).await {
+                Ok(Some(message)) => {
+                    if let Some(bridge) = &bridge {
+                        bridge.from_helper(message).await;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("helper pipe: {e}");
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        () = write => {}
+        () = read => {}
+    }
+    if let Some(bridge) = &bridge {
+        bridge.detach();
+    }
+    drop(to_helper);
     info!("helper disconnected");
 }
 
@@ -148,7 +193,7 @@ mod tests {
         let pid = Arc::new(AtomicU32::new(std::process::id()));
         tokio::spawn({
             let name = name.clone();
-            async move { serve_on(&name, rx, pid).await }
+            async move { serve_on(&name, rx, pid, None).await }
         });
 
         let mut client = loop {
@@ -180,7 +225,7 @@ mod tests {
         let pid = Arc::new(AtomicU32::new(1)); // not us
         tokio::spawn({
             let name = name.clone();
-            async move { serve_on(&name, rx, pid).await }
+            async move { serve_on(&name, rx, pid, None).await }
         });
         let mut client = loop {
             match ClientOptions::new().open(&name) {

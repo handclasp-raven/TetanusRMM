@@ -1,6 +1,6 @@
 [package]
 name = "viewer"
-description = "Native remote desktop viewer (placeholder until Phase 5)."
+description = "Cross-platform remote desktop viewer: connects to the server with a viewer-session token."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,5 +8,15 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 common.workspace = true
+font8x8.workspace = true
+openh264.workspace = true
+postcard.workspace = true
+protocol.workspace = true
+quinn.workspace = true
+softbuffer.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+winit.workspace = true

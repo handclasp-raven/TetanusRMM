@@ -8,7 +8,13 @@
 //! |---|---|---|
 //! | yes | `Hello` | Accepted if the cert is pinned to that agent id in the registry, then `Heartbeat`/`HeartbeatAck` |
 //! | no  | `Enroll` | Token consumed, certificate issued, `Enrolled` sent, connection ends |
+//! | no  | `ViewerHello` | Viewer token consumed; the viewer is subscribed to its agent's video via the relay |
 //! | anything else | | Closed with `PROTOCOL_ERROR` or `UNAUTHORIZED` |
+//!
+//! An agent's connection also carries its video: the agent opens
+//! unidirectional streams of `MediaFrame`s, which feed the [`Hub`]'s
+//! fan-out. The server writes `StartStream`/`StopStream`/`RequestKeyframe`/
+//! `ListMonitors` on the agent's control stream as viewers come and go.
 //!
 //! Without a registry (tests only), any certificate from the CA may say
 //! `Hello` and enrollment is unavailable.
@@ -18,15 +24,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::Identity;
+use protocol::media::MediaFrame;
 use protocol::{close_code, read_frame, write_frame, FrameError, Message};
 use quinn::rustls::pki_types::CertificateDer;
 use ring::digest::{digest, SHA256};
 use sqlx::PgPool;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::enroll::{self, AgentCa, EnrollError};
 use crate::registry;
+use crate::relay::Hub;
+use crate::viewers::{self, ViewerError, ViewerGrant};
 
 /// How long to wait for an enrolling agent to read its certificate and hang up.
 const ENROLL_LINGER: Duration = Duration::from_secs(10);
@@ -58,6 +67,11 @@ pub enum ServerEvent {
         conn_id: usize,
         agent_id: String,
     },
+    ViewerConnected {
+        conn_id: usize,
+        agent_id: String,
+        username: String,
+    },
 }
 
 /// Database-backed agent registry plus what enrollment needs.
@@ -87,6 +101,8 @@ enum ConnError {
     Protocol(&'static str),
     #[error("unauthorized: {0}")]
     Unauthorized(&'static str),
+    #[error("agent is not connected")]
+    AgentOffline,
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -95,6 +111,7 @@ pub struct Server {
     endpoint: quinn::Endpoint,
     events: Option<UnboundedSender<ServerEvent>>,
     registry: Option<Arc<Registry>>,
+    hub: Arc<Hub>,
 }
 
 /// Per-connection context shared with the connection task.
@@ -102,6 +119,7 @@ pub struct Server {
 struct Hooks {
     events: Option<UnboundedSender<ServerEvent>>,
     registry: Option<Arc<Registry>>,
+    hub: Arc<Hub>,
 }
 
 impl Hooks {
@@ -120,7 +138,13 @@ impl Server {
             endpoint,
             events: None,
             registry: None,
+            hub: Hub::new(),
         })
+    }
+
+    /// The media relay (shared with the HTTPS API).
+    pub fn hub(&self) -> Arc<Hub> {
+        self.hub.clone()
     }
 
     /// Report connection activity on `events` as well as logging it.
@@ -147,6 +171,7 @@ impl Server {
             let hooks = Hooks {
                 events: self.events.clone(),
                 registry: self.registry.clone(),
+                hub: self.hub.clone(),
             };
             tokio::spawn(
                 async move {
@@ -190,6 +215,9 @@ async fn handle_connection(incoming: quinn::Incoming, hooks: Hooks) -> Result<()
             warn!(conn_id, "rejected: {reason}");
             conn.close(close_code::UNAUTHORIZED.into(), reason.as_bytes());
         }
+        Err(ConnError::AgentOffline) => {
+            conn.close(close_code::AGENT_OFFLINE.into(), b"agent is not connected");
+        }
         Err(ConnError::Db(e)) => {
             error!(conn_id, "database error: {e}");
             conn.close(close_code::PROTOCOL_ERROR.into(), b"server error");
@@ -222,7 +250,31 @@ async fn dispatch(
                 agent_id: agent_id.clone(),
                 version,
             });
-            heartbeat_loop(conn, conn_id, &agent_id, &mut send, &mut recv, hooks).await
+            serve_agent(conn, conn_id, &agent_id, version, send, recv, hooks).await
+        }
+        (Some(Message::ViewerHello { token, version }), None) => {
+            let registry = hooks
+                .registry
+                .as_ref()
+                .ok_or(ConnError::Unauthorized("viewing is not available"))?;
+            let grant = match viewers::connect(&registry.pool, &token).await {
+                Ok(grant) => grant,
+                Err(ViewerError::Db(e)) => return Err(e.into()),
+                Err(_) => return Err(ConnError::Unauthorized("invalid viewer token")),
+            };
+            info!(conn_id, agent_id = %grant.agent_id, user = %grant.username, version, "viewer connected");
+            hooks.emit(ServerEvent::ViewerConnected {
+                conn_id,
+                agent_id: grant.agent_id.clone(),
+                username: grant.username.clone(),
+            });
+            let mut frames_sent = 0;
+            let result = serve_viewer(conn, &grant, send, recv, hooks, &mut frames_sent).await;
+            if let Err(e) = viewers::end(&registry.pool, &grant, frames_sent).await {
+                warn!(conn_id, "recording viewer disconnect failed: {e}");
+            }
+            info!(conn_id, frames_sent, "viewer disconnected");
+            result
         }
         (Some(Message::Hello { .. }), None) => {
             Err(ConnError::Unauthorized("client certificate required"))
@@ -268,46 +320,169 @@ async fn dispatch(
         (Some(Message::Enroll { .. }), Some(_)) => {
             Err(ConnError::Protocol("already enrolled; send Hello"))
         }
-        (Some(_), _) => Err(ConnError::Protocol("expected Hello or Enroll")),
+        (Some(_), _) => Err(ConnError::Protocol("expected Hello, Enroll or ViewerHello")),
     }
 }
 
-async fn heartbeat_loop(
+/// An authenticated agent: heartbeats, monitor lists and video, plus
+/// commands from the relay written back on the control stream.
+async fn serve_agent(
     conn: &quinn::Connection,
     conn_id: usize,
     agent_id: &str,
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    version: u32,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
     hooks: &Hooks,
 ) -> Result<(), ConnError> {
-    while let Some(msg) = read_frame(recv).await? {
-        match msg {
-            Message::Heartbeat { ts, seq, telemetry } => {
-                let remote = conn.remote_address();
-                debug!(%agent_id, seq, ts, %remote, ?telemetry, "heartbeat");
-                hooks.emit(ServerEvent::Heartbeat {
-                    conn_id,
-                    agent_id: agent_id.to_owned(),
-                    seq,
-                    remote,
-                });
-                if let Some(registry) = &hooks.registry {
-                    // A registry hiccup should not disconnect an authenticated agent.
-                    if let Err(e) =
-                        registry::touch(&registry.pool, agent_id, telemetry.as_ref()).await
-                    {
-                        warn!(%agent_id, "registry update failed: {e}");
+    let (to_agent, mut outbox) = mpsc::unbounded_channel::<Message>();
+    let link = hooks.hub.register(agent_id, to_agent.clone());
+    // Agents older than protocol 3 do not know the streaming messages.
+    if version >= 3 {
+        let _ = to_agent.send(Message::ListMonitors);
+    }
+
+    let writer = async {
+        while let Some(msg) = outbox.recv().await {
+            write_frame(&mut send, &msg).await?;
+        }
+        Ok::<(), ConnError>(())
+    };
+
+    let reader = async {
+        while let Some(msg) = read_frame(&mut recv).await? {
+            match msg {
+                Message::Heartbeat { ts, seq, telemetry } => {
+                    let remote = conn.remote_address();
+                    debug!(%agent_id, seq, ts, %remote, ?telemetry, "heartbeat");
+                    hooks.emit(ServerEvent::Heartbeat {
+                        conn_id,
+                        agent_id: agent_id.to_owned(),
+                        seq,
+                        remote,
+                    });
+                    if let Some(registry) = &hooks.registry {
+                        // A registry hiccup should not disconnect an authenticated agent.
+                        if let Err(e) =
+                            registry::touch(&registry.pool, agent_id, telemetry.as_ref()).await
+                        {
+                            warn!(%agent_id, "registry update failed: {e}");
+                        }
                     }
+                    let _ = to_agent.send(Message::HeartbeatAck { seq });
                 }
-                write_frame(send, &Message::HeartbeatAck { seq }).await?;
-            }
-            other => {
-                warn!(%agent_id, ?other, "unexpected message on control stream");
-                return Err(ConnError::Protocol("unexpected message"));
+                Message::MonitorList { monitors } => {
+                    debug!(%agent_id, count = monitors.len(), "monitor list");
+                    link.set_monitors(monitors);
+                }
+                other => {
+                    warn!(%agent_id, ?other, "unexpected message on control stream");
+                    return Err(ConnError::Protocol("unexpected message"));
+                }
             }
         }
+        Ok(())
+    };
+
+    // Video: each unidirectional stream from the agent is a sequence of frames.
+    let media = async {
+        loop {
+            let mut stream = conn.accept_uni().await?;
+            while let Some(frame) = read_frame::<_, MediaFrame>(&mut stream).await? {
+                link.on_frame(frame);
+            }
+            link.stream_reset();
+        }
+    };
+
+    let result = tokio::select! {
+        r = writer => r,
+        r = reader => r,
+        r = media => r,
+    };
+    hooks.hub.unregister(&link);
+    result
+}
+
+/// A viewer watching `grant.agent_id` through the relay.
+async fn serve_viewer(
+    conn: &quinn::Connection,
+    grant: &ViewerGrant,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    hooks: &Hooks,
+    frames_sent: &mut u64,
+) -> Result<(), ConnError> {
+    let link = hooks
+        .hub
+        .get(&grant.agent_id)
+        .ok_or(ConnError::AgentOffline)?;
+    let viewer_id = hooks.hub.next_viewer_id();
+    let mut monitors = link.monitors();
+    let mut stream_monitor = link.stream_monitor();
+    let mut agent_closed = link.closed();
+
+    let (to_viewer, mut outbox) = mpsc::unbounded_channel::<Message>();
+    let _ = to_viewer.send(Message::ViewerWelcome {
+        agent_id: grant.agent_id.clone(),
+        monitors: monitors.borrow_and_update().clone(),
+        active_monitor: *stream_monitor.borrow(),
+    });
+    let mut subscription = link.subscribe(viewer_id);
+    let mut video = conn.open_uni().await?;
+
+    let writer = async {
+        while let Some(msg) = outbox.recv().await {
+            write_frame(&mut send, &msg).await?;
+        }
+        Ok::<(), ConnError>(())
+    };
+    let forward = async {
+        while let Some(frame) = subscription.frames.recv().await {
+            write_frame(&mut video, frame.as_ref()).await?;
+            *frames_sent += 1;
+        }
+        Ok(())
+    };
+    let notify = async {
+        loop {
+            tokio::select! {
+                changed = monitors.changed() => {
+                    if changed.is_err() { break; }
+                    let list = monitors.borrow_and_update().clone();
+                    let _ = to_viewer.send(Message::MonitorList { monitors: list });
+                }
+                changed = stream_monitor.changed() => {
+                    if changed.is_err() { break; }
+                    if let Some(monitor) = *stream_monitor.borrow_and_update() {
+                        let _ = to_viewer.send(Message::StreamMonitor { monitor });
+                    }
+                }
+                _ = agent_closed.wait_for(|closed| *closed) => break,
+            }
+        }
+        Err::<(), _>(ConnError::AgentOffline)
+    };
+    let reader = async {
+        while let Some(msg) = read_frame(&mut recv).await? {
+            match msg {
+                Message::SelectMonitor { monitor } => link.select_monitor(monitor),
+                Message::RequestKeyframe => link.viewer_requests_keyframe(viewer_id),
+                other => {
+                    warn!(?other, "unexpected message from viewer");
+                    return Err(ConnError::Protocol("unexpected message"));
+                }
+            }
+        }
+        Ok(())
+    };
+
+    tokio::select! {
+        r = writer => r,
+        r = forward => r,
+        r = notify => r,
+        r = reader => r,
     }
-    Ok(())
 }
 
 /// Hex SHA-256 of a DER certificate.

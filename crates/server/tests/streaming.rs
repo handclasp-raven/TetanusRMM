@@ -1,0 +1,442 @@
+//! Screen streaming end to end, on any OS: a real agent session with a
+//! synthetic two-monitor source (OpenH264 standing in for DXGI + Media
+//! Foundation), the real server relay, and real viewer clients decoding with
+//! OpenH264.
+
+mod support;
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use agent::media::h264::{is_keyframe, ParamSets};
+use agent::media::source::{media_channel, MediaCommand, MediaEvent, MediaSourceEnd};
+use openh264::encoder::Encoder;
+use openh264::formats::YUVBuffer;
+use protocol::ipc::EncodedFrame;
+use protocol::media::MonitorInfo;
+use reqwest::StatusCode;
+use serde_json::Value;
+use server::users::Role;
+use support::{audit_actions, create_user, start_api_full, start_db, Api};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use viewer::client::{self, ViewerEvent, ViewerHandle, ViewerOptions, Welcome};
+use viewer::decode::{Picture, VideoDecoder};
+
+const DEADLINE: Duration = Duration::from_secs(20);
+
+fn monitors() -> Vec<MonitorInfo> {
+    vec![
+        MonitorInfo {
+            id: 0,
+            name: r"\\.\DISPLAY1".into(),
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 240,
+            primary: true,
+        },
+        MonitorInfo {
+            id: 1,
+            name: r"\\.\DISPLAY2".into(),
+            x: 320,
+            y: 0,
+            width: 256,
+            height: 192,
+            primary: false,
+        },
+    ]
+}
+
+/// Solid colour per monitor (as YUV), with a moving square so every frame
+/// differs and the encoder produces real P-frames.
+fn picture(monitor: u32, n: u64) -> YUVBuffer {
+    let m = &monitors()[monitor as usize];
+    let (w, h) = (m.width as usize, m.height as usize);
+    // Monitor 0: red-ish. Monitor 1: blue-ish.
+    let (y, u, v) = if monitor == 0 {
+        (82u8, 90u8, 240u8)
+    } else {
+        (41, 240, 110)
+    };
+    let mut data = vec![y; w * h];
+    let sq = (n as usize * 4) % (w - 16);
+    for row in 0..16 {
+        for col in 0..16 {
+            data[row * w + sq + col] = 235;
+        }
+    }
+    data.extend(std::iter::repeat_n(u, w * h / 4));
+    data.extend(std::iter::repeat_n(v, w * h / 4));
+    YUVBuffer::from_vec(data, w, h)
+}
+
+/// What the synthetic source was asked to do, and how much it encoded.
+#[derive(Default)]
+struct SourceLog {
+    commands: Mutex<Vec<MediaCommand>>,
+    encoded: AtomicU64,
+}
+
+impl SourceLog {
+    fn commands(&self) -> Vec<MediaCommand> {
+        self.commands.lock().unwrap().clone()
+    }
+    fn starts(&self) -> usize {
+        self.commands()
+            .iter()
+            .filter(|c| matches!(c, MediaCommand::Start { .. }))
+            .count()
+    }
+}
+
+/// Stands in for the Windows helper: obeys MediaCommands, encodes with OpenH264.
+fn run_source(end: MediaSourceEnd, log: Arc<SourceLog>) {
+    let MediaSourceEnd {
+        mut commands,
+        events,
+    } = end;
+    std::thread::spawn(move || {
+        let mut active: Option<u32> = None;
+        let mut encoder: Option<Encoder> = None;
+        let mut params = ParamSets::default();
+        let mut n = 0u64;
+        loop {
+            loop {
+                match commands.try_recv() {
+                    Ok(cmd) => {
+                        log.commands.lock().unwrap().push(cmd.clone());
+                        match cmd {
+                            MediaCommand::ListMonitors => {
+                                let _ = events.blocking_send(MediaEvent::Monitors(monitors()));
+                            }
+                            MediaCommand::Start { monitor } => {
+                                active = Some(monitor);
+                                encoder = Some(Encoder::new().unwrap()); // new size, fresh stream
+                            }
+                            MediaCommand::Stop => {
+                                active = None;
+                                encoder = None;
+                            }
+                            MediaCommand::ForceKeyframe => {
+                                if let Some(e) = &mut encoder {
+                                    e.force_intra_frame();
+                                }
+                            }
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            }
+            if let (Some(monitor), Some(enc)) = (active, &mut encoder) {
+                let data = params.fix_up(enc.encode(&picture(monitor, n)).unwrap().to_vec());
+                let m = &monitors()[monitor as usize];
+                let frame = EncodedFrame {
+                    monitor,
+                    keyframe: is_keyframe(&data),
+                    pts_us: n * 33_333,
+                    width: m.width,
+                    height: m.height,
+                    h264: data,
+                };
+                if events.try_send(MediaEvent::Frame(frame)).is_ok() {
+                    log.encoded.fetch_add(1, Ordering::SeqCst);
+                }
+                n += 1;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+}
+
+struct Rig {
+    db: support::TestDb,
+    certs: common::devcerts::DevCerts,
+    addr: std::net::SocketAddr,
+    api: Api,
+    agent_id: String,
+    log: Arc<SourceLog>,
+    admin_session: String,
+}
+
+async fn rig() -> Rig {
+    let db = start_db().await;
+    let certs = common::devcerts::generate("unused").unwrap();
+    let (quic, addr, _events) = support::start_quic(db.pool.clone(), &certs);
+    let api = start_api_full(
+        db.pool.clone(),
+        &certs,
+        "/nonexistent".into(),
+        Some(quic.hub()),
+    )
+    .await;
+    // Keep the QUIC server alive for the test's duration.
+    std::mem::forget(quic);
+
+    let token = server::enroll::create_token(&db.pool, "root", Duration::from_secs(600))
+        .await
+        .unwrap()
+        .token;
+    let credential = agent::enroll::enroll(&agent::enroll::EnrollOptions {
+        server_addr: addr,
+        server_name: "localhost".into(),
+        server_ca_pem: certs.ca_cert.clone(),
+        token,
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+    })
+    .await
+    .unwrap();
+
+    let (link, end) = media_channel();
+    let log = Arc::new(SourceLog::default());
+    run_source(end, log.clone());
+    let mut config = credential.agent_config(Duration::from_secs(5)).unwrap();
+    config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
+    config.media = Some(Arc::new(link));
+    let session = agent::connect(&config).await.unwrap();
+    tokio::spawn(async move { session.run(None).await });
+
+    let admin = create_user(&db.pool, "root", Role::Admin).await;
+    let admin_session = api.session("root", &admin.totp_secret).await;
+    // Wait until the agent's monitor list reached the relay.
+    let agent_id = credential.agent_id.clone();
+    Rig {
+        db,
+        certs,
+        addr,
+        api,
+        agent_id,
+        log,
+        admin_session,
+    }
+}
+
+impl Rig {
+    async fn viewer_token_as(&self, session: &str) -> reqwest::Response {
+        self.api
+            .client
+            .post(
+                self.api
+                    .url(&format!("/api/agents/{}/viewer-sessions", self.agent_id)),
+            )
+            .bearer_auth(session)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn viewer_token(&self) -> String {
+        let resp = self.viewer_token_as(&self.admin_session).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["online"], true);
+        body["token"].as_str().unwrap().to_owned()
+    }
+
+    fn options(&self, token: String) -> ViewerOptions {
+        ViewerOptions {
+            server: self.addr,
+            server_name: "localhost".into(),
+            ca_pem: self.certs.ca_cert.clone(),
+            token,
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+        }
+    }
+
+    async fn viewer(&self) -> Viewer {
+        let token = self.viewer_token().await;
+        let (welcome, handle, events) = client::connect(&self.options(token)).await.unwrap();
+        Viewer {
+            welcome,
+            handle,
+            events,
+            decoder: VideoDecoder::new().unwrap(),
+            frames: BTreeMap::new(),
+        }
+    }
+}
+
+struct Viewer {
+    welcome: Welcome,
+    handle: ViewerHandle,
+    events: mpsc::Receiver<ViewerEvent>,
+    decoder: VideoDecoder,
+    /// seq -> raw payload, for comparing what different viewers got.
+    frames: BTreeMap<u64, Vec<u8>>,
+}
+
+impl Viewer {
+    /// Decode until `n` pictures of `monitor` have been shown.
+    async fn pictures(&mut self, monitor: u32, n: usize) -> Vec<Picture> {
+        let mut out = Vec::new();
+        timeout(DEADLINE, async {
+            while out.len() < n {
+                match self.events.recv().await.expect("viewer events") {
+                    ViewerEvent::Frame(frame) => {
+                        self.frames.insert(frame.seq, frame.payload.clone());
+                        match self.decoder.decode(&frame) {
+                            Ok(Some(p)) if p.monitor == monitor => out.push(p),
+                            Ok(_) => {}
+                            Err(e) => panic!("decode error: {e}"),
+                        }
+                    }
+                    ViewerEvent::Closed(reason) => panic!("viewer closed: {reason}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {n} pictures of monitor {monitor}"));
+        out
+    }
+}
+
+fn assert_colour(p: &Picture, expect: (u8, u8, u8)) {
+    // A corner away from the moving square; allow codec rounding.
+    let (r, g, b) = p.pixel(p.width - 4, p.height - 4);
+    let close = |a: u8, b: u8| a.abs_diff(b) <= 12;
+    assert!(
+        close(r, expect.0) && close(g, expect.1) && close(b, expect.2),
+        "{p:?}: got ({r},{g},{b}), expected about {expect:?}"
+    );
+}
+
+const RED: (u8, u8, u8) = (255, 0, 0);
+const BLUE: (u8, u8, u8) = (0, 0, 255);
+
+#[tokio::test]
+async fn two_viewers_are_fed_by_one_encode_via_the_server() {
+    let rig = rig().await;
+
+    let mut a = rig.viewer().await;
+    assert_eq!(a.welcome.agent_id, rig.agent_id);
+    let first = a.pictures(0, 5).await;
+    assert_eq!((first[0].width, first[0].height), (320, 240));
+    assert_colour(&first[0], RED);
+
+    // A second viewer joins mid-stream: it gets a keyframe, not a new encoder.
+    let mut b = rig.viewer().await;
+    assert_eq!(b.welcome.monitors, monitors(), "monitor list relayed");
+    assert_eq!(b.welcome.active_monitor, Some(0));
+    b.pictures(0, 5).await;
+    a.pictures(0, 5).await;
+
+    assert_eq!(
+        rig.log.starts(),
+        1,
+        "one Start for two viewers: {:?}",
+        rig.log.commands()
+    );
+    assert!(
+        rig.log.commands().contains(&MediaCommand::ForceKeyframe),
+        "late joiner asked for a keyframe"
+    );
+    // Frames with the same sequence number are byte-identical: the same
+    // encode, fanned out by the server.
+    let common: Vec<u64> = a
+        .frames
+        .keys()
+        .filter(|s| b.frames.contains_key(s))
+        .copied()
+        .collect();
+    assert!(common.len() >= 3, "overlap {common:?}");
+    for seq in &common {
+        assert_eq!(a.frames[seq], b.frames[seq]);
+    }
+
+    // Selecting monitor 1 switches the shared stream for both viewers.
+    b.handle.select_monitor(1);
+    let pa = a.pictures(1, 3).await;
+    let pb = b.pictures(1, 3).await;
+    for p in [&pa[0], &pb[0]] {
+        assert_eq!((p.width, p.height), (256, 192));
+        assert_colour(p, BLUE);
+    }
+    assert_eq!(rig.log.starts(), 2);
+
+    // When the last viewer leaves, the agent stops capturing.
+    a.handle.close();
+    b.handle.close();
+    drop((a, b));
+    timeout(DEADLINE, async {
+        while rig.log.commands().last() != Some(&MediaCommand::Stop) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("agent told to stop");
+
+    let actions = audit_actions(&rig.db.pool).await;
+    for action in [
+        "viewer.session_create",
+        "viewer.connect",
+        "viewer.disconnect",
+    ] {
+        assert_eq!(
+            actions.iter().filter(|a| *a == action).count(),
+            2,
+            "{action} in {actions:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn viewer_tokens_are_single_use_and_role_checked() {
+    let rig = rig().await;
+
+    let token = rig.viewer_token().await;
+    let (_welcome, handle, _events) = client::connect(&rig.options(token.clone())).await.unwrap();
+    match client::connect(&rig.options(token)).await {
+        Err(client::ClientError::Refused(reason)) => assert_eq!(reason, "invalid viewer token"),
+        other => panic!("reused token accepted: {:?}", other.map(|r| r.0)),
+    }
+    handle.close();
+
+    match client::connect(&rig.options("made-up".into())).await {
+        Err(client::ClientError::Refused(reason)) => assert_eq!(reason, "invalid viewer token"),
+        other => panic!("bogus token accepted: {:?}", other.map(|r| r.0)),
+    }
+
+    // Auditors are read-only: no screens.
+    let auditor = create_user(&rig.db.pool, "carol", Role::Auditor).await;
+    let auditor_session = rig.api.session("carol", &auditor.totp_secret).await;
+    assert_eq!(
+        rig.viewer_token_as(&auditor_session).await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Unknown agent.
+    let resp = rig
+        .api
+        .client
+        .post(rig.api.url("/api/agents/agt-nope/viewer-sessions"))
+        .bearer_auth(&rig.admin_session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn viewer_for_an_offline_agent_is_told_so() {
+    let rig = rig().await;
+    // An enrolled agent that is not connected.
+    support::insert_agent(&rig.db.pool, "agt-offline").await;
+    let resp = rig
+        .api
+        .client
+        .post(rig.api.url("/api/agents/agt-offline/viewer-sessions"))
+        .bearer_auth(&rig.admin_session)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["online"], false);
+    match client::connect(&rig.options(body["token"].as_str().unwrap().into())).await {
+        Err(client::ClientError::Refused(reason)) => assert_eq!(reason, "agent is not connected"),
+        other => panic!("expected refusal, got {:?}", other.map(|r| r.0)),
+    }
+}

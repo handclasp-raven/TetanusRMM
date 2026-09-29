@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::media::MonitorInfo;
+
 /// Well-known pipe name. Created by the service with `first_pipe_instance`,
 /// so another process cannot squat on it first.
 pub const PIPE_NAME: &str = r"\\.\pipe\rmm-agent-helper";
@@ -22,6 +24,41 @@ pub enum IpcMessage {
     /// Service to helper: what the tray should show. Sent on connect and
     /// whenever it changes.
     Status(AgentStatus),
+    /// Service to helper: report the monitors.
+    ListMonitors,
+    /// Helper to service: the monitors (reply to `ListMonitors`, or on change).
+    Monitors(Vec<MonitorInfo>),
+    /// Service to helper: capture and encode `monitor`.
+    StartCapture { monitor: u32 },
+    /// Service to helper: stop capturing.
+    StopCapture,
+    /// Service to helper: next frame must be a keyframe.
+    ForceKeyframe,
+    /// Helper to service: one encoded frame (Annex B, keyframes carry SPS/PPS).
+    Frame(EncodedFrame),
+}
+
+/// An encoded video frame from the helper.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodedFrame {
+    pub monitor: u32,
+    pub keyframe: bool,
+    pub pts_us: u64,
+    pub width: u32,
+    pub height: u32,
+    pub h264: Vec<u8>,
+}
+
+impl std::fmt::Debug for EncodedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedFrame")
+            .field("monitor", &self.monitor)
+            .field("keyframe", &self.keyframe)
+            .field("pts_us", &self.pts_us)
+            .field("size", &format_args!("{}x{}", self.width, self.height))
+            .field("bytes", &self.h264.len())
+            .finish()
+    }
 }
 
 /// Agent state as shown to the user.

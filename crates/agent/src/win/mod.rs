@@ -16,7 +16,12 @@
 //! See [`crate::session`] for why the helper exists.
 
 pub mod acl;
+pub mod bridge;
+pub mod capture;
+pub mod capture_test;
+pub mod encoder;
 pub mod helper;
 pub mod pipe;
 pub mod process;
 pub mod service;
+pub mod stream;

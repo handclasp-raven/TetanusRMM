@@ -163,6 +163,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         },
         public_url: config.public_url(),
         updates_dir: config.updates_dir.clone(),
+        hub: Some(quic.hub()),
     });
     let listener = std::net::TcpListener::bind(config.api_listen)
         .with_context(|| format!("binding API listener on {}", config.api_listen))?;

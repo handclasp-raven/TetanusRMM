@@ -11,12 +11,13 @@ for the architecture and phase plan.
 | `crates/common` | lib | Logging init, PEM loading, quinn/rustls TLS configs, dev cert generation |
 | `crates/server` | bin + lib | QUIC listener for agents, HTTPS API, Postgres, auth, audit log, enrollment CA, update publishing |
 | `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray |
-| `crates/viewer` | bin | Placeholder until Phase 5 |
+| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC to the server, OpenH264 decode, winit + softbuffer window |
 
 Server modules: `quic` (agent listener), `api` (HTTPS routes), `auth` (Argon2id,
 TOTP, sessions), `users`, `audit` (hash chain), `registry` (agents, policies),
-`enroll` (tokens, internal CA), `updates` (signing, publishing), `db` (pool,
-migrations), `config`.
+`enroll` (tokens, internal CA), `updates` (signing, publishing), `relay` (video
+fan-out to viewers), `viewers` (viewer-session tokens), `db` (pool, migrations),
+`config`.
 
 Agent modules:
 - `core`: the connect/heartbeat/update loop, shared by console and service mode.
@@ -25,9 +26,12 @@ Agent modules:
 - `telemetry`: sysinfo.
 - `session`: the helper supervisor state machine.
 - `update` (download and verify) and `updater` (rename-and-replace).
+- `media`: NV12 conversion, H.264 fix-ups, and the source link used for
+  streaming.
 - `paths`
 - `win` (Windows only): `service`, `process` (spawn into a session), `pipe`,
-  `helper` (tray), `acl`.
+  `helper` (tray), `acl`, `capture` (DXGI), `encoder` (Media Foundation),
+  `stream` (capture worker), `bridge` (service ↔ helper media).
 
 Migrations live in
 `crates/server/migrations/` and are embedded in the binary. They run
@@ -226,6 +230,96 @@ restart it on the new binary.
 
 Both are appended to with no rotation yet.
 
+## Remote desktop viewing
+
+Agents sit behind NAT and only connect *out*, so viewers never connect to an
+agent. They connect to the **server**, which relays:
+
+```text
+ helper (user session)          service              server                viewers
+ DXGI capture ─▶ MF H.264 ─pipe─▶ QUIC video ─────────▶ relay ──┬─▶ viewer A (Linux)
+ (dirty rects)   encode once      stream (agent → server)        └─▶ viewer B (Windows)
+```
+
+The agent **encodes once**, whatever the number of viewers, and the server
+fans the one stream out. Other points:
+- **Start and stop:** capture starts when the first viewer arrives and stops
+  when the last one leaves.
+- **Joining mid-stream:** a viewer that joins late starts at a keyframe the
+  server asks the agent for.
+- **Slow viewers:** a viewer that falls behind skips to the next keyframe
+  rather than slowing anyone else.
+- **Monitor choice is shared:** picking a monitor changes it for everyone
+  watching that agent, because there is only one stream.
+
+### Launching the viewer
+
+1. Get a short-lived viewer token (admin or support engineer; auditors can't
+   view screens). It is valid for **60 seconds** and works **once**:
+
+   ```sh
+   curl --cacert dev-certs/ca.crt -X POST -H "Authorization: Bearer $SESSION" \
+     https://localhost:8443/api/agents/agt-c77b3326d49696ef/viewer-sessions
+   # {"token":"…","expires_at":"…","agent_id":"agt-…","online":true}
+   ```
+
+2. Start the viewer with it (the TUI will do both steps in Phase 8):
+
+   ```sh
+   viewer --server 203.0.113.10:4433 --server-name localhost \
+     --ca dev-certs/ca.crt --token <token>
+   # or: RMM_VIEWER_TOKEN=<token> viewer --ca dev-certs/ca.crt
+   ```
+
+   In the window:
+   - **Tab** or **M** shows the monitor picker; **1–9** switches monitor.
+   - **F5** requests a fresh keyframe.
+   - **Esc** closes the picker, or the viewer.
+
+   `--monitor N` picks a monitor at startup. `--snapshot out.ppm --frames N`
+   is headless: it decodes N frames, writes the last one, and exits. Use it
+   for checks and on machines without a display.
+
+The server audits `viewer.session_create`, `viewer.connect` and
+`viewer.disconnect` (the last with duration and frames sent). A token that
+has expired or already been used is refused, as is a token for an agent that
+isn't connected ("agent is not connected").
+
+### Capture and encoding on the agent
+
+- **Capture:** DXGI Desktop Duplication in the helper (the user's session),
+  on any selected monitor. Only the regions DXGI reports as changed (dirty
+  and move rectangles) are copied off the GPU and converted to NV12. Frames
+  are encoded only when something changed, at up to 30 fps, so a static
+  screen costs almost nothing.
+- **Encoding:** H.264 through Media Foundation. **Hardware encoders are
+  preferred** (NVENC, Quick Sync and AMF all register as MFTs). If none
+  exists or none accepts the configuration, it **falls back to Microsoft's
+  software "H264 Encoder MFT"**, and the helper log says which it used:
+  `H.264 encoder ready encoder=… hardware=true|false`.
+- **Stream format:** Constrained Baseline profile, low-latency mode, Annex B,
+  with SPS/PPS repeated on every keyframe. Baseline keeps it decodable by the
+  portable OpenH264 decoder the viewer uses.
+- **Bitrate:** scales with resolution (4 Mbit/s at 1080p) and can be changed
+  at runtime (`H264Encoder::set_bitrate`, for Phase 9's adaptive bitrate).
+- **Display changes:** display switches (UAC, lock screen, resolution change)
+  invalidate the duplication; capture restarts and resends the monitor list.
+- **Backpressure:** if the network can't keep up, frames are dropped rather
+  than queued, and the next one is a keyframe.
+- **Not yet:** the mouse cursor isn't drawn into the stream.
+
+Measured on the development VM (Windows 11, 4 vCPUs, **no GPU, so the
+software encoder**), at 1024×768:
+
+| Screen | Helper CPU | Service CPU |
+|---|---|---|
+| Static | ~0.2% of one core | ~0% |
+| Console scrolling 10 lines/s (~18 fps) | 16% of one core (4% of the VM) | 0.7% |
+
+The hardware encoder path is implemented, including the asynchronous model
+hardware MFTs use, but it hasn't been exercised: the VM has no GPU encoder.
+Test it on a machine with an NVIDIA, Intel or AMD GPU.
+
 ## Telemetry
 
 Every heartbeat carries a health sample, collected with `sysinfo`:
@@ -327,6 +421,7 @@ Sessions are sent as `Authorization: Bearer <token>`. Errors come back as
 | POST | `/api/auth/totp` | none | `{challenge_token, code}` → `{session_token, expires_at, user}` |
 | POST | `/api/auth/logout` | session | Ends the session |
 | POST | `/api/enrollment-links` | admin, support_engineer | `{ttl_secs?, platform?}` → `{token, expires_at, download_url}` |
+| POST | `/api/agents/{id}/viewer-sessions` | admin, support_engineer | → `{token, expires_at, agent_id, online}`: single-use viewer token, valid 60 s |
 | GET | `/api/download/{platform}?token=` | enrollment token | Latest published agent build. Does not use up the token. |
 | GET | `/api/updates/{platform}/manifest` | none | `{platform, version, sha256, size}` |
 | GET | `/api/updates/{platform}/binary` | none | Agent build (signed, so public) |
@@ -378,15 +473,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace        # needs a running Docker daemon
 ```
 
-The database tests (`crates/server/tests/db.rs`, `api.rs` and `enrollment.rs`)
+The database tests (`crates/server/tests/db.rs`, `api.rs`, `enrollment.rs`,
+`telemetry.rs` and `streaming.rs`)
 each start a throwaway `postgres:17-alpine` container with testcontainers. The
 container is removed when the test ends. `heartbeat.rs` (QUIC over loopback) and
-`updates.rs` (signed updates over HTTPS) need no database.
+`updates.rs` (signed updates over HTTPS) need no database. `streaming.rs` runs a
+real agent session with a synthetic two-monitor source (OpenH264 standing in
+for DXGI + Media Foundation), the real relay, and two real viewer clients. It
+checks:
+- both viewers decode frames from **one** encode (one `Start`, byte-identical
+  frames);
+- a monitor switch applies to both;
+- the agent stops capturing when both leave;
+- viewer tokens are single-use and role-checked.
 
 ### On Windows
 
 The Windows-only code (service, session helper, tray, named pipe, DPAPI, ACLs,
-detached relaunch) is behind `#[cfg(windows)]`, so Linux builds don't compile
+detached relaunch, DXGI capture, Media Foundation encoding) is behind
+`#[cfg(windows)]`, so Linux builds don't compile
 it. Build, lint and test it on Windows (MSVC toolchain):
 
 ```powershell
@@ -401,6 +506,11 @@ loaded: an interactive logon, or SYSTEM (as the service runs). Over
 receives the password that user-scope DPAPI keys derive from. To run them over
 SSH, run the test binary as SYSTEM, e.g. from a one-off scheduled task.
 
+`agent capture-test --monitor N --seconds S --out file.h264` (hidden
+subcommand) captures and encodes without a server. Run it in an interactive
+session, then check the output with `ffprobe`/`ffplay`.
+
 Service install, reboot survival, the helper in the user's session, the tray
-icon and service-mode self-update are verified by hand on a Windows 11 24H2
+icon, service-mode self-update and live streaming (two viewers, monitor
+switching) are verified by hand on a Windows 11 24H2
 VM (see the Phase 4 notes in the commit history).
