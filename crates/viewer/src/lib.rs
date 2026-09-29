@@ -9,7 +9,11 @@
 //! - [`decode`]: H.264 decoding with OpenH264. It is portable, unlike Media
 //!   Foundation, so the viewer builds everywhere.
 //! - [`render`]: scaling into the window and the on-screen monitor picker.
+//! - [`keymap`]: physical keys to the scancodes the agent injects.
+//! - [`clipboard`]: two-way clipboard sync with the remote machine.
 
 pub mod client;
+pub mod clipboard;
 pub mod decode;
+pub mod keymap;
 pub mod render;

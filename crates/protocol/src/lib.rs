@@ -3,7 +3,10 @@
 //! Every message on a QUIC stream is a [`Message`] encoded with `postcard` and
 //! prefixed by its length as a big-endian `u32` (see [`framing`]).
 
+pub mod clipboard;
+pub mod consent;
 pub mod framing;
+pub mod input;
 pub mod ipc;
 pub mod media;
 pub mod update;
@@ -19,7 +22,9 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   longer decode, so it is disconnected; it can still self-update over HTTPS.
 /// - 3: screen streaming messages (appended variants only; a version-2 agent
 ///   still works, it just cannot stream).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 4: consent, remote input and clipboard (appended variants). Viewing an
+///   agent older than 4 is refused, since it cannot enforce consent.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// ALPN identifier negotiated during the TLS handshake. Both ends must agree.
 pub const ALPN: &[u8] = b"rmm/1";
@@ -91,6 +96,48 @@ pub enum Message {
     /// Server to viewer: the stream now shows `monitor` (another viewer may
     /// have switched it).
     StreamMonitor { monitor: u32 },
+
+    // --- Consent, input and clipboard (Phase 6) -------------------------
+    //
+    // A viewer's session only starts once the agent has applied the device's
+    // consent policy (see `consent`). Input and clipboard then flow
+    // viewer -> server -> agent, tagged by the server with the session id so
+    // the agent can drop anything for a session it has not granted or has
+    // ended.
+    /// Agent to server, after `Hello`: what kind of device this is (picks
+    /// the default consent mode).
+    DeviceInfo { kind: consent::DeviceKind },
+    /// Server to agent: a technician wants a session; apply the policy.
+    SessionRequest(consent::SessionRequest),
+    /// Agent to server: how the request ended. The session starts only if
+    /// `outcome.allows_session()`.
+    SessionDecision {
+        session_id: u64,
+        outcome: consent::Outcome,
+    },
+    /// Server to agent: the session ended (or was abandoned while pending).
+    SessionEnded { session_id: u64 },
+    /// Server to viewer, before `ViewerWelcome`: waiting for the user to
+    /// answer a consent prompt for up to `timeout_secs`.
+    ConsentPending { timeout_secs: u32 },
+    /// Viewer to server: inject this input.
+    Input(input::InputEvent),
+    /// Server to agent: input from `session_id`'s technician.
+    SessionInput {
+        session_id: u64,
+        event: input::InputEvent,
+    },
+    /// Viewer to server: the technician's clipboard changed. Agent to
+    /// server, and server to viewers: the remote user's clipboard changed.
+    Clipboard(clipboard::ClipboardData),
+    /// Server to agent: clipboard content from `session_id`'s technician.
+    SessionClipboard {
+        session_id: u64,
+        data: clipboard::ClipboardData,
+    },
+    /// Agent to server: the user pressed the Ctrl+F12 kill switch; end every
+    /// session with this agent now.
+    UserTerminatedSessions,
 }
 
 /// Agent health sample, sent on each heartbeat.
@@ -117,6 +164,11 @@ pub mod close_code {
     pub const UNAUTHORIZED: u32 = 2;
     /// A viewer asked for an agent that is not connected (or disconnected).
     pub const AGENT_OFFLINE: u32 = 3;
+    /// The consent policy refused the session (declined, timed out, or
+    /// nobody to ask). The close reason says which.
+    pub const CONSENT_REFUSED: u32 = 4;
+    /// The user ended the session with the Ctrl+F12 kill switch.
+    pub const USER_TERMINATED: u32 = 5;
 }
 
 #[cfg(test)]

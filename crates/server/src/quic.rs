@@ -16,6 +16,15 @@
 //! fan-out. The server writes `StartStream`/`StopStream`/`RequestKeyframe`/
 //! `ListMonitors` on the agent's control stream as viewers come and go.
 //!
+//! A viewer's session starts only after consent: the server sends the
+//! agent a `SessionRequest` with the device's policy, waits for its
+//! `SessionDecision`, and audits the mode and outcome (`session.start`).
+//! A refused viewer is closed with `CONSENT_REFUSED` and the reason. Once
+//! started, the viewer's input and clipboard are relayed to the agent
+//! tagged with the session id, and the agent's clipboard goes to every
+//! viewer. The user's Ctrl+F12 (`UserTerminatedSessions`) closes every
+//! viewer of that agent with `USER_TERMINATED`, audited per session.
+//!
 //! Without a registry (tests only), any certificate from the CA may say
 //! `Hello` and enrollment is unavailable.
 
@@ -24,11 +33,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::Identity;
+use protocol::clipboard::MAX_CLIPBOARD_BYTES;
+use protocol::consent::{ConsentMode, OnNoUser, Outcome, SessionRequest};
 use protocol::media::MediaFrame;
 use protocol::{close_code, read_frame, write_frame, FrameError, Message};
 use quinn::rustls::pki_types::CertificateDer;
 use ring::digest::{digest, SHA256};
 use sqlx::PgPool;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
@@ -39,6 +51,13 @@ use crate::viewers::{self, ViewerError, ViewerGrant};
 
 /// How long to wait for an enrolling agent to read its certificate and hang up.
 const ENROLL_LINGER: Duration = Duration::from_secs(10);
+
+/// How long the agent may take to decide consent, beyond the prompt's own
+/// timeout, before the server gives up (`consent_unavailable`).
+const DECISION_GRACE: Duration = Duration::from_secs(15);
+
+/// Oldest agent protocol that enforces consent. Older agents cannot be viewed.
+const MIN_CONSENT_VERSION: u32 = 4;
 
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -103,6 +122,10 @@ enum ConnError {
     Unauthorized(&'static str),
     #[error("agent is not connected")]
     AgentOffline,
+    #[error("consent refused: {0}")]
+    ConsentRefused(Outcome),
+    #[error("the user ended the session")]
+    UserTerminated,
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -218,6 +241,18 @@ async fn handle_connection(incoming: quinn::Incoming, hooks: Hooks) -> Result<()
         Err(ConnError::AgentOffline) => {
             conn.close(close_code::AGENT_OFFLINE.into(), b"agent is not connected");
         }
+        Err(ConnError::ConsentRefused(outcome)) => {
+            conn.close(
+                close_code::CONSENT_REFUSED.into(),
+                outcome.refusal_reason().as_bytes(),
+            );
+        }
+        Err(ConnError::UserTerminated) => {
+            conn.close(
+                close_code::USER_TERMINATED.into(),
+                Outcome::UserTerminatedSession.refusal_reason().as_bytes(),
+            );
+        }
         Err(ConnError::Db(e)) => {
             error!(conn_id, "database error: {e}");
             conn.close(close_code::PROTOCOL_ERROR.into(), b"server error");
@@ -269,7 +304,16 @@ async fn dispatch(
                 username: grant.username.clone(),
             });
             let mut frames_sent = 0;
-            let result = serve_viewer(conn, &grant, send, recv, hooks, &mut frames_sent).await;
+            let result = serve_viewer(
+                conn,
+                &registry.pool,
+                &grant,
+                send,
+                recv,
+                hooks,
+                &mut frames_sent,
+            )
+            .await;
             if let Err(e) = viewers::end(&registry.pool, &grant, frames_sent).await {
                 warn!(conn_id, "recording viewer disconnect failed: {e}");
             }
@@ -336,7 +380,7 @@ async fn serve_agent(
     hooks: &Hooks,
 ) -> Result<(), ConnError> {
     let (to_agent, mut outbox) = mpsc::unbounded_channel::<Message>();
-    let link = hooks.hub.register(agent_id, to_agent.clone());
+    let link = hooks.hub.register(agent_id, version, to_agent.clone());
     // Agents older than protocol 3 do not know the streaming messages.
     if version >= 3 {
         let _ = to_agent.send(Message::ListMonitors);
@@ -375,6 +419,34 @@ async fn serve_agent(
                     debug!(%agent_id, count = monitors.len(), "monitor list");
                     link.set_monitors(monitors);
                 }
+                Message::DeviceInfo { kind } => {
+                    info!(%agent_id, ?kind, "device info");
+                    if let Some(registry) = &hooks.registry {
+                        match registry::record_device_kind(&registry.pool, agent_id, kind).await {
+                            Ok(Some(mode)) => {
+                                info!(%agent_id, ?mode, "default consent mode applied")
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(%agent_id, "recording device kind failed: {e}"),
+                        }
+                    }
+                }
+                Message::SessionDecision {
+                    session_id,
+                    outcome,
+                } => {
+                    info!(%agent_id, session_id, %outcome, "consent decided");
+                    link.on_decision(session_id, outcome);
+                }
+                Message::Clipboard(data) => {
+                    if data.size() <= MAX_CLIPBOARD_BYTES {
+                        link.on_clipboard(data);
+                    }
+                }
+                Message::UserTerminatedSessions => {
+                    warn!(%agent_id, viewers = link.viewers(), "user pressed Ctrl+F12");
+                    link.user_terminated();
+                }
                 other => {
                     warn!(%agent_id, ?other, "unexpected message on control stream");
                     return Err(ConnError::Protocol("unexpected message"));
@@ -404,9 +476,11 @@ async fn serve_agent(
     result
 }
 
-/// A viewer watching `grant.agent_id` through the relay.
+/// A viewer session with `grant.agent_id`, through the relay: consent
+/// first, then video out and input/clipboard in.
 async fn serve_viewer(
     conn: &quinn::Connection,
+    pool: &PgPool,
     grant: &ViewerGrant,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -417,10 +491,74 @@ async fn serve_viewer(
         .hub
         .get(&grant.agent_id)
         .ok_or(ConnError::AgentOffline)?;
+    let session_id = grant.session_id as u64;
+    let mut agent_closed = link.closed();
+    let mut terminations = link.terminations();
+    terminations.mark_unchanged();
+
+    // --- Consent --------------------------------------------------------
+    let policy = registry::get_policy(pool, &grant.agent_id).await?;
+    let (mode, on_no_user, timeout_secs) = match policy {
+        Some(p) => (
+            ConsentMode::from(p.consent_mode),
+            OnNoUser::from(p.on_no_user),
+            p.consent_timeout_secs.max(1) as u32,
+        ),
+        None => (ConsentMode::Notify, OnNoUser::Deny, 30),
+    };
+    if link.version < MIN_CONSENT_VERSION {
+        // It would ignore the request: refuse rather than skip consent.
+        warn!(agent_id = %grant.agent_id, version = link.version, "agent too old to enforce consent");
+        viewers::record_consent(pool, grant, mode, Outcome::ConsentUnavailable).await?;
+        return Err(ConnError::ConsentRefused(Outcome::ConsentUnavailable));
+    }
+    // From here on, however this ends, the agent hears that it did.
+    let _ended = EndSession {
+        link: &link,
+        session_id,
+    };
+    if mode == ConsentMode::Require {
+        write_frame(&mut send, &Message::ConsentPending { timeout_secs }).await?;
+    }
+    let decision = link.request_session(SessionRequest {
+        session_id,
+        technician: grant.username.clone(),
+        mode,
+        on_no_user,
+        timeout_secs,
+    });
+    let wait = Duration::from_secs(timeout_secs.into()) + DECISION_GRACE;
+    let outcome = tokio::select! {
+        decided = tokio::time::timeout(wait, decision) => match decided {
+            Ok(Ok(outcome)) => outcome,
+            // No answer from the agent: nobody approved it.
+            _ => Outcome::ConsentUnavailable,
+        },
+        // (The watch guard is dropped at once: it must not live across an await.)
+        _ = async { agent_closed.wait_for(|closed| *closed).await.map(drop) } => {
+            return Err(ConnError::AgentOffline)
+        }
+        _ = terminations.changed() => {
+            viewers::record_user_terminated(pool, grant).await?;
+            return Err(ConnError::UserTerminated);
+        }
+        _ = conn.closed() => {
+            info!(session_id, "viewer left while consent was pending");
+            return Ok(());
+        }
+    };
+    viewers::record_consent(pool, grant, mode, outcome).await?;
+    if !outcome.allows_session() {
+        info!(session_id, %outcome, "session refused");
+        return Err(ConnError::ConsentRefused(outcome));
+    }
+    info!(session_id, %outcome, "session started");
+
+    // --- Session ---------------------------------------------------------
     let viewer_id = hooks.hub.next_viewer_id();
     let mut monitors = link.monitors();
     let mut stream_monitor = link.stream_monitor();
-    let mut agent_closed = link.closed();
+    let mut clipboard = link.clipboard();
 
     let (to_viewer, mut outbox) = mpsc::unbounded_channel::<Message>();
     let _ = to_viewer.send(Message::ViewerWelcome {
@@ -458,7 +596,17 @@ async fn serve_viewer(
                         let _ = to_viewer.send(Message::StreamMonitor { monitor });
                     }
                 }
-                _ = agent_closed.wait_for(|closed| *closed) => break,
+                data = clipboard.recv() => match data {
+                    Ok(data) => { let _ = to_viewer.send(Message::Clipboard(data)); }
+                    // Missed some: only the latest matters, and it comes next.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = terminations.changed() => {
+                    viewers::record_user_terminated(pool, grant).await?;
+                    return Err(ConnError::UserTerminated);
+                }
+                _ = async { agent_closed.wait_for(|closed| *closed).await.map(drop) } => break,
             }
         }
         Err::<(), _>(ConnError::AgentOffline)
@@ -468,6 +616,16 @@ async fn serve_viewer(
             match msg {
                 Message::SelectMonitor { monitor } => link.select_monitor(monitor),
                 Message::RequestKeyframe => link.viewer_requests_keyframe(viewer_id),
+                Message::Input(event) => link.send(Message::SessionInput { session_id, event }),
+                Message::Clipboard(data) if data.size() <= MAX_CLIPBOARD_BYTES => {
+                    link.send(Message::SessionClipboard { session_id, data })
+                }
+                Message::Clipboard(data) => {
+                    warn!(
+                        bytes = data.size(),
+                        "oversized clipboard from viewer dropped"
+                    )
+                }
                 other => {
                     warn!(?other, "unexpected message from viewer");
                     return Err(ConnError::Protocol("unexpected message"));
@@ -482,6 +640,18 @@ async fn serve_viewer(
         r = forward => r,
         r = notify => r,
         r = reader => r,
+    }
+}
+
+/// Tells the agent a session is over when dropped.
+struct EndSession<'a> {
+    link: &'a crate::relay::AgentLink,
+    session_id: u64,
+}
+
+impl Drop for EndSession<'_> {
+    fn drop(&mut self) {
+        self.link.end_session(self.session_id);
     }
 }
 

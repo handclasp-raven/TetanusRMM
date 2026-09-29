@@ -32,6 +32,26 @@ pub fn fit(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u32, u3
     )
 }
 
+/// Inverse of [`fit`]: the picture pixel under window position `(x, y)`
+/// (physical pixels), or `None` in the letterbox bars.
+pub fn unfit(
+    (x, y): (f64, f64),
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<(u32, u32)> {
+    let (ox, oy, w, h) = fit(src_w, src_h, dst_w, dst_h);
+    let (rx, ry) = (x - f64::from(ox), y - f64::from(oy));
+    if w == 0 || rx < 0.0 || ry < 0.0 || rx >= f64::from(w) || ry >= f64::from(h) {
+        return None;
+    }
+    // Same nearest-neighbour mapping as `draw_picture`.
+    let px = (rx.floor() as u64 * u64::from(src_w) / u64::from(w)) as u32;
+    let py = (ry.floor() as u64 * u64::from(src_h) / u64::from(h)) as u32;
+    Some((px.min(src_w - 1), py.min(src_h - 1)))
+}
+
 /// Scale `src` into `dst` (nearest neighbour), letterboxed on `BACKGROUND`.
 pub fn draw_picture(src: &[u32], src_w: u32, src_h: u32, dst: &mut [u32], dst_w: u32, dst_h: u32) {
     dst.fill(BACKGROUND);
@@ -149,6 +169,40 @@ pub fn draw_status(canvas: &mut Canvas, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfit_finds_the_picture_pixel_under_the_cursor() {
+        // 1920x1080 in a 1000x1000 window: letterboxed top and bottom.
+        let (ox, oy, w, h) = fit(1920, 1080, 1000, 1000);
+        assert_eq!((ox, oy, w, h), (0, 219, 1000, 562));
+        assert_eq!(unfit((0.0, 219.0), 1920, 1080, 1000, 1000), Some((0, 0)));
+        assert_eq!(
+            unfit((999.9, 780.9), 1920, 1080, 1000, 1000),
+            Some((1918, 1078))
+        );
+        assert_eq!(unfit((500.0, 100.0), 1920, 1080, 1000, 1000), None, "bar");
+        assert_eq!(unfit((500.0, 781.0), 1920, 1080, 1000, 1000), None, "bar");
+        assert_eq!(unfit((-1.0, 500.0), 1920, 1080, 1000, 1000), None);
+    }
+
+    #[test]
+    fn unfit_agrees_with_draw_picture() {
+        // Each pixel's colour encodes its position; what is drawn at a window
+        // position must be the pixel unfit reports for it.
+        let (sw, sh, dw, dh) = (37u32, 23u32, 101u32, 77u32);
+        let src: Vec<u32> = (0..sw * sh).collect();
+        let mut dst = vec![0u32; (dw * dh) as usize];
+        draw_picture(&src, sw, sh, &mut dst, dw, dh);
+        for y in 0..dh {
+            for x in 0..dw {
+                let drawn = dst[(y * dw + x) as usize];
+                match unfit((f64::from(x) + 0.5, f64::from(y) + 0.5), sw, sh, dw, dh) {
+                    Some((px, py)) => assert_eq!(drawn, py * sw + px, "at {x},{y}"),
+                    None => assert_eq!(drawn, BACKGROUND, "at {x},{y}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn fit_keeps_aspect_ratio_and_centres() {

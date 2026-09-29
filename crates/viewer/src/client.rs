@@ -2,6 +2,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use protocol::clipboard::ClipboardData;
+use protocol::input::InputEvent;
 use protocol::media::{MediaFrame, MonitorInfo};
 use protocol::{read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
@@ -51,6 +53,8 @@ pub enum ViewerEvent {
     /// The stream now shows this monitor.
     StreamMonitor(u32),
     Frame(MediaFrame),
+    /// The remote user's clipboard changed.
+    Clipboard(ClipboardData),
     /// The connection ended; the reason is human-readable.
     Closed(String),
 }
@@ -71,6 +75,16 @@ impl ViewerHandle {
     /// Ask for a keyframe, e.g. after a decode error.
     pub fn request_keyframe(&self) {
         let _ = self.commands.send(Message::RequestKeyframe);
+    }
+
+    /// Inject input on the remote machine.
+    pub fn send_input(&self, event: InputEvent) {
+        let _ = self.commands.send(Message::Input(event));
+    }
+
+    /// Put `data` on the remote clipboard.
+    pub fn send_clipboard(&self, data: ClipboardData) {
+        let _ = self.commands.send(Message::Clipboard(data));
     }
 
     pub fn close(&self) {
@@ -95,9 +109,26 @@ async fn close_reason(conn: &quinn::Connection, fallback: impl std::fmt::Display
     }
 }
 
+/// Progress reported before the session starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// The remote user is being asked to accept, for up to `timeout_secs`.
+    WaitingForConsent { timeout_secs: u32 },
+}
+
 /// Connect, authenticate with the token, and start receiving.
 pub async fn connect(
     options: &ViewerOptions,
+) -> Result<(Welcome, ViewerHandle, mpsc::Receiver<ViewerEvent>), ClientError> {
+    connect_with_status(options, |_| {}).await
+}
+
+/// [`connect`], reporting progress (such as waiting for the remote user's
+/// consent) to `status`. A refused session is [`ClientError::Refused`] with
+/// the server's reason.
+pub async fn connect_with_status(
+    options: &ViewerOptions,
+    mut status: impl FnMut(Pending),
 ) -> Result<(Welcome, ViewerHandle, mpsc::Receiver<ViewerEvent>), ClientError> {
     let ca = common::tls::certs_from_pem(&options.ca_pem)?;
     let bind = options.bind.unwrap_or(match options.server {
@@ -120,23 +151,30 @@ pub async fn connect(
         },
     )
     .await?;
-    let welcome = match read_frame::<_, Message>(&mut recv).await {
-        Ok(Some(Message::ViewerWelcome {
-            agent_id,
-            monitors,
-            active_monitor,
-        })) => Welcome {
-            agent_id,
-            monitors,
-            active_monitor,
-        },
-        Ok(Some(other)) => return Err(ClientError::Unexpected(Box::new(other))),
-        Ok(None) => {
-            return Err(ClientError::Refused(
-                close_reason(&conn, "connection closed").await,
-            ))
+    let welcome = loop {
+        match read_frame::<_, Message>(&mut recv).await {
+            Ok(Some(Message::ConsentPending { timeout_secs })) => {
+                status(Pending::WaitingForConsent { timeout_secs });
+            }
+            Ok(Some(Message::ViewerWelcome {
+                agent_id,
+                monitors,
+                active_monitor,
+            })) => {
+                break Welcome {
+                    agent_id,
+                    monitors,
+                    active_monitor,
+                }
+            }
+            Ok(Some(other)) => return Err(ClientError::Unexpected(Box::new(other))),
+            Ok(None) => {
+                return Err(ClientError::Refused(
+                    close_reason(&conn, "connection closed").await,
+                ))
+            }
+            Err(e) => return Err(ClientError::Refused(close_reason(&conn, e).await)),
         }
-        Err(e) => return Err(ClientError::Refused(close_reason(&conn, e).await)),
     };
 
     let (events_tx, events) = mpsc::channel(EVENT_QUEUE);
@@ -158,6 +196,7 @@ pub async fn connect(
                 let event = match msg {
                     Message::MonitorList { monitors } => ViewerEvent::Monitors(monitors),
                     Message::StreamMonitor { monitor } => ViewerEvent::StreamMonitor(monitor),
+                    Message::Clipboard(data) => ViewerEvent::Clipboard(data),
                     other => {
                         debug!(?other, "ignoring control message");
                         continue;

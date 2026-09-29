@@ -38,6 +38,12 @@ pub enum Action {
     ViewerSessionCreate,
     ViewerConnect,
     ViewerDisconnect,
+    /// The device's reported kind applied its default consent mode.
+    PolicyDefault,
+    /// A viewer session's consent was decided; detail has mode and outcome.
+    SessionStart,
+    /// The user ended a session with the Ctrl+F12 kill switch.
+    SessionUserTerminated,
 }
 
 impl Action {
@@ -54,6 +60,9 @@ impl Action {
             Action::ViewerSessionCreate => "viewer.session_create",
             Action::ViewerConnect => "viewer.connect",
             Action::ViewerDisconnect => "viewer.disconnect",
+            Action::PolicyDefault => "policy.default",
+            Action::SessionStart => "session.start",
+            Action::SessionUserTerminated => "session.user_terminated",
         }
     }
 }

@@ -7,13 +7,19 @@
 //! - [`update`] and [`updater`]: signed self-update.
 //! - [`telemetry`]: health samples sent on each heartbeat.
 //! - [`core`]: the connect/heartbeat/update loop shared by console and service mode.
+//! - [`interactive`]: consent, remote input, clipboard and the kill switch.
+//! - [`input`]: mouse-coordinate mapping and held-key tracking.
+//! - [`device`]: workstation or server (picks the default consent mode).
 //! - [`session`]: when to (re)start the helper in the user's session.
 //! - [`paths`]: where the agent keeps its files.
 //! - `win` (Windows only): the service, the session helper and its tray icon.
 
 pub mod core;
 pub mod credstore;
+pub mod device;
 pub mod enroll;
+pub mod input;
+pub mod interactive;
 pub mod media;
 pub mod paths;
 pub mod session;
@@ -28,13 +34,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::Identity;
+use protocol::consent::{decide, Decision, DeviceKind, Outcome, SessionRequest};
 use protocol::media::VideoPayload;
 use protocol::{close_code, read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::interactive::{DesktopCommand, DesktopEvent, DesktopLink, Sessions};
 use crate::media::source::{MediaCommand, MediaEvent, MediaLink};
 use crate::telemetry::TelemetrySource;
 
@@ -58,6 +66,12 @@ pub struct AgentConfig {
     pub telemetry: Option<Arc<dyn TelemetrySource>>,
     /// Screen source for streaming, if any (Windows: the session helper).
     pub media: Option<Arc<MediaLink>>,
+    /// The user's desktop, for consent prompts, toasts, input and clipboard
+    /// (Windows: the session helper). Without one, no user is considered
+    /// present and input is dropped.
+    pub desktop: Option<Arc<DesktopLink>>,
+    /// Reported to the server; picks the default consent mode.
+    pub device_kind: DeviceKind,
 }
 
 /// What the agent observed, for tests.
@@ -98,6 +112,8 @@ pub struct AgentSession {
     heartbeat_interval: Duration,
     telemetry: Option<Arc<dyn TelemetrySource>>,
     media: Option<Arc<MediaLink>>,
+    desktop: Option<Arc<DesktopLink>>,
+    device_kind: DeviceKind,
 }
 
 /// Connect to the server and complete the mutual-TLS handshake.
@@ -123,6 +139,8 @@ pub async fn connect(config: &AgentConfig) -> Result<AgentSession, AgentError> {
         heartbeat_interval: config.heartbeat_interval,
         telemetry: config.telemetry.clone(),
         media: config.media.clone(),
+        desktop: config.desktop.clone(),
+        device_kind: config.device_kind,
     })
 }
 
@@ -159,7 +177,9 @@ impl AgentSession {
     }
 
     /// Send Hello, then heartbeat until the connection or stream ends,
-    /// serving the server's streaming commands if a media source is attached.
+    /// serving the server's streaming commands if a media source is attached
+    /// and its session requests (consent, input, clipboard) through the
+    /// desktop link.
     ///
     /// Only returns on failure; a healthy session runs forever.
     pub async fn run(&self, events: Option<UnboundedSender<AgentEvent>>) -> Result<(), AgentError> {
@@ -171,11 +191,18 @@ impl AgentSession {
             agent_id: self.agent_id.clone(),
             version: PROTOCOL_VERSION,
         });
+        let _ = outbox_tx.send(Message::DeviceInfo {
+            kind: self.device_kind,
+        });
         if let Some(media) = &self.media {
             // Fresh connection, fresh start: any stream from a previous
             // connection has no viewers any more.
             let _ = media.commands.send(MediaCommand::Stop);
         }
+        let sessions = Arc::new(std::sync::Mutex::new(Sessions::default()));
+        publish_technicians(self.desktop.as_deref(), &sessions);
+        // Consent prompts run concurrently; dropped (aborted) with the session.
+        let mut consent_tasks = tokio::task::JoinSet::new();
 
         let writer = async {
             while let Some(msg) = outbox.recv().await {
@@ -226,8 +253,68 @@ impl AgentSession {
                         }
                         continue;
                     }
+                    Message::SessionRequest(request) => {
+                        info!(
+                            session_id = request.session_id,
+                            technician = %request.technician,
+                            mode = ?request.mode,
+                            "session requested"
+                        );
+                        lock(&sessions).requested(request.session_id);
+                        while consent_tasks.try_join_next().is_some() {}
+                        consent_tasks.spawn(consent(
+                            request,
+                            self.desktop.clone(),
+                            sessions.clone(),
+                            outbox_tx.clone(),
+                        ));
+                        continue;
+                    }
+                    Message::SessionEnded { session_id } => {
+                        let ended = lock(&sessions).ended(session_id);
+                        info!(session_id, "session ended");
+                        if let Some(desktop) = &self.desktop {
+                            for event in ended.releases {
+                                let _ = desktop.commands.send(DesktopCommand::Input(event));
+                            }
+                            if ended.was_pending {
+                                let _ = desktop.commands.send(DesktopCommand::CancelPrompt {
+                                    request_id: session_id,
+                                });
+                            }
+                        }
+                        publish_technicians(self.desktop.as_deref(), &sessions);
+                        continue;
+                    }
+                    Message::SessionInput { session_id, event } => {
+                        let event = lock(&sessions).input(session_id, event);
+                        match (event, &self.desktop) {
+                            (Some(event), Some(desktop)) => {
+                                let _ = desktop.commands.send(DesktopCommand::Input(event));
+                            }
+                            (None, _) => {
+                                debug!(session_id, "input for an inactive session dropped")
+                            }
+                            (Some(_), None) => {}
+                        }
+                        continue;
+                    }
+                    Message::SessionClipboard { session_id, data } => {
+                        let active = lock(&sessions).is_active(session_id);
+                        if let (true, Some(desktop)) = (active, &self.desktop) {
+                            let _ = desktop.commands.send(DesktopCommand::SetClipboard(data));
+                        }
+                        continue;
+                    }
                     Message::ListMonitors => MediaCommand::ListMonitors,
-                    Message::StartStream { monitor } => MediaCommand::Start { monitor },
+                    Message::StartStream { monitor } => {
+                        // Only stream for a session this agent granted.
+                        if !lock(&sessions).any_active() {
+                            warn!(monitor, "stream requested with no active session; ignored");
+                            continue;
+                        }
+                        MediaCommand::Start { monitor }
+                    }
                     Message::StopStream => MediaCommand::Stop,
                     Message::RequestKeyframe => MediaCommand::ForceKeyframe,
                     other => return Err(AgentError::Unexpected(other)),
@@ -285,6 +372,32 @@ impl AgentSession {
             std::future::pending().await
         };
 
+        // The user's clipboard, and the Ctrl+F12 kill switch.
+        let desktop_events = async {
+            let Some(desktop) = &self.desktop else {
+                return std::future::pending::<Result<(), AgentError>>().await;
+            };
+            let mut source = desktop.events.lock().await;
+            while let Some(event) = source.recv().await {
+                match event {
+                    DesktopEvent::Clipboard(data) => {
+                        // Never leak the user's clipboard when nobody is connected.
+                        if lock(&sessions).any_active() {
+                            let _ = outbox_tx.send(Message::Clipboard(data));
+                        }
+                    }
+                    DesktopEvent::KillSwitch => {
+                        let ended = self.end_all_sessions(&sessions);
+                        warn!(sessions = ?ended, "user pressed Ctrl+F12: all sessions terminated");
+                        if !ended.is_empty() {
+                            let _ = outbox_tx.send(Message::UserTerminatedSessions);
+                        }
+                    }
+                }
+            }
+            std::future::pending().await
+        };
+
         // Each branch only finishes on error. read_frame is not cancel-safe,
         // which is fine: the losers are dropped along with the session.
         let result: Result<(), AgentError> = tokio::select! {
@@ -292,13 +405,39 @@ impl AgentSession {
             res = heartbeats => res,
             res = reader => res,
             res = pump => res,
+            res = desktop_events => res,
         };
+        // Sessions do not survive the connection.
+        self.end_all_sessions(&sessions);
         if let Err(AgentError::Unexpected(msg)) = &result {
             warn!(?msg, "closing connection after protocol violation");
             self.connection
                 .close(close_code::PROTOCOL_ERROR.into(), b"unexpected message");
         }
         result
+    }
+
+    /// End every session locally: release held input, withdraw prompts,
+    /// clear the tray list and stop capturing. Returns the ids of the
+    /// sessions (active or pending) that were ended.
+    fn end_all_sessions(&self, sessions: &std::sync::Mutex<Sessions>) -> Vec<u64> {
+        let (mut ended, cancelled, releases) = lock(sessions).terminate_all();
+        if let Some(desktop) = &self.desktop {
+            for event in releases {
+                let _ = desktop.commands.send(DesktopCommand::Input(event));
+            }
+            for &request_id in &cancelled {
+                let _ = desktop
+                    .commands
+                    .send(DesktopCommand::CancelPrompt { request_id });
+            }
+        }
+        publish_technicians(self.desktop.as_deref(), sessions);
+        if let Some(media) = &self.media {
+            let _ = media.commands.send(MediaCommand::Stop);
+        }
+        ended.extend(cancelled);
+        ended
     }
 
     /// Why the connection closed, if it has.
@@ -311,6 +450,68 @@ impl AgentSession {
         self.connection
             .close(close_code::NORMAL.into(), b"agent shutting down");
     }
+}
+
+fn lock(sessions: &std::sync::Mutex<Sessions>) -> std::sync::MutexGuard<'_, Sessions> {
+    sessions.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Tell the desktop who is connected (for the tray).
+fn publish_technicians(desktop: Option<&DesktopLink>, sessions: &std::sync::Mutex<Sessions>) {
+    if let Some(desktop) = desktop {
+        let list = lock(sessions).technicians();
+        let _ = desktop.commands.send(DesktopCommand::Technicians(list));
+    }
+}
+
+/// Apply the consent policy to one request and report the outcome.
+async fn consent(
+    request: SessionRequest,
+    desktop: Option<Arc<DesktopLink>>,
+    sessions: Arc<std::sync::Mutex<Sessions>>,
+    outbox: UnboundedSender<Message>,
+) {
+    let user_present = desktop.as_ref().is_some_and(|d| (d.user_present)());
+    let outcome = match decide(request.mode, user_present, request.on_no_user) {
+        Decision::Proceed(outcome) | Decision::Refuse(outcome) => outcome,
+        Decision::Ask => match &desktop {
+            Some(desktop) => {
+                let timeout = Duration::from_secs(request.timeout_secs.into());
+                desktop
+                    .prompt(request.session_id, &request.technician, timeout)
+                    .await
+                    .outcome()
+            }
+            None => Outcome::ConsentUnavailable,
+        },
+    };
+    let started = lock(&sessions).resolved(
+        request.session_id,
+        &request.technician,
+        request.mode,
+        outcome,
+    );
+    info!(
+        session_id = request.session_id,
+        technician = %request.technician,
+        mode = ?request.mode,
+        user_present,
+        %outcome,
+        started,
+        "consent decided"
+    );
+    if started {
+        publish_technicians(desktop.as_deref(), &sessions);
+        if let (Outcome::Notify, Some(desktop)) = (outcome, &desktop) {
+            let _ = desktop.commands.send(DesktopCommand::Toast {
+                technician: request.technician.clone(),
+            });
+        }
+    }
+    let _ = outbox.send(Message::SessionDecision {
+        session_id: request.session_id,
+        outcome,
+    });
 }
 
 fn unix_millis() -> u64 {

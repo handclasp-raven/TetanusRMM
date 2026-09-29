@@ -271,10 +271,17 @@ fans the one stream out. Other points:
    # or: RMM_VIEWER_TOKEN=<token> viewer --ca dev-certs/ca.crt
    ```
 
-   In the window:
-   - **Tab** or **M** shows the monitor picker; **1–9** switches monitor.
-   - **F5** requests a fresh keyframe.
-   - **Esc** closes the picker, or the viewer.
+   In the window, mouse, wheel and keyboard go to the remote machine (keys
+   are sent by physical position, so the remote keyboard layout applies).
+   The viewer's own shortcuts all use **Ctrl+Alt+Shift**:
+   - **Ctrl+Alt+Shift+M** shows the monitor picker (then **1–9** picks,
+     **Esc** closes it); **Ctrl+Alt+Shift+1–9** switches monitor directly.
+   - **Ctrl+Alt+Shift+F5** requests a fresh keyframe.
+   - **Ctrl+Alt+Shift+Q** (or closing the window) quits.
+
+   Under the `require` consent mode the viewer shows "Waiting for the remote
+   user to accept" until the user answers (see
+   [Consent and notifications](#consent-and-notifications)).
 
    `--monitor N` picks a monitor at startup. `--snapshot out.ppm --frames N`
    is headless: it decodes N frames, writes the last one, and exits. Use it
@@ -284,6 +291,61 @@ The server audits `viewer.session_create`, `viewer.connect` and
 `viewer.disconnect` (the last with duration and frames sent). A token that
 has expired or already been used is refused, as is a token for an agent that
 isn't connected ("agent is not connected").
+
+### Consent and notifications
+
+Every session is gated by the device's **consent policy**, read from the
+`device_policies` row for the agent (`GET`/`PUT /api/agents/{id}/policy`;
+changes are audited as `policy.update`). The server sends the agent a
+session request carrying the policy; the agent, which alone knows whether a
+user is logged on, decides, and the session (video, input, clipboard)
+starts only if the outcome allows it.
+
+| Mode | User logged on | Nobody logged on |
+|---|---|---|
+| `require` | Blocking Yes/No prompt naming the technician. **Yes** → `granted`; **No** → `denied`; no answer within `consent_timeout_secs` → `timeout`. | `on_no_user`: `deny` → `consent_unavailable` (refused), `allow` → `bypassed_no_user` (starts) |
+| `notify` | Starts at once; a toast names the technician → `notify` | Starts → `notify_no_user` |
+| `unattended` | Starts silently, no prompt or toast → `unattended` | `unattended` |
+
+**Defaults.** A new device starts as `notify`. When the agent first connects
+it reports whether it is a workstation or a server (Windows product type):
+workstations stay `notify`, servers become `unattended` (audited as
+`policy.default` by `system`). Once an admin sets a device's policy, the
+reported kind no longer changes it. `on_no_user` defaults to `deny`,
+`consent_timeout_secs` to 30.
+
+**What the user sees** (Windows, in the session helper):
+- A toast "*technician* connected to this computer" for each `notify`
+  session, including concurrent ones.
+- The tray tooltip and menu list every connected technician (`notify` and
+  `require` sessions; `unattended` ones are silent). The tray icon turns
+  blue while anyone is connected.
+- **Ctrl+F12** (or the tray's *End all remote sessions*) immediately ends
+  every session. Viewers are closed with "the user ended the session", and
+  each session is audited as `session.user_terminated` (outcome
+  `user_terminated_session`). A technician cannot send Ctrl+F12 for the user:
+  the agent drops that chord from remote input.
+
+Every session's consent is audited as `session.start` with `mode`,
+`outcome` and `started`. Refused viewers see the reason ("the user declined
+the session", "the user did not respond to the consent prompt", "nobody is
+available to approve the session"). An agent older than protocol 4 cannot
+enforce consent, so viewing it is refused.
+
+The agent enforces this itself too: it only injects input, applies
+clipboard or streams for sessions it granted, and it releases any keys or
+buttons a technician was holding when their session ends.
+
+**Clipboard** syncs both ways while a session is active: text, and a file
+list copied on the remote machine (sent as its paths, pasted as text on the
+viewer; the files themselves are not transferred). Content over 1 MiB is not
+synced, what was on either clipboard before connecting is never sent, and a
+loop guard stops the two sides echoing a copy back and forth.
+
+Known limits (planned for Phase 9, secure desktop): input cannot reach UAC
+prompts or the lock/login screen, and because the helper runs as the user,
+Windows drops input aimed at elevated windows. A locked workstation cannot
+answer a `require` prompt, so the request times out.
 
 ### Capture and encoding on the agent
 

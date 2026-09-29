@@ -33,6 +33,52 @@ pub enum OnNoUser {
     Allow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "device_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    Workstation,
+    Server,
+}
+
+impl From<protocol::consent::DeviceKind> for DeviceKind {
+    fn from(kind: protocol::consent::DeviceKind) -> Self {
+        match kind {
+            protocol::consent::DeviceKind::Workstation => DeviceKind::Workstation,
+            protocol::consent::DeviceKind::Server => DeviceKind::Server,
+        }
+    }
+}
+
+impl From<protocol::consent::ConsentMode> for ConsentMode {
+    fn from(mode: protocol::consent::ConsentMode) -> Self {
+        match mode {
+            protocol::consent::ConsentMode::Require => ConsentMode::Require,
+            protocol::consent::ConsentMode::Notify => ConsentMode::Notify,
+            protocol::consent::ConsentMode::Unattended => ConsentMode::Unattended,
+        }
+    }
+}
+
+impl From<ConsentMode> for protocol::consent::ConsentMode {
+    fn from(mode: ConsentMode) -> Self {
+        match mode {
+            ConsentMode::Require => protocol::consent::ConsentMode::Require,
+            ConsentMode::Notify => protocol::consent::ConsentMode::Notify,
+            ConsentMode::Unattended => protocol::consent::ConsentMode::Unattended,
+        }
+    }
+}
+
+impl From<OnNoUser> for protocol::consent::OnNoUser {
+    fn from(on_no_user: OnNoUser) -> Self {
+        match on_no_user {
+            OnNoUser::Deny => protocol::consent::OnNoUser::Deny,
+            OnNoUser::Allow => protocol::consent::OnNoUser::Allow,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct Agent {
     pub id: String,
@@ -47,6 +93,7 @@ pub struct Agent {
     pub uptime_secs: Option<i64>,
     pub telemetry_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub device_kind: Option<DeviceKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
@@ -148,6 +195,62 @@ pub async fn touch(
     Ok(())
 }
 
+/// Record the device kind an agent reported (on every connect).
+///
+/// While no admin has set the device's policy, the kind picks its consent
+/// mode: `notify` for a workstation, `unattended` for a server. A change is
+/// audited as `policy.default` by `system`. Returns the new mode if it
+/// changed.
+pub async fn record_device_kind(
+    pool: &PgPool,
+    agent_id: &str,
+    kind: protocol::consent::DeviceKind,
+) -> sqlx::Result<Option<ConsentMode>> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<DeviceKind>, ConsentMode, bool)> = sqlx::query_as(
+        "SELECT a.device_kind, p.consent_mode, p.admin_set
+         FROM agents a JOIN device_policies p ON p.agent_id = a.id
+         WHERE a.id = $1 FOR UPDATE",
+    )
+    .bind(agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((previous, mode, admin_set)) = row else {
+        return Ok(None);
+    };
+    if previous != Some(kind.into()) {
+        sqlx::query("UPDATE agents SET device_kind = $2 WHERE id = $1")
+            .bind(agent_id)
+            .bind(DeviceKind::from(kind))
+            .execute(&mut *tx)
+            .await?;
+    }
+    let default = ConsentMode::from(protocol::consent::default_mode(kind));
+    let changed = !admin_set && mode != default;
+    if changed {
+        sqlx::query(
+            "UPDATE device_policies SET consent_mode = $2, updated_at = now() WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .bind(default)
+        .execute(&mut *tx)
+        .await?;
+        audit::append(
+            &mut tx,
+            NewEntry::new("system", Action::PolicyDefault)
+                .target(agent_id)
+                .detail(json!({
+                    "device_kind": DeviceKind::from(kind),
+                    "before": { "consent_mode": mode },
+                    "after": { "consent_mode": default },
+                })),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(changed.then_some(default))
+}
+
 pub async fn list_agents(pool: &PgPool) -> sqlx::Result<Vec<Agent>> {
     sqlx::query_as("SELECT * FROM agents ORDER BY id")
         .fetch_all(pool)
@@ -164,7 +267,8 @@ pub async fn get_policy(pool: &PgPool, agent_id: &str) -> sqlx::Result<Option<De
     .await
 }
 
-/// Replace an agent's policy. Audited as `policy.update` with before and after.
+/// Replace an agent's policy. Audited as `policy.update` with before and
+/// after. From then on the device's reported kind no longer changes it.
 pub async fn update_policy(
     pool: &PgPool,
     actor: &str,
@@ -186,7 +290,8 @@ pub async fn update_policy(
 
     sqlx::query(
         "UPDATE device_policies
-         SET consent_mode = $2, on_no_user = $3, consent_timeout_secs = $4, updated_at = now()
+         SET consent_mode = $2, on_no_user = $3, consent_timeout_secs = $4,
+             admin_set = true, updated_at = now()
          WHERE agent_id = $1",
     )
     .bind(agent_id)

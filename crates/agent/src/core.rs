@@ -27,6 +27,8 @@ pub struct CoreOptions {
     pub telemetry: Option<Arc<dyn TelemetrySource>>,
     /// Screen source for streaming (Windows service: the session helper).
     pub media: Option<Arc<crate::media::source::MediaLink>>,
+    /// The user's desktop (Windows service: the session helper).
+    pub desktop: Option<Arc<crate::interactive::DesktopLink>>,
 }
 
 pub fn version() -> &'static str {
@@ -51,6 +53,7 @@ pub async fn run(
     let mut config = credential.agent_config(options.heartbeat_interval)?;
     config.telemetry = options.telemetry;
     config.media = options.media;
+    config.desktop = options.desktop;
     tokio::select! {
         () = connect_forever(&config, &status) => unreachable!("connect_forever never returns"),
         update = update_loop(credential, options.update_interval) => Ok(update),

@@ -5,11 +5,13 @@
 //! The viewer (launched by the TUI) presents it in `ViewerHello` on its QUIC
 //! connection; [`connect`] consumes it. Tokens live [`TOKEN_TTL`], work once,
 //! and only their SHA-256 is stored. Create, connect and disconnect are all
-//! audited.
+//! audited, as are the consent outcome (`session.start`) and a Ctrl+F12
+//! termination (`session.user_terminated`).
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use protocol::consent::{ConsentMode, Outcome};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -144,4 +146,44 @@ pub async fn end(pool: &PgPool, grant: &ViewerGrant, frames_sent: u64) -> sqlx::
     )
     .await?;
     tx.commit().await
+}
+
+/// Record how consent for a viewer session was decided. Audited as
+/// `session.start` with the mode in effect and the outcome, whether or not
+/// the session was allowed to start.
+pub async fn record_consent(
+    pool: &PgPool,
+    grant: &ViewerGrant,
+    mode: ConsentMode,
+    outcome: Outcome,
+) -> sqlx::Result<()> {
+    audit::append_now(
+        pool,
+        NewEntry::new(&grant.username, Action::SessionStart)
+            .target(&grant.agent_id)
+            .detail(json!({
+                "viewer_session_id": grant.session_id,
+                "mode": mode,
+                "outcome": outcome,
+                "started": outcome.allows_session(),
+            })),
+    )
+    .await
+    .map(drop)
+}
+
+/// Record that the user ended this session with Ctrl+F12. Audited as
+/// `session.user_terminated` (outcome `user_terminated_session`).
+pub async fn record_user_terminated(pool: &PgPool, grant: &ViewerGrant) -> sqlx::Result<()> {
+    audit::append_now(
+        pool,
+        NewEntry::new(&grant.username, Action::SessionUserTerminated)
+            .target(&grant.agent_id)
+            .detail(json!({
+                "viewer_session_id": grant.session_id,
+                "outcome": Outcome::UserTerminatedSession,
+            })),
+    )
+    .await
+    .map(drop)
 }

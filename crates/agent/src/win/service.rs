@@ -25,6 +25,7 @@ use super::{acl, pipe, process};
 use crate::core::{self, CoreOptions};
 use crate::credstore::{Credential, CredentialStore};
 use crate::enroll::{self, EnrollRequest};
+use crate::interactive::desktop_channel;
 use crate::media::source::media_channel;
 use crate::session::{Action, Backoff, Supervisor};
 use crate::telemetry::SystemTelemetry;
@@ -303,7 +304,10 @@ async fn service_body(
     let helper_pid = Arc::new(AtomicU32::new(0));
     // Screen streaming: the core talks to the helper through the bridge.
     let (media_link, media_source) = media_channel();
-    let bridge = Bridge::start(media_source);
+    // Consent, input and clipboard: likewise, through the helper. A user is
+    // "present" (to be asked or told) when someone is logged on at the console.
+    let (desktop_link, desktop_end) = desktop_channel(|| process::console_user_session().is_some());
+    let bridge = Bridge::start(media_source, desktop_end);
     tokio::spawn({
         let helper_pid = helper_pid.clone();
         async move {
@@ -328,6 +332,7 @@ async fn service_body(
             update_interval: UPDATE_INTERVAL,
             telemetry: Some(Arc::new(SystemTelemetry::new())),
             media: Some(Arc::new(media_link)),
+            desktop: Some(Arc::new(desktop_link)),
         };
         core::run(&credential, options, status_tx).await
     };

@@ -59,6 +59,8 @@ impl Credential {
             bind_addr: None,
             telemetry: None,
             media: None,
+            desktop: None,
+            device_kind: crate::device::kind(),
         })
     }
 }

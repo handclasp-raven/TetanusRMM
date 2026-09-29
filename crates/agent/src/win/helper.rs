@@ -1,56 +1,99 @@
-//! The session helper: runs as the logged-on user, on their desktop, and
-//! shows the tray icon. Connects back to the service over the named pipe and
-//! exits when the pipe closes (the service restarts it if it should run).
+//! The session helper: runs as the logged-on user, on their desktop.
+//! Connects back to the service over the named pipe and exits when the pipe
+//! closes (the service restarts it if it should run).
 //!
-//! In this phase it is a shell: icon, tooltip showing connection state, and
-//! a menu with About and a disabled Quit (the user cannot stop the agent).
+//! It owns everything that must happen on the user's desktop:
+//! - the tray icon: connection state, and everyone connected right now
+//!   (tooltip and menu), with "End all remote sessions";
+//! - the Ctrl+F12 hotkey, which ends every remote session;
+//! - consent prompts (`require` mode) and "technician connected" toasts;
+//! - input injection, clipboard sync, and (in `stream`) screen capture.
+//!
+//! Threads: the UI thread runs the tray, the hotkey and the clipboard
+//! listener (all need its message loop); the pipe thread talks to the
+//! service and injects input; capture, prompts and toasts have their own.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use protocol::clipboard::{ClipboardData, ClipboardGuard};
 use protocol::ipc::{AgentStatus, IpcMessage, PIPE_NAME};
 use protocol::{read_frame, write_frame};
 use tokio::net::windows::named_pipe::ClientOptions;
-use tracing::{info, warn};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::{debug, info, warn};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::HSTRING;
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_F12,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage,
-    MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, QS_ALLINPUT,
+    MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, QS_ALLINPUT, WM_HOTKEY,
 };
 
+use super::clipboard::Listener;
+use super::input::Injector;
 use super::stream::{self, WorkerCommand};
+use super::{consent, toast};
 use crate::core;
 
 /// Windows error code when all pipe instances are busy.
 const ERROR_PIPE_BUSY: i32 = 231;
 
+/// Id of the Ctrl+F12 hotkey registration.
+const KILL_SWITCH_HOTKEY: i32 = 1;
+
 enum UiEvent {
     Status(AgentStatus),
+    Technicians(Vec<String>),
+    SetClipboard(ClipboardData),
     /// The service went away; exit.
     Disconnected,
 }
 
 pub fn run() -> anyhow::Result<()> {
     common::logging::init_file(&crate::paths::helper_log());
+    // Physical pixels everywhere, matching DXGI's monitor coordinates, so
+    // injected pointer positions land where the viewer clicked. Must happen
+    // before any window is created.
+    // SAFETY: process-wide setting, no pointers.
+    if let Err(e) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        warn!("setting DPI awareness: {e}");
+    }
+    toast::register();
     let session_id = current_session_id();
     info!(pid = std::process::id(), ?session_id, "helper starting");
 
     let (ui_tx, ui_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        if let Err(e) = runtime.block_on(pipe_client(&ui_tx, session_id.unwrap_or(0))) {
-            warn!("pipe: {e}");
+    // Control messages to the service (answers, clipboard, kill switch).
+    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn({
+        let ctl_tx = ctl_tx.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let result =
+                runtime.block_on(pipe_client(&ui_tx, ctl_tx, ctl_rx, session_id.unwrap_or(0)));
+            if let Err(e) = result {
+                warn!("pipe: {e}");
+            }
+            let _ = ui_tx.send(UiEvent::Disconnected);
         }
-        let _ = ui_tx.send(UiEvent::Disconnected);
     });
 
-    let tray = Tray::new()?;
+    let tray = Tray::new(ctl_tx)?;
     tray.run(&ui_rx);
     info!("helper exiting");
     Ok(())
@@ -67,23 +110,37 @@ fn current_session_id() -> Option<u32> {
 /// is not keeping up, the capture worker drops frames instead.
 const OUT_QUEUE: usize = 8;
 
-async fn pipe_client(ui: &mpsc::Sender<UiEvent>, session_id: u32) -> std::io::Result<()> {
+async fn pipe_client(
+    ui: &mpsc::Sender<UiEvent>,
+    ctl_tx: UnboundedSender<IpcMessage>,
+    mut ctl_rx: UnboundedReceiver<IpcMessage>,
+    session_id: u32,
+) -> std::io::Result<()> {
     let pipe = connect().await?;
     let (mut reader, mut writer) = tokio::io::split(pipe);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<IpcMessage>(OUT_QUEUE);
-    // Hello first; the channel keeps order.
-    let _ = out_tx
-        .send(IpcMessage::HelperHello {
+    write_frame(
+        &mut writer,
+        &IpcMessage::HelperHello {
             pid: std::process::id(),
             session_id,
             version: core::version().to_owned(),
-        })
-        .await;
+        },
+    )
+    .await
+    .map_err(std::io::Error::other)?;
     let worker = stream::spawn(out_tx);
     info!("connected to service");
 
     let write = async {
-        while let Some(message) = out_rx.recv().await {
+        loop {
+            // Control messages (a kill switch!) go ahead of video.
+            let message = tokio::select! {
+                biased;
+                Some(m) = ctl_rx.recv() => m,
+                Some(m) = out_rx.recv() => m,
+                else => break,
+            };
             write_frame(&mut writer, &message)
                 .await
                 .map_err(std::io::Error::other)?;
@@ -91,6 +148,9 @@ async fn pipe_client(ui: &mpsc::Sender<UiEvent>, session_id: u32) -> std::io::Re
         Ok::<(), std::io::Error>(())
     };
     let read = async {
+        let mut injector = Injector::default();
+        // Open prompts by request id, so they can be withdrawn.
+        let mut prompts: HashMap<u64, consent::Prompt> = HashMap::new();
         while let Some(message) = read_frame::<_, IpcMessage>(&mut reader)
             .await
             .map_err(std::io::Error::other)?
@@ -103,11 +163,56 @@ async fn pipe_client(ui: &mpsc::Sender<UiEvent>, session_id: u32) -> std::io::Re
                     }
                     continue;
                 }
+                IpcMessage::Technicians(list) => {
+                    info!(technicians = ?list, "connected technicians");
+                    let _ = ui.send(UiEvent::Technicians(list));
+                    continue;
+                }
+                IpcMessage::Input(event) => {
+                    injector.inject(event);
+                    continue;
+                }
+                IpcMessage::SetClipboard(data) => {
+                    let _ = ui.send(UiEvent::SetClipboard(data));
+                    continue;
+                }
+                IpcMessage::Toast { technician } => {
+                    toast::technician_connected(&technician);
+                    continue;
+                }
+                IpcMessage::ConsentPrompt {
+                    request_id,
+                    technician,
+                    timeout_secs,
+                } => {
+                    info!(request_id, %technician, timeout_secs, "showing consent prompt");
+                    let ctl = ctl_tx.clone();
+                    let prompt = consent::show(
+                        &technician,
+                        Duration::from_secs(timeout_secs.into()),
+                        move |answer| {
+                            info!(request_id, ?answer, "consent answered");
+                            let _ = ctl.send(IpcMessage::ConsentAnswer { request_id, answer });
+                        },
+                    );
+                    prompts.insert(request_id, prompt);
+                    continue;
+                }
+                IpcMessage::ConsentCancel { request_id } => {
+                    if let Some(prompt) = prompts.remove(&request_id) {
+                        info!(request_id, "consent prompt withdrawn");
+                        prompt.cancel();
+                    }
+                    continue;
+                }
                 IpcMessage::ListMonitors => WorkerCommand::ListMonitors,
                 IpcMessage::StartCapture { monitor } => WorkerCommand::Start { monitor },
                 IpcMessage::StopCapture => WorkerCommand::Stop,
                 IpcMessage::ForceKeyframe => WorkerCommand::ForceKeyframe,
-                _ => continue,
+                other => {
+                    debug!(?other, "ignoring message from service");
+                    continue;
+                }
             };
             if worker.send(command).is_err() {
                 break;
@@ -144,46 +249,93 @@ async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipe
 struct Tray {
     icon: TrayIcon,
     status_item: MenuItem,
+    technicians_item: MenuItem,
+    end_sessions_item: MenuItem,
     about_item: MenuItem,
-    /// A status not yet successfully applied to the tray icon.
+    status: RefCell<AgentStatus>,
+    technicians: RefCell<Vec<String>>,
+    /// The tooltip/icon still need applying.
     ///
     /// At logon the helper can start before Explorer has created the taskbar.
     /// Then `Shell_NotifyIcon(NIM_MODIFY)` fails, and tray-icon 0.25 returns
     /// the error *without* recording the new tooltip/icon. When the taskbar
     /// appears it re-adds the icon with the stale, initial values. So a
-    /// status stays pending, and is retried every loop iteration, until the
+    /// change stays pending, and is retried every loop iteration, until the
     /// modify succeeds. After that tray-icon has the current values, which
     /// also covers Explorer restarts.
-    pending: std::cell::RefCell<Option<AgentStatus>>,
+    dirty: Cell<bool>,
+    clipboard: Option<Listener>,
+    guard: RefCell<ClipboardGuard>,
+    /// To the service.
+    ctl: UnboundedSender<IpcMessage>,
 }
 
 impl Tray {
-    fn new() -> anyhow::Result<Self> {
+    fn new(ctl: UnboundedSender<IpcMessage>) -> anyhow::Result<Self> {
         let initial = core::initial_status(None);
         let status_item = MenuItem::new(initial.tooltip(), false, None);
+        let technicians_item = MenuItem::new(technicians_text(&[]), false, None);
+        let end_sessions_item = MenuItem::new("End all remote sessions (Ctrl+F12)", false, None);
         let about_item = MenuItem::new("About RMM Agent", true, None);
         // Deliberately disabled: users cannot stop the agent from the tray.
         let quit_item = MenuItem::new("Quit (managed by your administrator)", false, None);
         let menu = Menu::new();
         menu.append(&status_item)?;
+        menu.append(&technicians_item)?;
+        menu.append(&end_sessions_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&about_item)?;
         menu.append(&quit_item)?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip(initial.tooltip())
-            .with_icon(status_icon(&initial))
+            .with_icon(status_icon(&initial, false))
             .build()?;
+
+        // The kill switch. Registered for this thread (no window), so
+        // WM_HOTKEY arrives in the message loop below.
+        // SAFETY: no pointers.
+        match unsafe {
+            RegisterHotKey(
+                None,
+                KILL_SWITCH_HOTKEY,
+                MOD_CONTROL | MOD_NOREPEAT,
+                u32::from(VK_F12.0),
+            )
+        } {
+            Ok(()) => info!("Ctrl+F12 kill switch registered"),
+            // Another program holds Ctrl+F12; the tray item still works.
+            Err(e) => warn!("registering Ctrl+F12: {e}"),
+        }
+
+        let clipboard = match Listener::new() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                warn!("clipboard sync disabled: {e}");
+                None
+            }
+        };
+        let mut guard = ClipboardGuard::default();
+        // Whatever the user copied before a technician connected stays private.
+        guard.prime(clipboard.as_ref().and_then(Listener::read));
+
         Ok(Self {
             icon,
             status_item,
+            technicians_item,
+            end_sessions_item,
             about_item,
-            pending: std::cell::RefCell::new(None),
+            status: RefCell::new(initial),
+            technicians: RefCell::new(Vec::new()),
+            dirty: Cell::new(false),
+            clipboard,
+            guard: RefCell::new(guard),
+            ctl,
         })
     }
 
-    /// Win32 message loop plus polling of menu and status events. Returns
-    /// when the service disconnects.
+    /// Win32 message loop plus polling of menu, clipboard and service
+    /// events. Returns when the service disconnects.
     fn run(&self, ui: &mpsc::Receiver<UiEvent>) {
         loop {
             // Sleep until there is window input, or at most 100 ms.
@@ -192,54 +344,121 @@ impl Tray {
                 MsgWaitForMultipleObjects(None, false, 100, QS_ALLINPUT);
             }
             let mut msg = MSG::default();
-            // SAFETY: standard message pump on the thread that owns the tray window.
+            // SAFETY: standard message pump on the thread that owns the
+            // tray and clipboard windows.
             unsafe {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_HOTKEY && msg.wParam.0 == KILL_SWITCH_HOTKEY as usize {
+                        self.kill_switch("hotkey");
+                        continue;
+                    }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
-                tracing::debug!(id = ?event.id, "menu event");
+                debug!(id = ?event.id, "menu event");
                 if event.id == *self.about_item.id() {
                     show_about();
+                } else if event.id == *self.end_sessions_item.id() {
+                    self.kill_switch("tray menu");
                 }
             }
-            // Clicks on the icon itself are not used yet; drain them.
+            // Clicks on the icon itself are not used; drain them.
             while TrayIconEvent::receiver().try_recv().is_ok() {}
+
+            if let Some(clipboard) = self.clipboard.as_ref().filter(|c| c.changed()) {
+                if let Some(data) = clipboard.read() {
+                    if let Some(data) = self.guard.borrow_mut().local_changed(data) {
+                        debug!(bytes = data.size(), "clipboard changed");
+                        let _ = self.ctl.send(IpcMessage::Clipboard(data));
+                    }
+                }
+            }
 
             loop {
                 match ui.try_recv() {
                     Ok(UiEvent::Status(status)) => {
                         info!(tooltip = %status.tooltip(), "status changed");
-                        *self.pending.borrow_mut() = Some(status);
+                        *self.status.borrow_mut() = status;
+                        self.dirty.set(true);
                     }
-                    Ok(UiEvent::Disconnected) | Err(mpsc::TryRecvError::Disconnected) => return,
+                    Ok(UiEvent::Technicians(list)) => {
+                        *self.technicians.borrow_mut() = list;
+                        self.dirty.set(true);
+                    }
+                    Ok(UiEvent::SetClipboard(data)) => self.set_clipboard(&data),
+                    Ok(UiEvent::Disconnected) | Err(mpsc::TryRecvError::Disconnected) => {
+                        // SAFETY: undoes our registration on this thread.
+                        let _ = unsafe { UnregisterHotKey(None, KILL_SWITCH_HOTKEY) };
+                        return;
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
-            self.apply_pending();
+            self.apply();
         }
     }
 
-    fn apply_pending(&self) {
-        let Some(status) = self.pending.borrow().clone() else {
+    fn kill_switch(&self, via: &str) {
+        warn!(via, "user ended all remote sessions");
+        let _ = self.ctl.send(IpcMessage::KillSwitch);
+    }
+
+    fn set_clipboard(&self, data: &ClipboardData) {
+        let Some(clipboard) = &self.clipboard else {
             return;
         };
-        let text = status.tooltip();
-        self.status_item.set_text(&text);
-        let applied = self.icon.set_tooltip(Some(&text)).is_ok()
-            && self.icon.set_icon(Some(status_icon(&status))).is_ok();
-        if applied {
-            info!(%text, "tray updated");
-            *self.pending.borrow_mut() = None;
+        if !self.guard.borrow_mut().remote(data) {
+            return;
         }
+        match clipboard.write(data) {
+            Ok(()) => {
+                info!(bytes = data.size(), "technician's clipboard applied");
+                // What the listener reads back next is not a new copy.
+                self.guard
+                    .borrow_mut()
+                    .prime(Some(ClipboardData::Text(data.to_text())));
+            }
+            Err(e) => warn!("setting clipboard: {e}"),
+        }
+    }
+
+    fn apply(&self) {
+        if !self.dirty.get() {
+            return;
+        }
+        let status = self.status.borrow();
+        let technicians = self.technicians.borrow();
+        let tooltip = status.tooltip_with(&technicians);
+        self.status_item.set_text(status.tooltip());
+        self.technicians_item
+            .set_text(technicians_text(&technicians));
+        self.end_sessions_item.set_enabled(!technicians.is_empty());
+        let applied = self.icon.set_tooltip(Some(&tooltip)).is_ok()
+            && self
+                .icon
+                .set_icon(Some(status_icon(&status, !technicians.is_empty())))
+                .is_ok();
+        if applied {
+            info!(%tooltip, "tray updated");
+            self.dirty.set(false);
+        }
+    }
+}
+
+fn technicians_text(technicians: &[String]) -> String {
+    if technicians.is_empty() {
+        "No remote sessions".to_owned()
+    } else {
+        format!("Connected: {}", technicians.join(", "))
     }
 }
 
 fn show_about() {
     let text = format!(
-        "RMM Agent {}\n\nThis computer is managed remotely by your IT team.",
+        "RMM Agent {}\n\nThis computer is managed remotely by your IT team.\n\
+         Press Ctrl+F12 at any time to end all remote sessions.",
         core::version()
     );
     // SAFETY: plain modal message box with owned strings.
@@ -251,13 +470,15 @@ fn show_about() {
             MB_OK | MB_ICONINFORMATION,
         )
     };
-    tracing::debug!(?result, "about box closed");
+    debug!(?result, "about box closed");
 }
 
-/// A 32x32 filled circle: green when connected, amber when enrolled but
-/// disconnected, grey when not enrolled.
-fn status_icon(status: &AgentStatus) -> Icon {
+/// A 32x32 filled circle: blue while a technician is connected, green when
+/// connected to the server, amber when enrolled but disconnected, grey when
+/// not enrolled.
+fn status_icon(status: &AgentStatus, in_session: bool) -> Icon {
     let rgb = match (&status.agent_id, status.connected) {
+        _ if in_session => [0x1f, 0x6f, 0xeb],
         (Some(_), true) => [0x2e, 0xa0, 0x43],
         (Some(_), false) => [0xd9, 0x8e, 0x04],
         (None, _) => [0x8a, 0x8a, 0x8a],

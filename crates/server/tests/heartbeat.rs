@@ -42,6 +42,8 @@ fn agent_config(server_addr: SocketAddr, trust: &DevCerts, client: &DevCerts) ->
         bind_addr: Some(LOOPBACK.parse().unwrap()),
         telemetry: None,
         media: None,
+        desktop: None,
+        device_kind: protocol::consent::DeviceKind::Workstation,
     }
 }
 

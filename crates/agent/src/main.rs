@@ -199,6 +199,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         update_interval: Duration::from_secs(args.update_interval_secs),
         telemetry: Some(Arc::new(SystemTelemetry::new())),
         media: None,
+        // Console mode has no helper: no consent prompt can be shown, so
+        // `require` falls back to its on_no_user setting.
+        desktop: None,
     };
     tokio::select! {
         update = agent::core::run(&credential, options, status) => install_and_relaunch(&paths, update?),
