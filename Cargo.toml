@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/common",
+    "crates/server",
+    "crates/agent",
+    "crates/viewer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+protocol = { path = "crates/protocol" }
+common = { path = "crates/common" }
+server = { path = "crates/server" }
+agent = { path = "crates/agent" }
+
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tempfile = "3"
