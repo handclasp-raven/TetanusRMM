@@ -9,6 +9,9 @@ pub mod framing;
 pub mod input;
 pub mod ipc;
 pub mod media;
+pub mod script;
+pub mod shell;
+pub mod transfer;
 pub mod update;
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +27,14 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   still works, it just cannot stream).
 /// - 4: consent, remote input and clipboard (appended variants). Viewing an
 ///   agent older than 4 is refused, since it cannot enforce consent.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// - 5: remote shell, script runner and file transfer, each on a stream the
+///   server opens (see [`StreamOpen`]). Older agents never accept those
+///   streams, so the server refuses these operations for them.
+/// - 6: `AgentInfo` (appended variant): the agent reports its hostname.
+pub const PROTOCOL_VERSION: u32 = 6;
+
+/// Oldest agent protocol that serves [`StreamOpen`] streams.
+pub const MIN_REMOTE_OPS_VERSION: u32 = 5;
 
 /// ALPN identifier negotiated during the TLS handshake. Both ends must agree.
 pub const ALPN: &[u8] = b"rmm/1";
@@ -138,6 +148,47 @@ pub enum Message {
     /// Agent to server: the user pressed the Ctrl+F12 kill switch; end every
     /// session with this agent now.
     UserTerminatedSessions,
+
+    // --- Agent details (Phase 8) ----------------------------------------
+    /// Agent to server, after `DeviceInfo`: the machine's hostname, shown to
+    /// technicians. At most [`MAX_HOSTNAME_LEN`] bytes; the server trims and
+    /// cleans it (see `sanitize_hostname`).
+    AgentInfo { hostname: String },
+}
+
+/// Longest hostname the server stores, in bytes (the DNS limit).
+pub const MAX_HOSTNAME_LEN: usize = 253;
+
+/// A hostname fit for display: control characters removed, surrounding
+/// whitespace trimmed, cut to [`MAX_HOSTNAME_LEN`] bytes on a character
+/// boundary. `None` if nothing is left.
+pub fn sanitize_hostname(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let mut name = cleaned.trim();
+    if name.len() > MAX_HOSTNAME_LEN {
+        let mut end = MAX_HOSTNAME_LEN;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name = name[..end].trim_end();
+    }
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// First frame on a bidirectional stream the **server** opens to an agent.
+/// Each remote operation gets its own stream, so a large file transfer never
+/// delays a shell or the control stream. What follows depends on the kind:
+/// see [`shell`], [`script`] and [`transfer`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamOpen {
+    /// Interactive PowerShell on a pseudoconsole of this size.
+    Shell { size: shell::TermSize },
+    /// Run a script without a terminal and reply with its result.
+    Script(script::ScriptRequest),
+    /// Write a file on the agent.
+    Upload(transfer::UploadRequest),
+    /// Read a file from the agent. `path` is absolute.
+    Download { path: String },
 }
 
 /// Agent health sample, sent on each heartbeat.
@@ -219,5 +270,30 @@ mod tests {
         }
         let old = postcard::to_stdvec(&V1::Heartbeat { ts: 1, seq: 2 }).unwrap();
         assert!(postcard::from_bytes::<Message>(&old).is_err());
+    }
+
+    #[test]
+    fn agent_info_is_appended_after_every_earlier_variant() {
+        let msg = Message::AgentInfo {
+            hostname: "DESKTOP-42".into(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        // Variant 24: indices 0-23 are unchanged for older peers.
+        assert_eq!(bytes[0], 24);
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn hostnames_are_cleaned_for_display() {
+        assert_eq!(sanitize_hostname("  WS-01\r\n"), Some("WS-01".into()));
+        assert_eq!(sanitize_hostname("a\u{1b}[31mb"), Some("a[31mb".into()));
+        assert_eq!(sanitize_hostname(" \t\n"), None);
+        assert_eq!(sanitize_hostname(""), None);
+        // Cut to the limit without splitting a multi-byte character.
+        let long = "é".repeat(200); // 400 bytes
+        let cut = sanitize_hostname(&long).unwrap();
+        assert!(cut.len() <= MAX_HOSTNAME_LEN);
+        assert_eq!(cut.len(), 252);
+        assert!(cut.chars().all(|c| c == 'é'));
     }
 }

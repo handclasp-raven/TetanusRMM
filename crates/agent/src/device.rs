@@ -1,6 +1,6 @@
 //! What kind of machine the agent runs on, reported to the server so a new
 //! device gets the right default consent mode (workstation: `notify`,
-//! server: `unattended`).
+//! server: `unattended`), along with its hostname for display.
 
 use protocol::consent::DeviceKind;
 
@@ -49,9 +49,21 @@ fn kind_from_env(has: impl Fn(&str) -> bool) -> DeviceKind {
     }
 }
 
+/// The machine's hostname (Windows: the NetBIOS computer name), cleaned for
+/// display. `None` if the OS does not report one.
+pub fn hostname() -> Option<String> {
+    sysinfo::System::host_name().and_then(|name| protocol::sanitize_hostname(&name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn this_machine_has_a_displayable_hostname() {
+        let name = hostname().expect("a hostname");
+        assert_eq!(protocol::sanitize_hostname(&name).as_deref(), Some(&*name));
+    }
 
     #[cfg(not(windows))]
     #[test]

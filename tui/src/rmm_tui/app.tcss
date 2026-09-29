@@ -1,0 +1,114 @@
+#splash {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+}
+
+LoginScreen {
+    align: center middle;
+}
+
+#login-box {
+    width: 60;
+    height: auto;
+    border: round $primary;
+    padding: 1 2;
+}
+
+#login-box > Input, #login-box > Button {
+    margin-top: 1;
+}
+
+#login-box > Button {
+    width: 100%;
+}
+
+#login-title {
+    text-align: center;
+}
+
+#login-status {
+    margin-top: 1;
+    color: $warning;
+}
+
+#whoami, #status, #chain, #shell-status {
+    height: 1;
+    padding: 0 1;
+}
+
+#whoami {
+    color: $text-muted;
+}
+
+#agents, #audit {
+    height: 1fr;
+}
+
+/* --- shell console ------------------------------------------------------- */
+
+#terminal {
+    height: 1fr;
+    border: round $primary;
+    scrollbar-gutter: stable;
+    background: $background;
+}
+
+#terminal-content {
+    width: auto;
+}
+
+/* --- script runner ------------------------------------------------------- */
+
+#script-top {
+    height: 12;
+}
+
+#targets-box, #library-box {
+    width: 1fr;
+}
+
+#targets, #library {
+    height: 1fr;
+}
+
+#library-controls {
+    height: 3;
+}
+
+#save-name {
+    width: 1fr;
+}
+
+#script-body {
+    height: 8;
+}
+
+#run-controls {
+    height: 3;
+}
+
+#run-controls > Label {
+    padding: 1 1 0 1;
+}
+
+#timeout {
+    width: 10;
+}
+
+#run-summary {
+    padding: 1 2 0 2;
+}
+
+#results-box {
+    height: 1fr;
+}
+
+#results {
+    width: 2fr;
+}
+
+#output-box {
+    width: 3fr;
+    border: round $primary;
+}

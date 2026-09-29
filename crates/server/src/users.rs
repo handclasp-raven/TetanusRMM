@@ -33,10 +33,36 @@ impl Role {
         matches!(self, Role::Admin | Role::SupportEngineer)
     }
 
+    /// Whether this role may read the audit log.
+    pub fn can_read_audit(self) -> bool {
+        matches!(self, Role::Admin | Role::Auditor)
+    }
+
     /// Whether this role may create agent download links.
     pub fn can_create_enrollment_links(self) -> bool {
         matches!(self, Role::Admin | Role::SupportEngineer)
     }
+
+    /// Whether this role may use a remote operation on agents.
+    pub fn can(self, capability: Capability) -> bool {
+        match capability {
+            Capability::Shell | Capability::Script | Capability::FileTransfer => {
+                matches!(self, Role::Admin | Role::SupportEngineer)
+            }
+        }
+    }
+}
+
+/// Remote operations on an agent that need a role check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Interactive remote shell.
+    Shell,
+    /// Running scripts and commands.
+    Script,
+    /// Uploading and downloading files.
+    FileTransfer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -153,6 +179,26 @@ mod tests {
         assert!(Role::Admin.can_view_desktop());
         assert!(Role::SupportEngineer.can_view_desktop());
         assert!(!Role::Auditor.can_view_desktop());
+    }
+
+    #[test]
+    fn only_admins_and_engineers_run_remote_operations() {
+        for capability in [
+            Capability::Shell,
+            Capability::Script,
+            Capability::FileTransfer,
+        ] {
+            assert!(Role::Admin.can(capability));
+            assert!(Role::SupportEngineer.can(capability));
+            assert!(!Role::Auditor.can(capability), "{capability:?}");
+        }
+    }
+
+    #[test]
+    fn admins_and_auditors_read_the_audit_log() {
+        assert!(Role::Admin.can_read_audit());
+        assert!(Role::Auditor.can_read_audit());
+        assert!(!Role::SupportEngineer.can_read_audit());
     }
 
     #[test]

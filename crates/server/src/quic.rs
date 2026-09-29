@@ -380,7 +380,9 @@ async fn serve_agent(
     hooks: &Hooks,
 ) -> Result<(), ConnError> {
     let (to_agent, mut outbox) = mpsc::unbounded_channel::<Message>();
-    let link = hooks.hub.register(agent_id, version, to_agent.clone());
+    let link = hooks
+        .hub
+        .register(agent_id, version, to_agent.clone(), Some(conn.clone()));
     // Agents older than protocol 3 do not know the streaming messages.
     if version >= 3 {
         let _ = to_agent.send(Message::ListMonitors);
@@ -446,6 +448,17 @@ async fn serve_agent(
                 Message::UserTerminatedSessions => {
                     warn!(%agent_id, viewers = link.viewers(), "user pressed Ctrl+F12");
                     link.user_terminated();
+                }
+                Message::AgentInfo { hostname } => {
+                    let hostname = protocol::sanitize_hostname(&hostname);
+                    info!(%agent_id, ?hostname, "agent info");
+                    if let (Some(registry), Some(hostname)) = (&hooks.registry, hostname) {
+                        if let Err(e) =
+                            registry::record_hostname(&registry.pool, agent_id, &hostname).await
+                        {
+                            warn!(%agent_id, "recording hostname failed: {e}");
+                        }
+                    }
                 }
                 other => {
                     warn!(%agent_id, ?other, "unexpected message on control stream");

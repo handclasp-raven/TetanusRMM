@@ -44,6 +44,7 @@ fn agent_config(server_addr: SocketAddr, trust: &DevCerts, client: &DevCerts) ->
         media: None,
         desktop: None,
         device_kind: protocol::consent::DeviceKind::Workstation,
+        hostname: Some("test-host".into()),
     }
 }
 

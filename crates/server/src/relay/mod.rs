@@ -22,7 +22,7 @@
 pub mod fanout;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -53,6 +53,20 @@ pub struct AgentLink {
     clipboard: broadcast::Sender<ClipboardData>,
     /// Bumped each time the user presses Ctrl+F12.
     terminations: watch::Sender<u64>,
+    /// The agent's QUIC connection, for opening remote-operation streams
+    /// (`None` in unit tests).
+    connection: Option<quinn::Connection>,
+    /// Interactive shells open right now (see [`AgentLink::shell_started`]).
+    shells: AtomicUsize,
+}
+
+/// Counts one open shell on its agent until dropped.
+pub struct ActiveShell(Arc<AgentLink>);
+
+impl Drop for ActiveShell {
+    fn drop(&mut self) {
+        self.0.shells.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Clipboard updates buffered per viewer.
@@ -110,6 +124,17 @@ impl AgentLink {
         self.fanout().viewers()
     }
 
+    /// Interactive shells open on this agent.
+    pub fn shells(&self) -> usize {
+        self.shells.load(Ordering::Relaxed)
+    }
+
+    /// Count a shell as open until the returned guard is dropped.
+    pub fn shell_started(self: &Arc<Self>) -> ActiveShell {
+        self.shells.fetch_add(1, Ordering::Relaxed);
+        ActiveShell(self.clone())
+    }
+
     /// Send a message to the agent (input, clipboard).
     pub fn send(&self, message: Message) {
         let _ = self.to_agent.send(message);
@@ -143,6 +168,14 @@ impl AgentLink {
     /// Changes when the user presses Ctrl+F12.
     pub fn terminations(&self) -> watch::Receiver<u64> {
         self.terminations.subscribe()
+    }
+
+    /// Open a new bidirectional stream to the agent (shell, script, file
+    /// transfer). `None` if this link has no connection (unit tests).
+    pub async fn open_stream(
+        &self,
+    ) -> Option<Result<(quinn::SendStream, quinn::RecvStream), quinn::ConnectionError>> {
+        Some(self.connection.as_ref()?.open_bi().await)
     }
 
     /// The monitor a new viewer sees if nothing is streaming yet: the
@@ -243,12 +276,14 @@ impl Hub {
     }
 
     /// Register a newly connected agent. `to_agent` feeds its control-stream
-    /// writer. Replaces (and closes) any previous link for the same id.
+    /// writer; `connection` is used to open streams to it. Replaces (and
+    /// closes) any previous link for the same id.
     pub fn register(
         &self,
         agent_id: &str,
         version: u32,
         to_agent: mpsc::UnboundedSender<Message>,
+        connection: Option<quinn::Connection>,
     ) -> Arc<AgentLink> {
         let link = Arc::new(AgentLink {
             agent_id: agent_id.to_owned(),
@@ -261,6 +296,8 @@ impl Hub {
             decisions: Mutex::new(HashMap::new()),
             clipboard: broadcast::channel(CLIPBOARD_QUEUE).0,
             terminations: watch::channel(0).0,
+            connection,
+            shells: AtomicUsize::new(0),
         });
         if let Some(old) = self.agents().insert(agent_id.to_owned(), link.clone()) {
             old.closed.send_replace(true);
@@ -321,7 +358,7 @@ mod tests {
     async fn subscription_drives_the_agent_and_cleans_up_on_drop() {
         let hub = Hub::new();
         let (tx, mut to_agent) = mpsc::unbounded_channel();
-        let link = hub.register("agt-1", 4, tx);
+        let link = hub.register("agt-1", 4, tx, None);
         link.set_monitors(vec![monitor(0, false), monitor(1, true)]);
 
         let mut a = link.subscribe(hub.next_viewer_id());
@@ -349,8 +386,8 @@ mod tests {
     #[tokio::test]
     async fn reconnecting_agent_replaces_and_closes_the_old_link() {
         let hub = Hub::new();
-        let old = hub.register("agt-1", 4, mpsc::unbounded_channel().0);
-        let new = hub.register("agt-1", 4, mpsc::unbounded_channel().0);
+        let old = hub.register("agt-1", 4, mpsc::unbounded_channel().0, None);
+        let new = hub.register("agt-1", 4, mpsc::unbounded_channel().0, None);
         assert!(*old.closed().borrow());
         assert!(Arc::ptr_eq(&hub.get("agt-1").unwrap(), &new));
         // The old connection ending must not unregister the new one.
@@ -364,7 +401,7 @@ mod tests {
     async fn consent_decisions_reach_the_waiting_viewer_and_ending_is_forwarded() {
         let hub = Hub::new();
         let (tx, mut to_agent) = mpsc::unbounded_channel();
-        let link = hub.register("agt-1", 4, tx);
+        let link = hub.register("agt-1", 4, tx, None);
         let request = SessionRequest {
             session_id: 7,
             technician: "jane".into(),
@@ -388,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn clipboard_and_kill_switch_reach_every_viewer() {
         let hub = Hub::new();
-        let link = hub.register("agt-1", 4, mpsc::unbounded_channel().0);
+        let link = hub.register("agt-1", 4, mpsc::unbounded_channel().0, None);
         let (mut a, mut b) = (link.clipboard(), link.clipboard());
         let (mut ka, mut kb) = (link.terminations(), link.terminations());
         link.on_clipboard(ClipboardData::Text("hi".into()));
@@ -402,10 +439,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_shells_are_counted_until_their_guards_drop() {
+        let hub = Hub::new();
+        let link = hub.register("agt-1", 6, mpsc::unbounded_channel().0, None);
+        assert_eq!(link.shells(), 0);
+        let a = link.shell_started();
+        let b = link.shell_started();
+        assert_eq!(link.shells(), 2);
+        drop(a);
+        assert_eq!(link.shells(), 1);
+        drop(b);
+        assert_eq!(link.shells(), 0);
+    }
+
+    #[tokio::test]
     async fn stream_reset_resumes_for_remaining_viewers() {
         let hub = Hub::new();
         let (tx, mut to_agent) = mpsc::unbounded_channel();
-        let link = hub.register("agt-1", 4, tx);
+        let link = hub.register("agt-1", 4, tx, None);
         let _a = link.subscribe(1);
         drain(&mut to_agent);
         link.stream_reset();

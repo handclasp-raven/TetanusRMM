@@ -94,6 +94,8 @@ pub struct Agent {
     pub telemetry_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub device_kind: Option<DeviceKind>,
+    /// As last reported by the agent (protocol 6+).
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
@@ -249,6 +251,17 @@ pub async fn record_device_kind(
     }
     tx.commit().await?;
     Ok(changed.then_some(default))
+}
+
+/// Record the hostname an agent reported (on every connect), already
+/// sanitized by the caller.
+pub async fn record_hostname(pool: &PgPool, agent_id: &str, hostname: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE agents SET hostname = $2 WHERE id = $1 AND hostname IS DISTINCT FROM $2")
+        .bind(agent_id)
+        .bind(hostname)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn list_agents(pool: &PgPool) -> sqlx::Result<Vec<Agent>> {

@@ -61,6 +61,7 @@ impl Credential {
             media: None,
             desktop: None,
             device_kind: crate::device::kind(),
+            hostname: crate::device::hostname(),
         })
     }
 }

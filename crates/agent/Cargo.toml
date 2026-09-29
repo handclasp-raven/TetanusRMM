@@ -13,7 +13,7 @@ common.workspace = true
 protocol.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
 tracing.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
@@ -25,6 +25,9 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

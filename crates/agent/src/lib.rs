@@ -10,6 +10,8 @@
 //! - [`interactive`]: consent, remote input, clipboard and the kill switch.
 //! - [`input`]: mouse-coordinate mapping and held-key tracking.
 //! - [`device`]: workstation or server (picks the default consent mode).
+//! - [`remote`]: remote shell, script runner and file transfer, on streams
+//!   the server opens.
 //! - [`session`]: when to (re)start the helper in the user's session.
 //! - [`paths`]: where the agent keeps its files.
 //! - `win` (Windows only): the service, the session helper and its tray icon.
@@ -22,6 +24,7 @@ pub mod input;
 pub mod interactive;
 pub mod media;
 pub mod paths;
+pub mod remote;
 pub mod session;
 pub mod telemetry;
 pub mod update;
@@ -72,6 +75,8 @@ pub struct AgentConfig {
     pub desktop: Option<Arc<DesktopLink>>,
     /// Reported to the server; picks the default consent mode.
     pub device_kind: DeviceKind,
+    /// Reported to the server for display, if known.
+    pub hostname: Option<String>,
 }
 
 /// What the agent observed, for tests.
@@ -114,6 +119,7 @@ pub struct AgentSession {
     media: Option<Arc<MediaLink>>,
     desktop: Option<Arc<DesktopLink>>,
     device_kind: DeviceKind,
+    hostname: Option<String>,
 }
 
 /// Connect to the server and complete the mutual-TLS handshake.
@@ -141,6 +147,7 @@ pub async fn connect(config: &AgentConfig) -> Result<AgentSession, AgentError> {
         media: config.media.clone(),
         desktop: config.desktop.clone(),
         device_kind: config.device_kind,
+        hostname: config.hostname.clone(),
     })
 }
 
@@ -177,9 +184,10 @@ impl AgentSession {
     }
 
     /// Send Hello, then heartbeat until the connection or stream ends,
-    /// serving the server's streaming commands if a media source is attached
-    /// and its session requests (consent, input, clipboard) through the
-    /// desktop link.
+    /// serving the server's streaming commands if a media source is attached,
+    /// its session requests (consent, input, clipboard) through the desktop
+    /// link, and the streams it opens for remote operations (shell, scripts,
+    /// file transfer).
     ///
     /// Only returns on failure; a healthy session runs forever.
     pub async fn run(&self, events: Option<UnboundedSender<AgentEvent>>) -> Result<(), AgentError> {
@@ -194,6 +202,11 @@ impl AgentSession {
         let _ = outbox_tx.send(Message::DeviceInfo {
             kind: self.device_kind,
         });
+        if let Some(hostname) = &self.hostname {
+            let _ = outbox_tx.send(Message::AgentInfo {
+                hostname: hostname.clone(),
+            });
+        }
         if let Some(media) = &self.media {
             // Fresh connection, fresh start: any stream from a previous
             // connection has no viewers any more.
@@ -398,6 +411,22 @@ impl AgentSession {
             std::future::pending().await
         };
 
+        // Shell, script and file-transfer streams opened by the server. The
+        // tasks are aborted with the connection, which kills any shell or
+        // script still running and discards partial uploads.
+        let remote_ops = async {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (mut send, mut recv) = self.connection.accept_bi().await?;
+                while tasks.try_join_next().is_some() {}
+                tasks.spawn(async move {
+                    if remote::serve(&mut send, &mut recv).await.is_ok() {
+                        let _ = send.finish();
+                    }
+                });
+            }
+        };
+
         // Each branch only finishes on error. read_frame is not cancel-safe,
         // which is fine: the losers are dropped along with the session.
         let result: Result<(), AgentError> = tokio::select! {
@@ -406,6 +435,7 @@ impl AgentSession {
             res = reader => res,
             res = pump => res,
             res = desktop_events => res,
+            res = remote_ops => res,
         };
         // Sessions do not survive the connection.
         self.end_all_sessions(&sessions);

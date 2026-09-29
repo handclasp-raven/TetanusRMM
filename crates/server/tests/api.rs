@@ -196,3 +196,47 @@ async fn policies_are_admin_only_and_audited() {
         Verification::Valid { .. }
     ));
 }
+
+#[tokio::test]
+async fn auditors_and_admins_read_and_verify_the_audit_log() {
+    let db = start_db().await;
+    let auditor = create_user(&db.pool, "reader", Role::Auditor).await;
+    let engineer = create_user(&db.pool, "eng", Role::SupportEngineer).await;
+    let api = start_api(db.pool.clone()).await;
+    let reader = api.session("reader", &auditor.totp_secret).await;
+    let eng = api.session("eng", &engineer.totp_secret).await;
+    let get = |path: &str, token: &str| api.client.get(api.url(path)).bearer_auth(token).send();
+
+    let entries: Vec<Value> = get("/api/audit?limit=2", &reader)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Newest first: the two logins just made.
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0]["id"].as_i64() > entries[1]["id"].as_i64());
+    assert_eq!(entries[0]["actor"], "eng");
+    assert_eq!(entries[0]["action"], "login.success");
+    assert_eq!(entries[0]["hash"].as_str().unwrap().len(), 64);
+
+    let verified: Value = get("/api/audit/verify", &reader)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(verified["status"], "valid");
+    assert!(verified["entries"].as_u64().unwrap() >= 4);
+
+    assert_eq!(
+        get("/api/audit?limit=0", &reader).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    for path in ["/api/audit", "/api/audit/verify"] {
+        assert_eq!(
+            get(path, &eng).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+}

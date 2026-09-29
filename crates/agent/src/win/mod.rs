@@ -21,6 +21,7 @@ pub mod bridge;
 pub mod capture;
 pub mod capture_test;
 pub mod clipboard;
+pub mod conpty;
 pub mod consent;
 pub mod encoder;
 pub mod helper;

@@ -10,14 +10,15 @@ for the architecture and phase plan.
 | `crates/protocol` | lib | Wire `Message` enum, framing, close codes, update manifest and signed-message format |
 | `crates/common` | lib | Logging init, PEM loading, quinn/rustls TLS configs, dev cert generation |
 | `crates/server` | bin + lib | QUIC listener for agents, HTTPS API, Postgres, auth, audit log, enrollment CA, update publishing |
-| `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray |
+| `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray, remote shell / scripts / file transfer |
 | `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC to the server, OpenH264 decode, winit + softbuffer window |
+| `tui/` | Python project | Support TUI (Textual): sign in, live agent table, launch the viewer, shell console and script runner through the server ([tui/README.md](tui/README.md)) |
 
 Server modules: `quic` (agent listener), `api` (HTTPS routes), `auth` (Argon2id,
 TOTP, sessions), `users`, `audit` (hash chain), `registry` (agents, policies),
 `enroll` (tokens, internal CA), `updates` (signing, publishing), `relay` (video
-fan-out to viewers), `viewers` (viewer-session tokens), `db` (pool, migrations),
-`config`.
+fan-out to viewers), `viewers` (viewer-session tokens), `remote` (shell, script
+and file-transfer relay to agents), `db` (pool, migrations), `config`.
 
 Agent modules:
 - `core`: the connect/heartbeat/update loop, shared by console and service mode.
@@ -28,10 +29,13 @@ Agent modules:
 - `update` (download and verify) and `updater` (rename-and-replace).
 - `media`: NV12 conversion, H.264 fix-ups, and the source link used for
   streaming.
+- `remote`: the agent's end of the remote shell (`pty`, `shell`), the script
+  runner (`script`) and file transfer (`transfer`).
 - `paths`
 - `win` (Windows only): `service`, `process` (spawn into a session), `pipe`,
   `helper` (tray), `acl`, `capture` (DXGI), `encoder` (Media Foundation),
-  `stream` (capture worker), `bridge` (service ↔ helper media).
+  `stream` (capture worker), `bridge` (service ↔ helper media), `conpty`
+  (PowerShell on a pseudoconsole).
 
 Migrations live in
 `crates/server/migrations/` and are embedded in the binary. They run
@@ -70,6 +74,8 @@ echo 'a long password here' | \
 
 Roles: `admin` (can change device policies and create download links),
 `support_engineer` (can create download links), and `auditor` (read-only).
+Admins and support engineers can also view desktops and use the remote shell,
+script runner and file transfer; auditors cannot.
 
 Stop with `docker compose down`, or `docker compose down -v` to also delete the
 database volume.
@@ -387,6 +393,160 @@ The hardware encoder path is implemented, including the asynchronous model
 hardware MFTs use, but it hasn't been exercised: the VM has no GPU encoder.
 Test it on a machine with an NVIDIA, Intel or AMD GPU.
 
+## Remote shell, scripts and file transfer
+
+These three are **server-mediated and viewer-independent**: any authorized
+client drives them through the HTTPS API, with no viewer and no remote
+desktop session. The [support TUI](#support-tui) uses them the same way.
+
+```text
+ client (TUI, curl, …)            server                          agent
+ WebSocket / HTTPS  ───────────▶  role check + audit  ──QUIC──▶  one new stream per operation
+                                  (no files stored)              ConPTY, PowerShell, file IO
+```
+
+For each operation the server opens a new bidirectional QUIC stream on the
+agent's existing connection (agents are behind NAT and never accept
+connections). A large file transfer therefore never delays a shell, video or
+heartbeats. The wire formats are in `crates/protocol/src/{shell,script,transfer}.rs`.
+
+On a Windows agent all three run in the **service, as LocalSystem in
+session 0**. They work with nobody logged on, need no session helper, and
+have full control of the machine. Everything typed, run or written happens as
+SYSTEM, and the logged-on user's desktop, mapped drives and profile are not
+visible. They are **not gated by the consent policy**, which governs remote
+desktop sessions only. They are gated by role and audited.
+
+**Roles:** `admin` and `support_engineer` may use all three; `auditor` may
+not. A refused request gets `403` and is audited as `permission.denied` with
+the capability (`shell`, `script` or `file_transfer`), the user's role and the
+agent. An agent that isn't connected gives `409 agent is not connected`. An
+agent older than protocol 5 gives `409` and must update first.
+
+### Interactive shell
+
+`GET /api/agents/{id}/shell?cols=120&rows=30` with `Authorization: Bearer
+<session>`, upgraded to a **WebSocket**. The server starts the shell on the
+agent before completing the upgrade, so errors (offline, forbidden, no
+ConPTY) arrive as ordinary HTTP responses.
+
+- **Binary messages** are raw terminal bytes both ways: keystrokes in, and
+  VT-encoded output out (render it with a terminal emulator widget).
+- **Text messages** are JSON control:
+  - client → server: `{"type":"resize","cols":132,"rows":43}`
+  - server → client: `{"type":"started"}` first, then at the end
+    `{"type":"exit","code":3}` or `{"type":"error","message":"…"}`, after
+    which the server closes the socket. A malformed control message closes
+    it with code 1008.
+
+The agent runs Windows PowerShell (`powershell.exe -NoLogo`, by full path) on
+a ConPTY, so colours, line editing and full-screen programs work. Closing the
+WebSocket, or losing the agent connection, kills the shell. When the shell
+ends, `ClosePseudoConsole` also ends any console programs it left running.
+Dimensions are 1–1000.
+
+On Linux and macOS agents (development only), the shell is `/bin/sh` on a
+Unix pseudoterminal. That lets the whole path, resize included, be tested
+without Windows.
+
+### Script runner
+
+`POST /api/script-runs`:
+
+```sh
+curl --cacert dev-certs/ca.crt -H "Authorization: Bearer $SESSION" \
+  -H 'content-type: application/json' https://localhost:8443/api/script-runs \
+  -d '{"agent_ids": ["agt-1", "agt-2"], "script": "Get-Service RmmAgent", "timeout_secs": 60}'
+```
+
+```json
+{
+  "run_id": 152,
+  "summary": {"total": 2, "succeeded": 2, "failed": 0, "not_run": 0},
+  "results": [
+    {"agent_id": "agt-1", "status": "completed", "exit_code": 0,
+     "stdout": "…", "stderr": "", "stdout_truncated": false,
+     "stderr_truncated": false, "duration_ms": 431, "error": null},
+    …
+  ]
+}
+```
+
+- `script` is a PowerShell script or a single command, up to 256 KiB.
+  `timeout_secs` defaults to 300; the maximum is 3600. Up to 500 agents per
+  run. Duplicate agent ids are dropped.
+- The script runs on every agent at once, with no terminal. The call returns
+  when every agent has finished, timed out or been found unreachable.
+  Results come back in request order.
+- `status`:
+  - `completed`: see `exit_code`
+  - `timed_out`: the process tree was killed; `exit_code` is null
+  - `offline`
+  - `unsupported`: the agent is too old
+  - `failed`: it could not run; see `error`
+- Summary: `succeeded` means exit 0, `failed` means it ran but exited
+  non-zero or timed out, and `not_run` is everything else.
+- stdout and stderr are kept up to 1 MiB each (marked `*_truncated`) and
+  decoded as UTF-8.
+- On Windows the script is written to a randomly named `.ps1` in the
+  service's temp directory and run with `-NoProfile -NonInteractive
+  -ExecutionPolicy Bypass`, with UTF-8 output. `exit N` sets the exit code,
+  and an uncaught `throw` gives 1. The file is deleted afterwards.
+- Timeouts kill the whole process tree (`taskkill /T` on Windows).
+- On development agents the script runs with `/bin/sh -c`.
+
+The run is audited twice. `script.run` is written before anything is sent:
+who, the agents, the script's first line, its size and its SHA-256. Its row
+id is the `run_id`. `script.complete` follows with every agent's status and
+exit code.
+
+### File transfer
+
+**Upload:** `PUT /api/agents/{id}/files?path=<absolute path>&overwrite=false`,
+with the file as the body. `Content-Length` and `x-content-sha256` (hex) are
+required:
+
+```sh
+curl --cacert dev-certs/ca.crt -H "Authorization: Bearer $SESSION" \
+  -H "x-content-sha256: $(sha256sum big.iso | cut -d' ' -f1)" -T big.iso \
+  'https://localhost:8443/api/agents/agt-1/files?path=C:%5CTemp%5Cbig.iso'
+# {"path":"C:\\Temp\\big.iso","size":…,"sha256":"…"}
+```
+
+The agent writes to a temporary file next to the target and checks the size
+and SHA-256 against the manifest. Only then does it move the file into
+place, so a failed or interrupted upload never leaves a partial file. It
+refuses to replace an existing file unless `overwrite=true`, and needs the
+parent directory to exist.
+
+**Download:** `GET /api/agents/{id}/files?path=<absolute path>`. The agent
+hashes the file first. The response carries `Content-Length`,
+`x-content-sha256` and `Content-Disposition`. The server checks every byte
+against that hash as it passes, and releases the last chunk only if the
+whole file matches. A body that fails verification is cut short, so a client
+never gets a complete-looking bad copy.
+
+Neither side holds a file in memory: the data moves in 256 KiB chunks with
+flow control end to end. On the test VM, a 512 MiB file went each way at
+about 125–140 MB/s. The server peaked at 27 MiB of RAM and the agent service
+at 22 MB. Resume after a dropped connection is not implemented; retry the
+transfer.
+
+| Status | Meaning |
+|---|---|
+| 400 | Bad path (relative, a directory), missing hash header |
+| 403 | Role not allowed (audited), or the agent was denied access to the path |
+| 404 | File or parent directory not found on the agent |
+| 409 | File exists (upload without `overwrite`), agent offline or too old |
+| 411 | No `Content-Length` |
+| 422 | Size or SHA-256 does not match |
+| 502 | The agent connection failed mid-transfer |
+
+Each transfer that reaches an agent is audited as `file.upload` or
+`file.download`: who, agent, path, bytes moved, size and SHA-256, and
+`status` (`completed` or `failed` with the reason). A client that
+disconnects mid-download is recorded as failed.
+
 ## Telemetry
 
 Every heartbeat carries a health sample, collected with `sysinfo`:
@@ -399,9 +559,18 @@ The server stores the latest values on the agent's row (`cpu_percent`,
 `mem_used_bytes`, `mem_total_bytes`, `disk_used_bytes`, `disk_total_bytes`,
 `uptime_secs`, `telemetry_at`). `GET /api/agents` returns them.
 
-This changed the wire format, so the protocol version is now 2. Phase 1–3
+This changed the wire format, so the protocol version became 2. (It is 6
+now: remote shell, scripts and file transfer need agents at version 5.) Phase 1–3
 agents can't talk to this server until they update, which they still can,
 because updates go over HTTPS.
+
+Agents at protocol 6 also report their **hostname** once per connection
+(`Message::AgentInfo`, sent after `DeviceInfo`), stored as `agents.hostname`.
+Older agents keep working and show no hostname until they update.
+
+`GET /api/agents` adds live state from the relay to each row: `online`
+(connected right now), `viewer_sessions` (remote-desktop viewers watching)
+and `shell_sessions` (interactive shells open).
 
 ## Publishing a signed update
 
@@ -494,9 +663,15 @@ Sessions are sent as `Authorization: Bearer <token>`. Errors come back as
 | GET | `/api/updates/{platform}/binary` | none | Agent build (signed, so public) |
 | GET | `/api/updates/{platform}/signature` | none | 64-byte detached ed25519 signature |
 | GET | `/api/me` | session | Current user |
-| GET | `/api/agents` | session | Agent registry |
+| GET | `/api/agents` | session | Agent registry, with hostname, telemetry and live `online` / `viewer_sessions` / `shell_sessions` |
+| GET | `/api/audit?limit=` | admin, auditor | Newest audit entries first (default 100, at most 1000) |
+| GET | `/api/audit/verify` | admin, auditor | Walks the whole chain: `{"status":"valid","entries":n}` or `{"status":"broken","id":…,"reason":…}` |
 | GET | `/api/agents/{id}/policy` | session | Consent policy |
 | PUT | `/api/agents/{id}/policy` | admin | `{consent_mode, on_no_user, consent_timeout_secs}` |
+| GET | `/api/agents/{id}/shell?cols=&rows=` | admin, support_engineer | WebSocket: interactive PowerShell ([details](#interactive-shell)) |
+| POST | `/api/script-runs` | admin, support_engineer | `{agent_ids, script, timeout_secs?}` → per-agent results ([details](#script-runner)) |
+| PUT | `/api/agents/{id}/files?path=&overwrite=` | admin, support_engineer | Upload the body; needs `x-content-sha256` ([details](#file-transfer)) |
+| GET | `/api/agents/{id}/files?path=` | admin, support_engineer | Download, with `x-content-sha256` |
 
 Login is two steps:
 1. A correct password returns a 5-minute challenge token.
@@ -507,8 +682,29 @@ and the user has to enter their password again.
 
 Every login attempt (successful or not), every logout, user creation, policy
 change, download-link creation and agent enrollment is written to the
-hash-chained `audit_log` table. Chain verification is
-`server::audit::verify`.
+hash-chained `audit_log` table. So is every remote shell (`shell.open`,
+`shell.close`), script run (`script.run`, `script.complete`), file transfer
+(`file.upload`, `file.download`) and refused remote operation
+(`permission.denied`). Chain verification is
+`server::audit::verify`, exposed as `GET /api/audit/verify`.
+
+## Support TUI
+
+`tui/` is the support engineers' terminal app (Python + Textual). It talks
+only to the server's HTTPS API:
+
+- sign in with username, password and TOTP; the session token is kept in the
+  OS keyring, so it stays signed in across launches;
+- a live table of agents: hostname, status, last seen, CPU, RAM, disk and
+  active sessions;
+- **remote desktop:** mints a viewer token and starts the native viewer
+  (`crates/viewer`) as a separate process. The TUI doesn't render video;
+- **shell console** and **script runner**, which use the server's shell
+  WebSocket and `/api/script-runs` directly. **Neither needs the viewer**;
+- an audit-log view with chain verification for admins and auditors.
+  Auditors see agents and the audit log but get none of the control actions.
+
+Install, configuration and usage: [tui/README.md](tui/README.md).
 
 ## Running without Docker
 
@@ -541,7 +737,7 @@ cargo test --workspace        # needs a running Docker daemon
 ```
 
 The database tests (`crates/server/tests/db.rs`, `api.rs`, `enrollment.rs`,
-`telemetry.rs` and `streaming.rs`)
+`telemetry.rs`, `streaming.rs`, `consent.rs` and `remote.rs`)
 each start a throwaway `postgres:17-alpine` container with testcontainers. The
 container is removed when the test ends. `heartbeat.rs` (QUIC over loopback) and
 `updates.rs` (signed updates over HTTPS) need no database. `streaming.rs` runs a
@@ -553,6 +749,26 @@ checks:
 - a monitor switch applies to both;
 - the agent stops capturing when both leave;
 - viewer tokens are single-use and role-checked.
+
+`remote.rs` drives the shell, script and file APIs with plain HTTPS and
+WebSocket clients against two real agents. No viewer is used. It checks:
+- an interactive shell with resize and exit code;
+- a script fanned out to both agents, plus an offline one;
+- a 24 MiB upload and download with hash checks;
+- corrupted, short and conflicting transfers leave no file;
+- an auditor is refused and audited on all three.
+
+It runs the agents' development fallbacks (`/bin/sh`), so it runs on Linux
+and macOS only.
+
+The TUI has its own checks (no server or Docker needed; the API is mocked):
+
+```sh
+cd tui
+python -m venv .venv && .venv/bin/pip install -e '.[dev]'
+.venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
+.venv/bin/pytest
+```
 
 ### On Windows
 
@@ -566,6 +782,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p agent -p protocol -p common
 cargo test -p server --lib --test heartbeat --test updates   # no Docker needed
 ```
+
+The Windows agent tests include real ConPTY PowerShell (resize, exit code)
+and the PowerShell script runner (output, UTF-8, `throw`, timeout tree-kill).
 
 The DPAPI credential tests need an account whose logon credentials are
 loaded: an interactive logon, or SYSTEM (as the service runs). Over

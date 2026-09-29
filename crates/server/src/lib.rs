@@ -9,6 +9,8 @@
 //! - [`updates`]: signing and publishing agent updates.
 //! - [`relay`]: fan-out of agent video to viewers.
 //! - [`viewers`]: short-lived viewer-session tokens.
+//! - [`remote`]: remote shell, script runner and file transfer, relayed to
+//!   agents for API clients (no viewer needed).
 
 pub mod api;
 pub mod audit;
@@ -19,6 +21,7 @@ pub mod enroll;
 pub mod quic;
 pub mod registry;
 pub mod relay;
+pub mod remote;
 pub mod updates;
 pub mod users;
 pub mod viewers;

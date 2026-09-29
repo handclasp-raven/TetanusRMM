@@ -8,10 +8,16 @@
 //! | POST   | /api/auth/logout            | session         |
 //! | GET    | /api/me                     | session         |
 //! | GET    | /api/agents                 | session         |
+//! | GET    | /api/audit?limit=           | session (admin, auditor) |
+//! | GET    | /api/audit/verify           | session (admin, auditor) |
 //! | GET    | /api/agents/{id}/policy     | session         |
 //! | PUT    | /api/agents/{id}/policy     | session (admin) |
 //! | POST   | /api/enrollment-links       | session (admin, support_engineer) |
 //! | POST   | /api/agents/{id}/viewer-sessions | session (admin, support_engineer) |
+//! | GET    | /api/agents/{id}/shell?cols=&rows= | session (admin, support_engineer); WebSocket |
+//! | POST   | /api/script-runs            | session (admin, support_engineer) |
+//! | PUT    | /api/agents/{id}/files?path=&overwrite= | session (admin, support_engineer) |
+//! | GET    | /api/agents/{id}/files?path= | session (admin, support_engineer) |
 //! | GET    | /api/download/{platform}?token= | enrollment token |
 //! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
 //! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
@@ -25,21 +31,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use protocol::shell::TermSize;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use tracing::error;
 
+use crate::audit;
 use crate::auth::{self, AuthSettings, LoginError};
 use crate::enroll;
 use crate::registry::{self, Agent, DevicePolicy, PolicyError};
+use crate::remote::{self, files, script, shell, RemoteError};
 use crate::updates;
 use crate::users::User;
 use crate::viewers::{self, ViewerError};
@@ -64,11 +75,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/agents", get(list_agents))
+        .route("/api/audit", get(list_audit))
+        .route("/api/audit/verify", get(verify_audit))
         .route("/api/agents/{id}/policy", get(get_policy).put(put_policy))
         .route("/api/enrollment-links", post(create_enrollment_link))
         .route(
             "/api/agents/{id}/viewer-sessions",
             post(create_viewer_session),
+        )
+        .route("/api/agents/{id}/shell", get(open_shell))
+        .route("/api/script-runs", post(run_script))
+        .route(
+            "/api/agents/{id}/files",
+            get(download_file)
+                .put(upload_file)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/download/{platform}", get(download_agent))
         .route("/api/updates/{platform}/manifest", get(update_manifest))
@@ -106,6 +127,9 @@ pub enum ApiError {
     Unavailable,
     #[error("internal error")]
     Internal(String),
+    /// Any other status, with a message for the client.
+    #[error("{1}")]
+    Status(StatusCode, String),
 }
 
 impl IntoResponse for ApiError {
@@ -120,6 +144,7 @@ impl IntoResponse for ApiError {
                 error!("internal error: {detail}");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            ApiError::Status(status, _) => *status,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
@@ -128,6 +153,28 @@ impl IntoResponse for ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         ApiError::Internal(e.to_string())
+    }
+}
+
+impl From<RemoteError> for ApiError {
+    fn from(e: RemoteError) -> Self {
+        use protocol::transfer::ErrorKind;
+        let status = match &e {
+            RemoteError::Forbidden => return ApiError::Forbidden,
+            RemoteError::Db(e) => return ApiError::Internal(e.to_string()),
+            RemoteError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            RemoteError::AgentOffline | RemoteError::Unsupported => StatusCode::CONFLICT,
+            RemoteError::Agent { kind, .. } => match kind {
+                ErrorKind::InvalidPath => StatusCode::BAD_REQUEST,
+                ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+                ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                ErrorKind::Integrity => StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorKind::Io => StatusCode::BAD_GATEWAY,
+            },
+            RemoteError::Transport(_) => StatusCode::BAD_GATEWAY,
+        };
+        ApiError::Status(status, e.to_string())
     }
 }
 
@@ -239,11 +286,74 @@ async fn me(session: Session) -> Json<User> {
     Json(session.user)
 }
 
+/// An agent as listed by the API: the registry row plus live state from
+/// the relay hub.
+#[derive(Serialize)]
+struct AgentView {
+    #[serde(flatten)]
+    agent: Agent,
+    /// Connected to the server right now.
+    online: bool,
+    /// Remote-desktop viewers watching it.
+    viewer_sessions: usize,
+    /// Interactive shells open on it.
+    shell_sessions: usize,
+}
+
 async fn list_agents(
     State(state): State<AppState>,
     _session: Session,
-) -> Result<Json<Vec<Agent>>, ApiError> {
-    Ok(Json(registry::list_agents(&state.pool).await?))
+) -> Result<Json<Vec<AgentView>>, ApiError> {
+    let agents = registry::list_agents(&state.pool).await?;
+    Ok(Json(
+        agents
+            .into_iter()
+            .map(|agent| {
+                let link = state.hub.as_ref().and_then(|hub| hub.get(&agent.id));
+                AgentView {
+                    online: link.is_some(),
+                    viewer_sessions: link.as_ref().map_or(0, |l| l.viewers()),
+                    shell_sessions: link.as_ref().map_or(0, |l| l.shells()),
+                    agent,
+                }
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    /// Defaults to 100; at most 1000.
+    limit: Option<i64>,
+}
+
+/// The newest audit entries, newest first.
+async fn list_audit(
+    State(state): State<AppState>,
+    session: Session,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Vec<audit::Entry>>, ApiError> {
+    if !session.user.role.can_read_audit() {
+        return Err(ApiError::Forbidden);
+    }
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    Ok(Json(audit::recent(&state.pool, limit).await?))
+}
+
+/// Walk the whole audit chain and report whether it is intact.
+async fn verify_audit(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<audit::Verification>, ApiError> {
+    if !session.user.role.can_read_audit() {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(audit::verify(&state.pool).await?))
 }
 
 async fn get_policy(
@@ -441,4 +551,171 @@ async fn create_viewer_session(
         online: state.hub.as_ref().is_some_and(|h| h.is_online(&agent_id)),
         agent_id,
     }))
+}
+
+fn hub(state: &AppState) -> Result<&crate::relay::Hub, ApiError> {
+    state.hub.as_deref().ok_or(ApiError::Unavailable)
+}
+
+#[derive(Deserialize)]
+struct ShellQuery {
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+/// Interactive shell over a WebSocket (see `remote::shell`). The shell is
+/// started before the upgrade, so failures are ordinary HTTP errors.
+async fn open_shell(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+    Query(query): Query<ShellQuery>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Result<Response, ApiError> {
+    let default = TermSize::default();
+    let size = TermSize::new(
+        query.cols.unwrap_or(default.cols),
+        query.rows.unwrap_or(default.rows),
+    )
+    .ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "cols and rows must be between 1 and {}",
+            protocol::shell::MAX_DIMENSION
+        ))
+    })?;
+    if !session.user.role.can(crate::users::Capability::Shell) {
+        // Audit the refusal even for a request that is not a WebSocket.
+        remote::authorize(
+            &state.pool,
+            &session.user,
+            crate::users::Capability::Shell,
+            std::slice::from_ref(&agent_id),
+        )
+        .await?;
+    }
+    let upgrade = upgrade.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let opened = shell::open(&state.pool, hub(&state)?, &session.user, &agent_id, size).await?;
+    Ok(upgrade.on_upgrade(move |socket| shell::relay(socket, opened)))
+}
+
+#[derive(Deserialize)]
+struct ScriptRunRequest {
+    agent_ids: Vec<String>,
+    /// PowerShell on Windows agents.
+    script: String,
+    /// Defaults to 300; at most 3600.
+    timeout_secs: Option<u32>,
+}
+
+/// Run a script on one or more agents; returns every agent's result.
+async fn run_script(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<ScriptRunRequest>,
+) -> Result<Json<script::RunReport>, ApiError> {
+    let agents = script::normalize_agents(&req.agent_ids)?;
+    let request = protocol::script::ScriptRequest::new(req.script, req.timeout_secs)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let report = script::run(&state.pool, hub(&state)?, &session.user, agents, request).await?;
+    Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    /// Absolute path on the agent.
+    path: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Header carrying a file's hex SHA-256: required on upload, set on download.
+pub const SHA256_HEADER: &str = "x-content-sha256";
+
+/// Upload the request body to `path` on the agent. Needs `Content-Length`
+/// and `x-content-sha256`; the file appears only if both match.
+async fn upload_file(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+    Query(query): Query<FileQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<files::Uploaded>, ApiError> {
+    let size = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+        .ok_or_else(|| {
+            ApiError::Status(
+                StatusCode::LENGTH_REQUIRED,
+                "Content-Length is required".into(),
+            )
+        })?;
+    let sha256 = headers
+        .get(SHA256_HEADER)
+        .and_then(|v| files::parse_sha256(v.to_str().ok()?))
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("{SHA256_HEADER} must be the file's hex SHA-256"))
+        })?;
+    let params = files::UploadParams {
+        agent_id,
+        path: query.path,
+        overwrite: query.overwrite,
+        size,
+        sha256,
+    };
+    let uploaded = files::upload(
+        &state.pool,
+        hub(&state)?,
+        &session.user,
+        params,
+        body.into_data_stream(),
+    )
+    .await?;
+    Ok(Json(uploaded))
+}
+
+/// Download `path` from the agent, streamed. `x-content-sha256` is the
+/// agent's hash of the file; a body that fails verification is cut short.
+async fn download_file(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Response, ApiError> {
+    let download = files::download(
+        &state.pool,
+        hub(&state)?,
+        &session.user,
+        &agent_id,
+        &query.path,
+    )
+    .await?;
+    let name: String = query
+        .path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("download")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut resp = Body::from_stream(download.body).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(header::CONTENT_LENGTH, download.manifest.size.into());
+    let hash = HeaderValue::from_str(&hex::encode(download.manifest.sha256))
+        .expect("hex is a valid header");
+    headers.insert(SHA256_HEADER, hash);
+    if let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, disposition);
+    }
+    Ok(resp)
 }

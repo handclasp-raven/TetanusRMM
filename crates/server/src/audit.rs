@@ -44,6 +44,18 @@ pub enum Action {
     SessionStart,
     /// The user ended a session with the Ctrl+F12 kill switch.
     SessionUserTerminated,
+    /// A remote operation was refused because of the user's role.
+    PermissionDenied,
+    /// An interactive shell was requested; detail says whether it started.
+    ShellOpen,
+    /// An interactive shell ended; detail has the duration and byte counts.
+    ShellClose,
+    /// A script was sent to agents; detail has a summary and its hash.
+    ScriptRun,
+    /// A script run finished; detail has each agent's exit code.
+    ScriptComplete,
+    FileUpload,
+    FileDownload,
 }
 
 impl Action {
@@ -63,6 +75,13 @@ impl Action {
             Action::PolicyDefault => "policy.default",
             Action::SessionStart => "session.start",
             Action::SessionUserTerminated => "session.user_terminated",
+            Action::PermissionDenied => "permission.denied",
+            Action::ShellOpen => "shell.open",
+            Action::ShellClose => "shell.close",
+            Action::ScriptRun => "script.run",
+            Action::ScriptComplete => "script.complete",
+            Action::FileUpload => "file.upload",
+            Action::FileDownload => "file.download",
         }
     }
 }
@@ -203,6 +222,17 @@ pub async fn append_now(pool: &PgPool, entry: NewEntry) -> sqlx::Result<Entry> {
     let row = append(&mut tx, entry).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+/// The newest `limit` entries, newest first.
+pub async fn recent(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<Entry>> {
+    sqlx::query_as(
+        "SELECT id, ts, actor, action, target, detail, prev_hash, hash
+         FROM audit_log ORDER BY id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// Walk the whole chain in id order and report the first break, if any.

@@ -34,7 +34,7 @@ rustls-pki-types = { version = "1.9", features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 tempfile = "3"
 argon2 = "0.6"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -61,6 +61,7 @@ windows = { version = "0.62", features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",
