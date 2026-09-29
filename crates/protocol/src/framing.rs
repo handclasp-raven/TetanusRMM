@@ -1,10 +1,14 @@
-//! Length-delimited framing over any async byte stream (QUIC streams in practice).
+//! Length-delimited framing over any async byte stream: QUIC streams between
+//! agent and server, and the named pipe between the agent service and its
+//! session helper.
 //!
 //! Frame layout: `[len: u32 big-endian][payload: len bytes of postcard]`.
+//! The payload type is generic; in practice it is [`crate::Message`] or
+//! [`crate::ipc::IpcMessage`].
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-use crate::Message;
 
 /// Largest payload accepted in a single frame. Guards against a peer making us
 /// allocate an arbitrary amount of memory from a forged length prefix.
@@ -23,9 +27,10 @@ pub enum FrameError {
 }
 
 /// Encode `msg` and write it as one frame. Does not flush or finish the stream.
-pub async fn write_frame<W>(writer: &mut W, msg: &Message) -> Result<(), FrameError>
+pub async fn write_frame<W, T>(writer: &mut W, msg: &T) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin + ?Sized,
+    T: Serialize + ?Sized,
 {
     let payload = postcard::to_stdvec(msg)?;
     let len = u32::try_from(payload.len())
@@ -46,9 +51,10 @@ where
 ///
 /// Not cancel-safe: if the future is dropped mid-read, the stream is left at an
 /// unknown offset. Run it in its own task rather than inside `select!`.
-pub async fn read_frame<R>(reader: &mut R) -> Result<Option<Message>, FrameError>
+pub async fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>, FrameError>
 where
     R: AsyncRead + Unpin + ?Sized,
+    T: DeserializeOwned,
 {
     let mut len_buf = [0u8; 4];
     let mut filled = 0;
@@ -79,6 +85,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Message;
+
+    async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Message>, FrameError> {
+        read_frame(r).await
+    }
 
     fn samples() -> Vec<Message> {
         vec![
@@ -89,10 +100,19 @@ mod tests {
             Message::Heartbeat {
                 ts: 1_700_000_000_000,
                 seq: 0,
+                telemetry: None,
             },
             Message::Heartbeat {
                 ts: u64::MAX,
                 seq: u64::MAX,
+                telemetry: Some(crate::Telemetry {
+                    cpu_percent: 12.5,
+                    mem_used_bytes: 8 << 30,
+                    mem_total_bytes: 16 << 30,
+                    disk_used_bytes: 100 << 30,
+                    disk_total_bytes: 500 << 30,
+                    uptime_secs: 86_400,
+                }),
             },
             Message::HeartbeatAck { seq: 42 },
         ]
@@ -107,10 +127,10 @@ mod tests {
 
         let mut reader = buf.as_slice();
         for expected in samples() {
-            let got = read_frame(&mut reader).await.unwrap();
+            let got = read_msg(&mut reader).await.unwrap();
             assert_eq!(got, Some(expected));
         }
-        assert!(read_frame(&mut reader).await.unwrap().is_none());
+        assert!(read_msg(&mut reader).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -123,10 +143,10 @@ mod tests {
             }
         });
         for expected in samples() {
-            assert_eq!(read_frame(&mut server).await.unwrap(), Some(expected));
+            assert_eq!(read_msg(&mut server).await.unwrap(), Some(expected));
         }
         writer.await.unwrap();
-        assert!(read_frame(&mut server).await.unwrap().is_none());
+        assert!(read_msg(&mut server).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -142,14 +162,14 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_is_clean_eof() {
         let mut reader: &[u8] = &[];
-        assert!(read_frame(&mut reader).await.unwrap().is_none());
+        assert!(read_msg(&mut reader).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn eof_inside_length_prefix_is_truncated() {
         let mut reader: &[u8] = &[0, 0];
         assert!(matches!(
-            read_frame(&mut reader).await,
+            read_msg(&mut reader).await,
             Err(FrameError::Truncated)
         ));
     }
@@ -163,7 +183,7 @@ mod tests {
         buf.pop();
         let mut reader = buf.as_slice();
         assert!(matches!(
-            read_frame(&mut reader).await,
+            read_msg(&mut reader).await,
             Err(FrameError::Truncated)
         ));
     }
@@ -172,7 +192,7 @@ mod tests {
     async fn oversized_length_prefix_is_rejected_without_allocating() {
         let mut reader: &[u8] = &(MAX_FRAME_LEN + 1).to_be_bytes();
         assert!(matches!(
-            read_frame(&mut reader).await,
+            read_msg(&mut reader).await,
             Err(FrameError::TooLarge(n)) if n == u64::from(MAX_FRAME_LEN) + 1
         ));
     }
@@ -182,7 +202,7 @@ mod tests {
         // Variant index 200 does not exist.
         let mut reader: &[u8] = &[0, 0, 0, 1, 200];
         assert!(matches!(
-            read_frame(&mut reader).await,
+            read_msg(&mut reader).await,
             Err(FrameError::Decode(_))
         ));
     }

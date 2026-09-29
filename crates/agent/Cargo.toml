@@ -24,9 +24,12 @@ rustls.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+windows-service.workspace = true
+tray-icon.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

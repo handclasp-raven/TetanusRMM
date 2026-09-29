@@ -57,6 +57,7 @@ impl Credential {
             identity: Identity::from_pem(&self.cert_pem, &self.key_pem)?,
             heartbeat_interval,
             bind_addr: None,
+            telemetry: None,
         })
     }
 }

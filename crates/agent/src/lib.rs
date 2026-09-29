@@ -5,13 +5,25 @@
 //! - [`enroll`]: first-run exchange of a one-time token for a certificate.
 //! - [`credstore`]: the certificate and key, protected at rest.
 //! - [`update`] and [`updater`]: signed self-update.
+//! - [`telemetry`]: health samples sent on each heartbeat.
+//! - [`core`]: the connect/heartbeat/update loop shared by console and service mode.
+//! - [`session`]: when to (re)start the helper in the user's session.
+//! - [`paths`]: where the agent keeps its files.
+//! - `win` (Windows only): the service, the session helper and its tray icon.
 
+pub mod core;
 pub mod credstore;
 pub mod enroll;
+pub mod paths;
+pub mod session;
+pub mod telemetry;
 pub mod update;
 pub mod updater;
+#[cfg(windows)]
+pub mod win;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::Identity;
@@ -20,6 +32,8 @@ use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
+
+use crate::telemetry::TelemetrySource;
 
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -37,6 +51,8 @@ pub struct AgentConfig {
     /// server's address family, which is what production agents should use
     /// (see [`AgentSession::rebind`] for why).
     pub bind_addr: Option<SocketAddr>,
+    /// Telemetry to attach to heartbeats, if any.
+    pub telemetry: Option<Arc<dyn TelemetrySource>>,
 }
 
 /// What the agent observed, for tests.
@@ -71,6 +87,7 @@ pub struct AgentSession {
     connection: quinn::Connection,
     agent_id: String,
     heartbeat_interval: Duration,
+    telemetry: Option<Arc<dyn TelemetrySource>>,
 }
 
 /// Connect to the server and complete the mutual-TLS handshake.
@@ -94,6 +111,7 @@ pub async fn connect(config: &AgentConfig) -> Result<AgentSession, AgentError> {
         connection,
         agent_id: config.agent_id.clone(),
         heartbeat_interval: config.heartbeat_interval,
+        telemetry: config.telemetry.clone(),
     })
 }
 
@@ -148,11 +166,21 @@ impl AgentSession {
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             for seq in 0u64.. {
                 ticker.tick().await;
+                let telemetry = match &self.telemetry {
+                    Some(source) => {
+                        let source = source.clone();
+                        tokio::task::spawn_blocking(move || source.sample())
+                            .await
+                            .ok()
+                    }
+                    None => None,
+                };
                 write_frame(
                     &mut send,
                     &Message::Heartbeat {
                         ts: unix_millis(),
                         seq,
+                        telemetry,
                     },
                 )
                 .await?;

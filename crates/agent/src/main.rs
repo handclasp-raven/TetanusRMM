@@ -1,17 +1,18 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use agent::credstore::{Credential, CredentialStore};
+use agent::core::CoreOptions;
+use agent::credstore::CredentialStore;
 use agent::enroll::EnrollOptions;
-use agent::update::{CheckOutcome, UpdateClient, VerifiedUpdate};
+use agent::telemetry::SystemTelemetry;
+use agent::update::VerifiedUpdate;
 use agent::updater::{self, UpdatePaths};
 use anyhow::{bail, Context};
 use clap::{Args, Parser, Subcommand};
-use tracing::{error, info, warn};
-
-/// Delay before reconnecting after the connection drops.
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+use tokio::sync::watch;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(about = "RMM agent", version)]
@@ -22,28 +23,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Enroll with a one-time token from a download link and store the
-    /// issued credential.
+    /// Enroll with a one-time token and store the credential (console mode).
     Enroll(EnrollArgs),
-    /// Connect with the stored credential, heartbeat, and apply signed updates.
+    /// Run in the foreground: connect, heartbeat, apply signed updates.
     Run(RunArgs),
+    /// Manage the Windows service (Windows only).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+    /// Session helper started by the service in the user's session (internal).
+    #[command(hide = true)]
+    Helper,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install as an auto-start LocalSystem service and start it. With
+    /// --token, the service enrolls itself on first start.
+    Install(InstallArgs),
+    /// Stop and remove the service. Files are left in place.
+    Uninstall,
+    Start,
+    Stop,
+    /// Service entry point, invoked by the Service Control Manager (internal).
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Args)]
-struct StateDir {
-    /// Where the protected credential is kept.
-    #[arg(long, env = "RMM_STATE_DIR", default_value_os_t = default_state_dir())]
-    state_dir: PathBuf,
-}
-
-#[derive(Args)]
-struct EnrollArgs {
+struct ServerArgs {
     /// Server UDP address.
     #[arg(long, env = "RMM_SERVER", default_value = "127.0.0.1:4433")]
     server: SocketAddr,
     /// Name the server certificate must be valid for.
     #[arg(long, env = "RMM_SERVER_NAME", default_value = "localhost")]
     server_name: String,
+}
+
+#[derive(Args)]
+struct InstallArgs {
+    #[command(flatten)]
+    server: ServerArgs,
+    /// PEM CA certificate the server's certificate must chain to (ca.crt).
+    #[arg(long, env = "RMM_SERVER_CA")]
+    server_ca: Option<PathBuf>,
+    /// Enrollment token from the download link.
+    #[arg(long, env = "RMM_ENROLL_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Install without starting.
+    #[arg(long)]
+    no_start: bool,
+}
+
+#[derive(Args)]
+struct StateDir {
+    /// Where the protected credential is kept.
+    #[arg(long, env = "RMM_STATE_DIR", default_value_os_t = agent::paths::default_state_dir())]
+    state_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct EnrollArgs {
+    #[command(flatten)]
+    server: ServerArgs,
     /// PEM CA certificate the server's certificate must chain to (ca.crt).
     #[arg(long, env = "RMM_SERVER_CA")]
     server_ca: PathBuf,
@@ -69,24 +110,25 @@ struct RunArgs {
     state: StateDir,
 }
 
-fn default_state_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
-        PathBuf::from(base).join("RMM").join("agent")
-    }
-    #[cfg(not(windows))]
-    {
-        PathBuf::from("agent-state")
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        // These two set up their own logging (to files) and runtimes.
+        Command::Service(ServiceCommand::Run) => service_run(),
+        Command::Helper => helper(),
+        command => {
+            common::logging::init();
+            tokio::runtime::Runtime::new()?.block_on(console(command))
+        }
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    common::logging::init();
-    match Cli::parse().command {
+async fn console(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Enroll(args) => enroll(args).await,
         Command::Run(args) => run(args).await,
+        Command::Service(command) => service(command),
+        Command::Helper => unreachable!(),
     }
 }
 
@@ -101,8 +143,8 @@ async fn enroll(args: EnrollArgs) -> anyhow::Result<()> {
     let server_ca_pem = std::fs::read_to_string(&args.server_ca)
         .with_context(|| format!("reading {}", args.server_ca.display()))?;
     let credential = agent::enroll::enroll(&EnrollOptions {
-        server_addr: args.server,
-        server_name: args.server_name,
+        server_addr: args.server.server,
+        server_name: args.server.server_name,
         server_ca_pem,
         token: args.token,
         bind_addr: None,
@@ -125,71 +167,23 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             store.dir().display()
         )
     })?;
-    let config = credential.agent_config(Duration::from_secs(args.heartbeat_secs.max(1)))?;
-    info!(agent_id = %credential.agent_id, version = env!("CARGO_PKG_VERSION"), "starting");
+    info!(agent_id = %credential.agent_id, version = agent::core::version(), "starting");
 
-    let update = update_loop(&credential, Duration::from_secs(args.update_interval_secs));
+    let (status, _) = watch::channel(agent::core::initial_status(Some(
+        credential.agent_id.clone(),
+    )));
+    let options = CoreOptions {
+        heartbeat_interval: Duration::from_secs(args.heartbeat_secs.max(1)),
+        update_interval: Duration::from_secs(args.update_interval_secs),
+        telemetry: Some(Arc::new(SystemTelemetry::new())),
+    };
     tokio::select! {
-        () = connect_forever(&config) => unreachable!(),
-        update = update => {
-            let update = update?;
-            install_and_relaunch(&paths, update)
-        }
+        update = agent::core::run(&credential, options, status) => install_and_relaunch(&paths, update?),
         res = tokio::signal::ctrl_c() => {
             res.context("waiting for ctrl-c")?;
             info!("shutting down");
             Ok(())
         }
-    }
-}
-
-/// Connect and heartbeat, reconnecting after any failure.
-async fn connect_forever(config: &agent::AgentConfig) {
-    loop {
-        match agent::connect(config).await {
-            Ok(session) => {
-                if let Err(e) = session.run(None).await {
-                    warn!("connection lost: {e}");
-                }
-                session.close();
-            }
-            Err(e) => warn!("connect failed: {e}"),
-        }
-        tokio::time::sleep(RECONNECT_DELAY).await;
-    }
-}
-
-/// Poll for updates. Returns once a verified update is ready to install;
-/// never returns if updates are disabled or unavailable.
-async fn update_loop(
-    credential: &Credential,
-    interval: Duration,
-) -> anyhow::Result<VerifiedUpdate> {
-    let Some(key) = agent::update::baked_public_key() else {
-        warn!("auto-update disabled: this build has no RMM_UPDATE_PUBKEY");
-        return std::future::pending().await;
-    };
-    if interval.is_zero() {
-        info!("auto-update disabled by configuration");
-        return std::future::pending().await;
-    }
-    let client = UpdateClient::new(
-        &credential.api_url,
-        &credential.ca_pem,
-        key,
-        protocol::update::current_platform(),
-        env!("CARGO_PKG_VERSION")
-            .parse()
-            .expect("crate version is semver"),
-    )?;
-    loop {
-        match client.check().await {
-            Ok(CheckOutcome::Available(update)) => return Ok(update),
-            Ok(CheckOutcome::UpToDate) => {}
-            // A bad signature is logged loudly but never installed.
-            Err(e) => error!("update check failed: {e}"),
-        }
-        tokio::time::sleep(interval).await;
     }
 }
 
@@ -200,4 +194,48 @@ fn install_and_relaunch(paths: &UpdatePaths, update: VerifiedUpdate) -> anyhow::
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let err = updater::relaunch(&paths.current, &args);
     Err(err).context("relaunching after update")
+}
+
+#[cfg(windows)]
+fn service(command: ServiceCommand) -> anyhow::Result<()> {
+    use agent::win::service::{self, InstallOptions};
+    match command {
+        ServiceCommand::Install(args) => service::install(InstallOptions {
+            server: args.server.server,
+            server_name: args.server.server_name,
+            server_ca: args.server_ca,
+            token: args.token,
+            start: !args.no_start,
+        }),
+        ServiceCommand::Uninstall => service::uninstall(),
+        ServiceCommand::Start => service::start(),
+        ServiceCommand::Stop => service::stop(),
+        ServiceCommand::Run => unreachable!(),
+    }
+}
+
+#[cfg(windows)]
+fn service_run() -> anyhow::Result<()> {
+    agent::win::service::run_dispatcher()
+        .context("`service run` is started by the Service Control Manager, not by hand")
+}
+
+#[cfg(windows)]
+fn helper() -> anyhow::Result<()> {
+    agent::win::helper::run()
+}
+
+#[cfg(not(windows))]
+fn service(_: ServiceCommand) -> anyhow::Result<()> {
+    bail!("the Windows service is only available on Windows; use `agent run` instead")
+}
+
+#[cfg(not(windows))]
+fn service_run() -> anyhow::Result<()> {
+    service(ServiceCommand::Run)
+}
+
+#[cfg(not(windows))]
+fn helper() -> anyhow::Result<()> {
+    bail!("the session helper is only available on Windows")
 }

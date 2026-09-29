@@ -86,6 +86,10 @@ struct GenCertsArgs {
     /// Replace existing certificates in the output directory.
     #[arg(long)]
     force: bool,
+    /// Extra DNS name or IP address for the server certificate, besides
+    /// localhost/127.0.0.1/::1. Repeatable.
+    #[arg(long = "san")]
+    extra_names: Vec<String>,
 }
 
 #[derive(Args)]
@@ -188,9 +192,9 @@ fn gen_certs(args: GenCertsArgs) -> anyhow::Result<()> {
             args.out.display()
         );
     }
-    let certs = devcerts::generate("unused")?;
+    let certs = devcerts::generate_with_names("unused", &args.extra_names)?;
     certs.write_to_dir(&args.out)?;
-    info!(dir = %args.out.display(), "wrote dev CA and server certificate");
+    info!(dir = %args.out.display(), extra_names = ?args.extra_names, "wrote dev CA and server certificate");
     Ok(())
 }
 

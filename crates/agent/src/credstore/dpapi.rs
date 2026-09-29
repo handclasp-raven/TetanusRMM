@@ -53,7 +53,13 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, StoreError> {
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut out,
         )
-        .map_err(|e| StoreError::Protect(e.to_string()))?;
+        .map_err(|e| {
+            StoreError::Protect(format!(
+                "{e} (DPAPI needs the account's logon credentials; a key-based SSH \
+                 session does not have them. The installed service, running as \
+                 SYSTEM, does.)"
+            ))
+        })?;
         Ok(take(out))
     }
 }

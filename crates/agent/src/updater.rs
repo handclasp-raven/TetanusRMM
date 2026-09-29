@@ -54,15 +54,22 @@ impl UpdatePaths {
     }
 }
 
-/// Write the new binary next to the current one and make it executable.
+/// Write the new binary next to the current one, flush it to disk, and make
+/// it executable.
 pub fn stage(paths: &UpdatePaths, binary: &[u8]) -> io::Result<()> {
-    std::fs::write(&paths.staged, binary)?;
+    use std::io::Write;
+    // One writable handle for write + flush: Windows' FlushFileBuffers
+    // (behind sync_all) needs write access, unlike fsync on Unix.
+    let mut file = std::fs::File::create(&paths.staged)?;
+    file.write_all(binary)?;
+    file.sync_all()?;
+    drop(file);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&paths.staged, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::File::open(&paths.staged)?.sync_all()
+    Ok(())
 }
 
 /// Move the staged binary into place, keeping the old one as `.old`.

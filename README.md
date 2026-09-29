@@ -10,7 +10,7 @@ for the architecture and phase plan.
 | `crates/protocol` | lib | Wire `Message` enum, framing, close codes, update manifest and signed-message format |
 | `crates/common` | lib | Logging init, PEM loading, quinn/rustls TLS configs, dev cert generation |
 | `crates/server` | bin + lib | QUIC listener for agents, HTTPS API, Postgres, auth, audit log, enrollment CA, update publishing |
-| `crates/agent` | bin + lib | Enrollment, heartbeats, protected credential storage, signed self-update |
+| `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray |
 | `crates/viewer` | bin | Placeholder until Phase 5 |
 
 Server modules: `quic` (agent listener), `api` (HTTPS routes), `auth` (Argon2id,
@@ -18,8 +18,18 @@ TOTP, sessions), `users`, `audit` (hash chain), `registry` (agents, policies),
 `enroll` (tokens, internal CA), `updates` (signing, publishing), `db` (pool,
 migrations), `config`.
 
-Agent modules: `enroll`, `credstore` (DPAPI on Windows, dev-only encrypted file
-elsewhere), `update` (download and verify), `updater` (rename-and-replace). Migrations live in
+Agent modules:
+- `core`: the connect/heartbeat/update loop, shared by console and service mode.
+- `enroll`
+- `credstore`: DPAPI on Windows, a dev-only encrypted file elsewhere.
+- `telemetry`: sysinfo.
+- `session`: the helper supervisor state machine.
+- `update` (download and verify) and `updater` (rename-and-replace).
+- `paths`
+- `win` (Windows only): `service`, `process` (spawn into a session), `pipe`,
+  `helper` (tray), `acl`.
+
+Migrations live in
 `crates/server/migrations/` and are embedded in the binary. They run
 automatically when the server starts.
 
@@ -117,6 +127,120 @@ Agents do not share a certificate. Each one gets its own at enrollment:
    certificate. The server accepts `Hello` only if the certificate is the one
    pinned to that agent id and the agent is not revoked. Setting
    `agents.enrollment_state = 'revoked'` locks it out at its next connection.
+
+## Installing the agent on Windows (service + session helper)
+
+On Windows the agent runs as a service. From an elevated prompt, with the token
+from a download link and the server's `ca.crt`:
+
+```powershell
+rmm-agent.exe service install --server 203.0.113.10:4433 --server-name localhost `
+  --server-ca C:\path\to\ca.crt --token 9f3c…
+rmm-agent.exe service stop | start      # manual control
+rmm-agent.exe service uninstall         # stops and removes the service; keeps files
+```
+
+`service install`:
+1. Copies the binary to `C:\Program Files\RMM\rmm-agent.exe`.
+2. Creates `C:\ProgramData\RMM\agent\` with an ACL allowing only SYSTEM and
+   Administrators (nothing inherited from `ProgramData`, which ordinary users can
+   read).
+3. Saves the token there as a pending enrollment request.
+4. Registers the `RmmAgent` service:
+   - runs as **LocalSystem** and starts automatically at boot;
+   - restarts on failure after 5 s, 5 s, then 30 s;
+   - failure restarts also apply to the agent's own non-zero exits.
+5. Starts the service. Pass `--no-start` to skip this.
+
+The service enrolls itself on first start. It does this rather than the
+installer because DPAPI ties the credential to the account that encrypts it:
+the admin running `install` is not the account that runs the service. So
+SYSTEM enrolls, encrypts the credential under SYSTEM, and deletes the request.
+Reinstalling later needs no token, because the existing credential is reused.
+
+For the same reason, don't use `agent enroll`/`agent run` in the default
+state directory on a machine where the service is installed. Console mode is
+for development; point it at its own `--state-dir`.
+
+### Service and helper model
+
+```text
+ Session 0 (no desktop)                 User's session (e.g. 1)
+┌──────────────────────────────┐       ┌─────────────────────────────┐
+│ rmm-agent.exe service run    │ spawn │ rmm-agent.exe helper        │
+│ LocalSystem, auto-start      │──────▶│ runs as the logged-on user  │
+│ - QUIC + heartbeat/telemetry │       │ - tray icon                 │
+│ - signed updates             │◀─────▶│ - (later) capture + input   │
+│ - supervises the helper      │ pipe  │                             │
+└──────────────────────────────┘       └─────────────────────────────┘
+```
+
+Why a helper is needed: services run in **session 0**, which Windows isolates
+from users (its own window station and desktop, visible to no one). A SYSTEM
+service there can't capture the user's screen, inject input, or show a tray
+icon, and it would only ever see session 0's empty desktop. So the service
+starts a helper process *inside* the user's session:
+
+- **Finding the session:** `WTSGetActiveConsoleSessionId` gives the console
+  session. `WTSQueryUserToken` succeeds only if a user is logged on there; at
+  the logon screen, nobody is.
+- **Starting the helper:** it's launched with that user's token and
+  environment block, via `CreateProcessAsUser` on `winsta0\default`. It runs
+  **as the user, not SYSTEM**. (The secure desktop for UAC and the logon
+  screen needs a SYSTEM token and is Phase 9.)
+- **When nobody is logged on,** the service keeps running and heartbeating.
+  It re-checks every 5 s, and immediately on session-change notifications
+  (logon, logoff, user switch), then spawns the helper when a user appears.
+- **If spawning fails or the helper crashes quickly,** retries back off
+  exponentially: 1 s, 2 s, 4 s … up to 60 s. A helper that has run for 60 s
+  resets the backoff.
+- **If the console user changes,** the old helper is terminated and a new one
+  is started for the new user.
+
+This logic lives in `crates/agent/src/session.rs` as a pure state machine
+with unit tests; the Windows code only feeds it observations.
+
+The service and helper talk over the named pipe `\\.\pipe\rmm-agent-helper`.
+Only SYSTEM, Administrators and interactive users may open it, and remote
+clients are rejected. The service creates it with `first_pipe_instance`, so
+another process can't claim the name first. It also accepts a connection only
+from the exact process ID it just spawned; the helper starts suspended until
+that ID is recorded. For now the pipe carries status for the tray; screen
+capture and input come in later phases.
+
+The **tray icon** is a green, amber or grey dot for connected, disconnected
+and not enrolled. Its tooltip is e.g. "RMM Agent 0.1.1 - connected". Its menu
+has the status line, *About*, and a disabled *Quit*: users can't stop the
+agent. Windows 11 puts new tray icons in the overflow (^) area until the user
+pins them.
+
+The helper exits when the pipe closes, and the service restarts it.
+
+**Updates in service mode:** after a verified update is swapped in, the
+service exits with service-specific code 1, and the SCM's failure actions
+restart it on the new binary.
+
+**Logs:**
+- service: `C:\ProgramData\RMM\agent\agent.log`
+- helper: `%LOCALAPPDATA%\RMM\helper.log` for the logged-on user
+
+Both are appended to with no rotation yet.
+
+## Telemetry
+
+Every heartbeat carries a health sample, collected with `sysinfo`:
+- CPU %: whole machine, since the previous sample
+- used/total RAM
+- used/total bytes of the system disk (`%SystemDrive%`, or `/`)
+- uptime
+
+The server stores the latest values on the agent's row (`cpu_percent`,
+`mem_used_bytes`, `mem_total_bytes`, `disk_used_bytes`, `disk_total_bytes`,
+`uptime_secs`, `telemetry_at`). `GET /api/agents` returns them.
+
+This changed the wire format, so the protocol version is now 2. Phase 1–3
+agents can't talk to this server until they update, which they still can,
+because updates go over HTTPS.
 
 ## Publishing a signed update
 
@@ -240,6 +364,12 @@ connection drops, the agent reconnects after 5 seconds.
 `gen-certs --force` replaces an existing CA. Every enrolled agent then has to
 enroll again.
 
+The dev server certificate is valid for `localhost`, `127.0.0.1` and `::1`.
+Agents on other machines connect to the QUIC port with `--server-name
+localhost`, which works. The HTTPS API (updates, download links) is reached at
+`RMM_PUBLIC_URL`, so its host must also be in the certificate. Add names or
+IPs with `gen-certs --san 192.168.122.1 --san rmm.example.lan`.
+
 ## Checks
 
 ```sh
@@ -253,6 +383,24 @@ each start a throwaway `postgres:17-alpine` container with testcontainers. The
 container is removed when the test ends. `heartbeat.rs` (QUIC over loopback) and
 `updates.rs` (signed updates over HTTPS) need no database.
 
-The Windows-only code (DPAPI credential storage, detached relaunch) is behind
-`#[cfg(windows)]`. It must be built and tested on Windows; Linux CI does not
-compile it.
+### On Windows
+
+The Windows-only code (service, session helper, tray, named pipe, DPAPI, ACLs,
+detached relaunch) is behind `#[cfg(windows)]`, so Linux builds don't compile
+it. Build, lint and test it on Windows (MSVC toolchain):
+
+```powershell
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p agent -p protocol -p common
+cargo test -p server --lib --test heartbeat --test updates   # no Docker needed
+```
+
+The DPAPI credential tests need an account whose logon credentials are
+loaded: an interactive logon, or SYSTEM (as the service runs). Over
+*key-based* SSH they fail with "Access is denied", because Windows never
+receives the password that user-scope DPAPI keys derive from. To run them over
+SSH, run the test binary as SYSTEM, e.g. from a one-off scheduled task.
+
+Service install, reboot survival, the helper in the user's session, the tray
+icon and service-mode self-update are verified by hand on a Windows 11 24H2
+VM (see the Phase 4 notes in the commit history).

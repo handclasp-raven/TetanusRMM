@@ -40,6 +40,7 @@ fn agent_config(server_addr: SocketAddr, trust: &DevCerts, client: &DevCerts) ->
         identity: client.agent_identity().unwrap(),
         heartbeat_interval: HEARTBEAT,
         bind_addr: Some(LOOPBACK.parse().unwrap()),
+        telemetry: None,
     }
 }
 
@@ -211,7 +212,7 @@ async fn server_rejects_connection_without_client_cert() {
             },
         )
         .await?;
-        Ok::<_, anyhow::Error>(read_frame(&mut recv).await?)
+        Ok::<_, anyhow::Error>(read_frame::<_, Message>(&mut recv).await?)
     })
     .await
     .expect("rejection should not hang");
@@ -246,9 +247,16 @@ async fn server_closes_connection_that_skips_hello() {
     );
     let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
-    write_frame(&mut send, &Message::Heartbeat { ts: 0, seq: 0 })
-        .await
-        .unwrap();
+    write_frame(
+        &mut send,
+        &Message::Heartbeat {
+            ts: 0,
+            seq: 0,
+            telemetry: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let reason = timeout(DEADLINE, conn.closed())
         .await

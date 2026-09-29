@@ -282,9 +282,9 @@ async fn heartbeat_loop(
 ) -> Result<(), ConnError> {
     while let Some(msg) = read_frame(recv).await? {
         match msg {
-            Message::Heartbeat { ts, seq } => {
+            Message::Heartbeat { ts, seq, telemetry } => {
                 let remote = conn.remote_address();
-                debug!(%agent_id, seq, ts, %remote, "heartbeat");
+                debug!(%agent_id, seq, ts, %remote, ?telemetry, "heartbeat");
                 hooks.emit(ServerEvent::Heartbeat {
                     conn_id,
                     agent_id: agent_id.to_owned(),
@@ -293,7 +293,9 @@ async fn heartbeat_loop(
                 });
                 if let Some(registry) = &hooks.registry {
                     // A registry hiccup should not disconnect an authenticated agent.
-                    if let Err(e) = registry::touch(&registry.pool, agent_id).await {
+                    if let Err(e) =
+                        registry::touch(&registry.pool, agent_id, telemetry.as_ref()).await
+                    {
                         warn!(%agent_id, "registry update failed: {e}");
                     }
                 }

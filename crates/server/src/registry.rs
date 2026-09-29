@@ -110,12 +110,41 @@ pub async fn authenticate_hello(
     Ok(updated.rows_affected() == 1)
 }
 
-/// Update `last_seen` on heartbeat.
-pub async fn touch(pool: &PgPool, agent_id: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE agents SET last_seen = now() WHERE id = $1")
-        .bind(agent_id)
-        .execute(pool)
-        .await?;
+/// Update `last_seen` on heartbeat and, if the heartbeat carried telemetry,
+/// the latest health values and `telemetry_at`.
+pub async fn touch(
+    pool: &PgPool,
+    agent_id: &str,
+    telemetry: Option<&protocol::Telemetry>,
+) -> sqlx::Result<()> {
+    match telemetry {
+        None => {
+            sqlx::query("UPDATE agents SET last_seen = now() WHERE id = $1")
+                .bind(agent_id)
+                .execute(pool)
+                .await?;
+        }
+        Some(t) => {
+            // BIGINT columns: u64 values beyond i64::MAX (not physically
+            // possible for these quantities) are clamped rather than wrapped.
+            let big = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+            sqlx::query(
+                "UPDATE agents SET last_seen = now(), telemetry_at = now(),
+                     cpu_percent = $2, mem_used_bytes = $3, mem_total_bytes = $4,
+                     disk_used_bytes = $5, disk_total_bytes = $6, uptime_secs = $7
+                 WHERE id = $1",
+            )
+            .bind(agent_id)
+            .bind(t.cpu_percent.clamp(0.0, 100.0))
+            .bind(big(t.mem_used_bytes))
+            .bind(big(t.mem_total_bytes))
+            .bind(big(t.disk_used_bytes))
+            .bind(big(t.disk_total_bytes))
+            .bind(big(t.uptime_secs))
+            .execute(pool)
+            .await?;
+        }
+    }
     Ok(())
 }
 

@@ -43,6 +43,13 @@ fn distinguished_name(common_name: &str) -> DistinguishedName {
 /// Generate a fresh CA and sign a server certificate and one agent client
 /// certificate (with `agent_id` as its common name) from it.
 pub fn generate(agent_id: &str) -> Result<DevCerts, TlsError> {
+    generate_with_names(agent_id, &[])
+}
+
+/// Like [`generate`], with extra DNS names or IP addresses on the server
+/// certificate beyond [`SERVER_NAMES`] (e.g. the host's LAN address, so
+/// agents on other machines can verify it).
+pub fn generate_with_names(agent_id: &str, extra_names: &[String]) -> Result<DevCerts, TlsError> {
     let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
     ca_params.distinguished_name = distinguished_name("RMM Dev CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -51,7 +58,8 @@ pub fn generate(agent_id: &str) -> Result<DevCerts, TlsError> {
     let ca_key_pem = ca_key.serialize_pem();
     let ca = CertifiedIssuer::self_signed(ca_params, ca_key)?;
 
-    let server_names: Vec<String> = SERVER_NAMES.iter().map(|s| s.to_string()).collect();
+    let mut server_names: Vec<String> = SERVER_NAMES.iter().map(|s| s.to_string()).collect();
+    server_names.extend(extra_names.iter().cloned());
     let mut server_params = CertificateParams::new(server_names)?;
     server_params.distinguished_name = distinguished_name("localhost");
     server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -125,6 +133,33 @@ mod tests {
 
         crate::quic::server_config(&server, &ca).unwrap();
         crate::quic::client_config(&ca, Some(&agent)).unwrap();
+    }
+
+    #[test]
+    fn extra_names_are_accepted_by_a_client() {
+        use rustls::client::danger::ServerCertVerifier;
+        let certs =
+            generate_with_names("a", &["192.168.122.1".into(), "rmm.example".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certs.ca().unwrap().remove(0)).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            roots.into(),
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .build()
+        .unwrap();
+        let leaf = certs.server_identity().unwrap().cert_chain.remove(0);
+        for name in ["localhost", "192.168.122.1", "rmm.example"] {
+            verifier
+                .verify_server_cert(
+                    &leaf,
+                    &[],
+                    &rustls_pki_types::ServerName::try_from(name).unwrap(),
+                    &[],
+                    rustls_pki_types::UnixTime::now(),
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     #[test]
