@@ -18,21 +18,44 @@
 //! The link also carries interactive sessions: consent requests and the
 //! agent's decisions, the agent's clipboard (to every viewer), and the
 //! user's Ctrl+F12 kill switch (every viewer is dropped).
+//!
+//! And it closes the adaptive-bitrate loop (see `agent::media::rate`): it
+//! notes when each frame arrived, times viewers' acknowledgements against
+//! that ([`delay::ViewerDelay`]), and a few times a second tells the agent
+//! how its video is being delivered (`StreamReport`).
 
+pub mod delay;
 pub mod fanout;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use protocol::clipboard::ClipboardData;
 use protocol::consent::{Outcome, SessionRequest};
-use protocol::media::{MediaFrame, MonitorInfo};
-use protocol::Message;
+use protocol::media::{MediaFrame, MonitorInfo, SendLog, StreamReport};
+use protocol::{Message, MIN_ADAPTIVE_VERSION};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+use delay::ViewerDelay;
 use fanout::{AgentAction, Fanout, ViewerId, VIEWER_QUEUE};
+
+/// How often the agent hears how its video is being delivered (while
+/// frames arrive).
+pub const REPORT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// What the relay knows about the agent's video delivery.
+#[derive(Default)]
+struct Delivery {
+    /// When each recent frame arrived from the agent.
+    arrivals: SendLog,
+    /// Payload bytes received on this connection.
+    bytes: u64,
+    last_report: Option<Instant>,
+    /// Each acknowledging viewer's delay tracker.
+    viewers: HashMap<ViewerId, Arc<Mutex<ViewerDelay>>>,
+}
 
 /// One connected agent, as seen by the relay.
 pub struct AgentLink {
@@ -53,11 +76,12 @@ pub struct AgentLink {
     clipboard: broadcast::Sender<ClipboardData>,
     /// Bumped each time the user presses Ctrl+F12.
     terminations: watch::Sender<u64>,
-    /// The agent's QUIC connection, for opening remote-operation streams
+    /// The agent's connection, for opening remote-operation streams
     /// (`None` in unit tests).
-    connection: Option<quinn::Connection>,
+    connection: Option<transport::Connection>,
     /// Interactive shells open right now (see [`AgentLink::shell_started`]).
     shells: AtomicUsize,
+    delivery: Mutex<Delivery>,
 }
 
 /// Counts one open shell on its agent until dropped.
@@ -66,6 +90,7 @@ pub struct ActiveShell(Arc<AgentLink>);
 impl Drop for ActiveShell {
     fn drop(&mut self) {
         self.0.shells.fetch_sub(1, Ordering::Relaxed);
+        crate::metrics::get().shells_open.dec();
     }
 }
 
@@ -132,6 +157,7 @@ impl AgentLink {
     /// Count a shell as open until the returned guard is dropped.
     pub fn shell_started(self: &Arc<Self>) -> ActiveShell {
         self.shells.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::get().shells_open.inc();
         ActiveShell(self.clone())
     }
 
@@ -174,8 +200,14 @@ impl AgentLink {
     /// transfer). `None` if this link has no connection (unit tests).
     pub async fn open_stream(
         &self,
-    ) -> Option<Result<(quinn::SendStream, quinn::RecvStream), quinn::ConnectionError>> {
+    ) -> Option<Result<(transport::SendStream, transport::RecvStream), transport::ConnectionError>>
+    {
         Some(self.connection.as_ref()?.open_bi().await)
+    }
+
+    /// Which transport the agent is connected over.
+    pub fn transport(&self) -> Option<transport::TransportKind> {
+        self.connection.as_ref().map(transport::Connection::kind)
     }
 
     /// The monitor a new viewer sees if nothing is streaming yet: the
@@ -236,8 +268,66 @@ impl AgentLink {
     }
 
     pub fn on_frame(&self, frame: MediaFrame) {
-        let actions = self.fanout().on_frame(Arc::new(frame), Instant::now());
+        let now = Instant::now();
+        let report = self.record_arrival(&frame, now);
+        let actions = self.fanout().on_frame(Arc::new(frame), now);
         self.apply(actions);
+        if let Some(report) = report {
+            self.send(Message::StreamReport(report));
+        }
+    }
+
+    fn delivery(&self) -> std::sync::MutexGuard<'_, Delivery> {
+        self.delivery.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Note a frame's arrival; returns a report for the agent if one is due.
+    fn record_arrival(&self, frame: &MediaFrame, now: Instant) -> Option<StreamReport> {
+        let metrics = crate::metrics::get();
+        metrics.relay_frames_in.inc();
+        metrics.relay_bytes_in.inc_by(frame.payload.len() as u64);
+        let mut delivery = self.delivery();
+        delivery.arrivals.record(frame.seq, now);
+        delivery.bytes += frame.payload.len() as u64;
+        if self.version < MIN_ADAPTIVE_VERSION
+            || delivery
+                .last_report
+                .is_some_and(|t| now.duration_since(t) < REPORT_INTERVAL)
+        {
+            return None;
+        }
+        delivery.last_report = Some(now);
+        let viewer_delay = delivery
+            .viewers
+            .values()
+            .map(|v| v.lock().unwrap_or_else(|e| e.into_inner()).current(now))
+            .max()
+            .unwrap_or_default();
+        if !delivery.viewers.is_empty() {
+            metrics.viewer_delay.observe(viewer_delay.as_secs_f64());
+        }
+        Some(StreamReport {
+            seq: frame.seq,
+            bytes: delivery.bytes,
+            viewer_delay_ms: u32::try_from(viewer_delay.as_millis()).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// When frame `seq` arrived from the agent, if it was recent.
+    pub fn arrived_at(&self, seq: u64) -> Option<Instant> {
+        self.delivery().arrivals.sent_at(seq)
+    }
+
+    /// Track viewer `id`'s delay (it acknowledges frames) until the guard
+    /// is dropped.
+    pub fn track_viewer(self: &Arc<Self>, id: ViewerId) -> TrackedViewer {
+        let tracker = Arc::new(Mutex::new(ViewerDelay::default()));
+        self.delivery().viewers.insert(id, tracker.clone());
+        TrackedViewer {
+            link: self.clone(),
+            id,
+            tracker,
+        }
     }
 
     /// The agent's video stream ended (e.g. it restarted capture); viewers
@@ -256,6 +346,38 @@ impl AgentLink {
                 self.apply(actions);
             }
         }
+    }
+}
+
+/// A viewer whose delay counts towards the agent's bitrate; stops counting
+/// when dropped.
+pub struct TrackedViewer {
+    link: Arc<AgentLink>,
+    id: ViewerId,
+    tracker: Arc<Mutex<ViewerDelay>>,
+}
+
+impl TrackedViewer {
+    fn tracker(&self) -> std::sync::MutexGuard<'_, ViewerDelay> {
+        self.tracker.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Frame `seq` was written to the viewer.
+    pub fn forwarded(&self, seq: u64) {
+        if let Some(arrived) = self.link.arrived_at(seq) {
+            self.tracker().forwarded(seq, arrived);
+        }
+    }
+
+    /// The viewer acknowledged everything up to `seq`.
+    pub fn acked(&self, seq: u64) {
+        self.tracker().acked(seq, Instant::now());
+    }
+}
+
+impl Drop for TrackedViewer {
+    fn drop(&mut self) {
+        self.link.delivery().viewers.remove(&self.id);
     }
 }
 
@@ -283,7 +405,7 @@ impl Hub {
         agent_id: &str,
         version: u32,
         to_agent: mpsc::UnboundedSender<Message>,
-        connection: Option<quinn::Connection>,
+        connection: Option<transport::Connection>,
     ) -> Arc<AgentLink> {
         let link = Arc::new(AgentLink {
             agent_id: agent_id.to_owned(),
@@ -298,6 +420,7 @@ impl Hub {
             terminations: watch::channel(0).0,
             connection,
             shells: AtomicUsize::new(0),
+            delivery: Mutex::new(Delivery::default()),
         });
         if let Some(old) = self.agents().insert(agent_id.to_owned(), link.clone()) {
             old.closed.send_replace(true);

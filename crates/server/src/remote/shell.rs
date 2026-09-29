@@ -32,8 +32,8 @@ const CLOSE_PROTOCOL: u16 = 1008;
 
 /// A shell running on an agent, not yet attached to a client.
 pub struct OpenShell {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    send: transport::SendStream,
+    recv: transport::RecvStream,
     audit: CloseAudit,
     /// Counts this shell in the agent list until the relay ends.
     active: crate::relay::ActiveShell,
@@ -84,7 +84,7 @@ pub async fn open(
 async fn start(
     link: &crate::relay::AgentLink,
     size: TermSize,
-) -> Result<(quinn::SendStream, quinn::RecvStream), RemoteError> {
+) -> Result<(transport::SendStream, transport::RecvStream), RemoteError> {
     let (mut send, mut recv) = super::open_stream(link).await?;
     write_frame(&mut send, &StreamOpen::Shell { size }).await?;
     let first = tokio::time::timeout(START_TIMEOUT, read_frame::<_, ShellOutput>(&mut recv))

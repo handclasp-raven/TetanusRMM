@@ -1,18 +1,22 @@
 //! First-run enrollment: trade a one-time token for a client certificate.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use protocol::{close_code, read_frame, write_frame, Message};
 use rcgen::{CertificateParams, KeyPair};
 use serde::{Deserialize, Serialize};
 use tracing::info;
+use transport::{Preference, TransportSettings};
 
 use crate::credstore::Credential;
 use crate::AgentError;
 
 pub struct EnrollOptions {
+    /// Server QUIC (UDP) address.
     pub server_addr: SocketAddr,
+    /// Which transports to use, and where the WebSocket fallback is.
+    pub transport: TransportSettings,
     /// Name the server certificate must be valid for.
     pub server_name: String,
     /// PEM CA that the server certificate must chain to.
@@ -33,16 +37,13 @@ pub async fn enroll(opts: &EnrollOptions) -> Result<Credential, AgentError> {
         .map_err(|e| AgentError::Enroll(e.to_string()))?;
 
     let server_ca = common::tls::certs_from_pem(&opts.server_ca_pem)?;
-    let bind_addr = opts.bind_addr.unwrap_or(match opts.server_addr {
-        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-    });
-    let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(AgentError::Bind)?;
+    let target = opts
+        .transport
+        .target(opts.server_addr, &opts.server_name, opts.bind_addr);
     // No client certificate: this connection may only enroll.
-    endpoint.set_default_client_config(common::quic::client_config(&server_ca, None)?);
-    let conn = endpoint
-        .connect(opts.server_addr, &opts.server_name)?
-        .await?;
+    let dialer = transport::Dialer::new(target, &server_ca, None)?;
+    let dialed = dialer.dial(&mut Preference::default()).await?;
+    let conn = dialed.connection;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(
@@ -55,14 +56,13 @@ pub async fn enroll(opts: &EnrollOptions) -> Result<Credential, AgentError> {
     .await?;
     let reply = read_frame(&mut recv).await;
     // Read the server's close reason (if it rejected us) before closing ourselves.
-    let rejection = match conn.close_reason() {
-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
-            Some(String::from_utf8_lossy(&close.reason).into_owned())
-        }
-        _ => None,
-    };
-    conn.close(close_code::NORMAL.into(), b"enrolled");
-    endpoint.wait_idle().await;
+    let rejection = conn
+        .close_reason()
+        .and_then(|e| e.application_reason().map(str::to_owned));
+    conn.close(close_code::NORMAL, b"enrolled");
+    if let Some(endpoint) = dialed.endpoint {
+        endpoint.wait_idle().await;
+    }
 
     match reply {
         Ok(Some(Message::Enrolled {
@@ -80,6 +80,7 @@ pub async fn enroll(opts: &EnrollOptions) -> Result<Credential, AgentError> {
                 server_addr: opts.server_addr,
                 server_name: opts.server_name.clone(),
                 api_url,
+                transport: opts.transport,
             })
         }
         Ok(Some(other)) => Err(AgentError::Unexpected(other)),
@@ -110,6 +111,8 @@ pub struct EnrollRequest {
     pub server_name: String,
     pub server_ca_pem: String,
     pub token: String,
+    #[serde(default)]
+    pub transport: TransportSettings,
 }
 
 impl std::fmt::Debug for EnrollRequest {
@@ -156,6 +159,7 @@ impl EnrollRequest {
             server_ca_pem: self.server_ca_pem.clone(),
             token: self.token.clone(),
             bind_addr: None,
+            transport: self.transport,
         }
     }
 }
@@ -173,6 +177,10 @@ mod tests {
             server_name: "localhost".into(),
             server_ca_pem: "-----BEGIN CERTIFICATE-----".into(),
             token: "secret-token".into(),
+            transport: TransportSettings {
+                mode: transport::TransportMode::WebSocket,
+                ws_addr: Some("192.168.122.1:443".parse().unwrap()),
+            },
         };
         req.save(dir.path()).unwrap();
         assert_eq!(EnrollRequest::load(dir.path()).unwrap(), Some(req.clone()));

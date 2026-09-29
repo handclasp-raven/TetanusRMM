@@ -56,6 +56,18 @@ pub enum Action {
     ScriptComplete,
     FileUpload,
     FileDownload,
+    /// An admin changed a user's role.
+    UserRoleChange,
+    UserDelete,
+    /// Access granted to a support engineer; detail has scope and capabilities.
+    GrantCreate,
+    GrantDelete,
+    GroupCreate,
+    /// A group was renamed or redescribed.
+    GroupUpdate,
+    GroupDelete,
+    /// Agents were added to or removed from a group.
+    GroupMembers,
 }
 
 impl Action {
@@ -82,6 +94,14 @@ impl Action {
             Action::ScriptComplete => "script.complete",
             Action::FileUpload => "file.upload",
             Action::FileDownload => "file.download",
+            Action::UserRoleChange => "user.role_change",
+            Action::UserDelete => "user.delete",
+            Action::GrantCreate => "grant.create",
+            Action::GrantDelete => "grant.delete",
+            Action::GroupCreate => "group.create",
+            Action::GroupUpdate => "group.update",
+            Action::GroupDelete => "group.delete",
+            Action::GroupMembers => "group.members",
         }
     }
 }
@@ -213,6 +233,8 @@ pub async fn append(tx: &mut Transaction<'_, Postgres>, entry: NewEntry) -> sqlx
     .bind(&row.hash)
     .execute(&mut **tx)
     .await?;
+    // Counted once written; a rolled-back transaction over-counts, rarely.
+    crate::metrics::get().audit_entries.inc();
     Ok(row)
 }
 

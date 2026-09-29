@@ -1,4 +1,7 @@
-//! QUIC listener for agents.
+//! Listeners for agents and viewers: QUIC, and the WebSocket-over-TLS
+//! fallback for networks that block UDP (see the `transport` crate). Both
+//! carry the same streams and are served by the same code below; only
+//! accepting the connection differs.
 //!
 //! Each connection gets its own task and opens one bidirectional control
 //! stream. What is allowed on it depends on whether the agent presented a
@@ -40,11 +43,14 @@ use protocol::{close_code, read_frame, write_frame, FrameError, Message};
 use quinn::rustls::pki_types::CertificateDer;
 use ring::digest::{digest, SHA256};
 use sqlx::PgPool;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::{debug, error, info, info_span, warn, Instrument};
+use transport::{Connection, ConnectionError, TransportKind};
 
 use crate::enroll::{self, AgentCa, EnrollError};
+use crate::metrics::{self, ConnectedGuard, ReasonLabels, ResultLabels, SessionLabels};
 use crate::registry;
 use crate::relay::Hub;
 use crate::viewers::{self, ViewerError, ViewerGrant};
@@ -60,7 +66,10 @@ const DECISION_GRACE: Duration = Duration::from_secs(15);
 const MIN_CONSENT_VERSION: u32 = 4;
 
 pub struct ServerConfig {
+    /// UDP address for QUIC.
     pub listen: SocketAddr,
+    /// TCP address for the WebSocket fallback (`None`: QUIC only).
+    pub ws_listen: Option<SocketAddr>,
     /// Certificate the server presents to agents.
     pub identity: Identity,
     /// CA(s) that agent client certificates must chain to.
@@ -74,6 +83,7 @@ pub enum ServerEvent {
         conn_id: usize,
         agent_id: String,
         version: u32,
+        transport: TransportKind,
     },
     Heartbeat {
         conn_id: usize,
@@ -108,12 +118,18 @@ pub enum ServerError {
     Tls(#[from] common::TlsError),
     #[error("binding QUIC endpoint: {0}")]
     Bind(#[from] std::io::Error),
+    #[error("binding WebSocket listener on {addr}: {source}")]
+    BindWs {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
 enum ConnError {
     #[error(transparent)]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] ConnectionError),
     #[error(transparent)]
     Frame(#[from] FrameError),
     #[error("protocol violation: {0}")]
@@ -132,6 +148,8 @@ enum ConnError {
 
 pub struct Server {
     endpoint: quinn::Endpoint,
+    /// The WebSocket fallback listener and its TLS acceptor.
+    ws: Option<(TcpListener, tokio_rustls::TlsAcceptor)>,
     events: Option<UnboundedSender<ServerEvent>>,
     registry: Option<Arc<Registry>>,
     hub: Arc<Hub>,
@@ -157,8 +175,24 @@ impl Server {
     pub fn bind(config: ServerConfig) -> Result<Self, ServerError> {
         let quic = common::quic::server_config(&config.identity, &config.client_ca)?;
         let endpoint = quinn::Endpoint::server(quic, config.listen)?;
+        let ws = match config.ws_listen {
+            Some(addr) => {
+                let tls = common::quic::mutual_tls_server(
+                    &config.identity,
+                    &config.client_ca,
+                    transport::ws::ALPN,
+                )?;
+                let bind_err = |source| ServerError::BindWs { addr, source };
+                let listener = std::net::TcpListener::bind(addr).map_err(bind_err)?;
+                listener.set_nonblocking(true).map_err(bind_err)?;
+                let listener = TcpListener::from_std(listener).map_err(bind_err)?;
+                Some((listener, transport::ws::acceptor(tls)))
+            }
+            None => None,
+        };
         Ok(Self {
             endpoint,
+            ws,
             events: None,
             registry: None,
             hub: Hub::new(),
@@ -182,26 +216,96 @@ impl Server {
         self
     }
 
+    /// The QUIC (UDP) address.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.endpoint.local_addr()
     }
 
-    /// Accept connections until the endpoint is closed.
+    /// The WebSocket fallback's (TCP) address, if it is enabled.
+    pub fn ws_local_addr(&self) -> Option<SocketAddr> {
+        self.ws.as_ref()?.0.local_addr().ok()
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks {
+            events: self.events.clone(),
+            registry: self.registry.clone(),
+            hub: self.hub.clone(),
+        }
+    }
+
+    /// Accept connections until the QUIC endpoint is closed.
     pub async fn run(&self) {
-        info!(addr = ?self.endpoint.local_addr().ok(), "listening for agents");
+        tokio::select! {
+            () = self.run_quic() => {}
+            () = self.run_ws() => {}
+        }
+    }
+
+    async fn run_quic(&self) {
+        info!(addr = ?self.endpoint.local_addr().ok(), "listening for agents (QUIC)");
         while let Some(incoming) = self.endpoint.accept().await {
-            let span = info_span!("agent_conn", remote = %incoming.remote_address());
-            let hooks = Hooks {
-                events: self.events.clone(),
-                registry: self.registry.clone(),
-                hub: self.hub.clone(),
-            };
+            let span =
+                info_span!("agent_conn", remote = %incoming.remote_address(), transport = "quic");
+            let hooks = self.hooks();
             tokio::spawn(
                 async move {
-                    match handle_connection(incoming, hooks).await {
-                        Ok(()) => info!("agent disconnected"),
-                        Err(e) => info!("agent connection ended: {e}"),
-                    }
+                    let result = match incoming.await {
+                        Ok(conn) => {
+                            let fingerprint = conn
+                                .peer_identity()
+                                .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+                                .and_then(|chain| chain.first().map(|leaf| cert_fingerprint(leaf)));
+                            handle_connection(Connection::Quic(conn), fingerprint, hooks).await
+                        }
+                        // The handshake fails here if the client presented a
+                        // certificate that does not chain to the client CA.
+                        Err(e) => Err(ConnError::Connection(e.into())),
+                    };
+                    log_end(result);
+                }
+                .instrument(span),
+            );
+        }
+    }
+
+    /// The WebSocket fallback: TLS (same certificates and client-cert
+    /// policy as QUIC), then the upgrade, then the same handling.
+    async fn run_ws(&self) {
+        let Some((listener, acceptor)) = &self.ws else {
+            return std::future::pending().await;
+        };
+        info!(addr = ?listener.local_addr().ok(), "listening for agents (WebSocket fallback)");
+        loop {
+            let (tcp, remote) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    // Out of file descriptors and the like: back off, carry on.
+                    warn!("accepting WebSocket connection: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            let span = info_span!("agent_conn", %remote, transport = "websocket");
+            let acceptor = acceptor.clone();
+            let hooks = self.hooks();
+            tokio::spawn(
+                async move {
+                    let accepted = match transport::ws::accept_tls(&acceptor, tcp, remote).await {
+                        Ok(accepted) => accepted,
+                        Err(e) => return info!("TLS handshake failed: {e}"),
+                    };
+                    let fingerprint = accepted
+                        .peer_certificates()
+                        .and_then(|chain| chain.first().map(cert_fingerprint));
+                    let conn = match transport::ws::upgrade(accepted).await {
+                        Ok(conn) => conn,
+                        Err(e) => return info!("WebSocket upgrade failed: {e}"),
+                    };
+                    log_end(
+                        handle_connection(Connection::WebSocket(conn), fingerprint, hooks).await,
+                    );
                 }
                 .instrument(span),
             );
@@ -215,14 +319,18 @@ impl Server {
     }
 }
 
-async fn handle_connection(incoming: quinn::Incoming, hooks: Hooks) -> Result<(), ConnError> {
-    // The handshake fails here if the agent presented a certificate that does
-    // not chain to the client CA (see common::quic::server_config).
-    let conn = incoming.await?;
-    let fingerprint = conn
-        .peer_identity()
-        .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
-        .and_then(|chain| chain.first().map(|leaf| cert_fingerprint(leaf)));
+fn log_end(result: Result<(), ConnError>) {
+    match result {
+        Ok(()) => info!("disconnected"),
+        Err(e) => info!("connection ended: {e}"),
+    }
+}
+
+async fn handle_connection(
+    conn: Connection,
+    fingerprint: Option<String>,
+    hooks: Hooks,
+) -> Result<(), ConnError> {
     let conn_id = conn.stable_id();
     match &fingerprint {
         Some(fp) => info!(conn_id, fingerprint = %fp, "client certificate verified"),
@@ -230,32 +338,47 @@ async fn handle_connection(incoming: quinn::Incoming, hooks: Hooks) -> Result<()
     }
 
     let result = dispatch(&conn, conn_id, fingerprint.as_deref(), &hooks).await;
+    let rejected = match &result {
+        Err(ConnError::Protocol(_)) => Some("protocol_error"),
+        Err(ConnError::Unauthorized(_)) => Some("unauthorized"),
+        Err(ConnError::AgentOffline) => Some("agent_offline"),
+        Err(ConnError::ConsentRefused(_)) => Some("consent_refused"),
+        Err(ConnError::UserTerminated) => Some("user_terminated"),
+        Err(ConnError::Db(_)) => Some("server_error"),
+        _ => None,
+    };
+    if let Some(reason) = rejected {
+        metrics::get()
+            .connections_rejected
+            .get_or_create(&ReasonLabels { reason })
+            .inc();
+    }
     match &result {
         Err(ConnError::Protocol(reason)) => {
-            conn.close(close_code::PROTOCOL_ERROR.into(), reason.as_bytes());
+            conn.close(close_code::PROTOCOL_ERROR, reason.as_bytes());
         }
         Err(ConnError::Unauthorized(reason)) => {
             warn!(conn_id, "rejected: {reason}");
-            conn.close(close_code::UNAUTHORIZED.into(), reason.as_bytes());
+            conn.close(close_code::UNAUTHORIZED, reason.as_bytes());
         }
         Err(ConnError::AgentOffline) => {
-            conn.close(close_code::AGENT_OFFLINE.into(), b"agent is not connected");
+            conn.close(close_code::AGENT_OFFLINE, b"agent is not connected");
         }
         Err(ConnError::ConsentRefused(outcome)) => {
             conn.close(
-                close_code::CONSENT_REFUSED.into(),
+                close_code::CONSENT_REFUSED,
                 outcome.refusal_reason().as_bytes(),
             );
         }
         Err(ConnError::UserTerminated) => {
             conn.close(
-                close_code::USER_TERMINATED.into(),
+                close_code::USER_TERMINATED,
                 Outcome::UserTerminatedSession.refusal_reason().as_bytes(),
             );
         }
         Err(ConnError::Db(e)) => {
             error!(conn_id, "database error: {e}");
-            conn.close(close_code::PROTOCOL_ERROR.into(), b"server error");
+            conn.close(close_code::PROTOCOL_ERROR, b"server error");
         }
         _ => {}
     }
@@ -263,7 +386,7 @@ async fn handle_connection(incoming: quinn::Incoming, hooks: Hooks) -> Result<()
 }
 
 async fn dispatch(
-    conn: &quinn::Connection,
+    conn: &Connection,
     conn_id: usize,
     fingerprint: Option<&str>,
     hooks: &Hooks,
@@ -284,6 +407,7 @@ async fn dispatch(
                 conn_id,
                 agent_id: agent_id.clone(),
                 version,
+                transport: conn.kind(),
             });
             serve_agent(conn, conn_id, &agent_id, version, send, recv, hooks).await
         }
@@ -295,6 +419,9 @@ async fn dispatch(
             let grant = match viewers::connect(&registry.pool, &token).await {
                 Ok(grant) => grant,
                 Err(ViewerError::Db(e)) => return Err(e.into()),
+                Err(ViewerError::Forbidden) => {
+                    return Err(ConnError::Unauthorized("not allowed to view this agent"))
+                }
                 Err(_) => return Err(ConnError::Unauthorized("invalid viewer token")),
             };
             info!(conn_id, agent_id = %grant.agent_id, user = %grant.username, version, "viewer connected");
@@ -304,16 +431,14 @@ async fn dispatch(
                 username: grant.username.clone(),
             });
             let mut frames_sent = 0;
-            let result = serve_viewer(
+            let viewer = ViewerConn {
                 conn,
-                &registry.pool,
-                &grant,
+                version,
                 send,
                 recv,
-                hooks,
-                &mut frames_sent,
-            )
-            .await;
+            };
+            let result =
+                serve_viewer(viewer, &registry.pool, &grant, hooks, &mut frames_sent).await;
             if let Err(e) = viewers::end(&registry.pool, &grant, frames_sent).await {
                 warn!(conn_id, "recording viewer disconnect failed: {e}");
             }
@@ -332,15 +457,18 @@ async fn dispatch(
                 match enroll::enroll(&registry.pool, &registry.ca, &token, &csr_der).await {
                     Ok(enrolled) => enrolled,
                     Err(EnrollError::InvalidToken) => {
-                        return Err(ConnError::Unauthorized("invalid enrollment token"))
+                        enrollment_result("invalid_token");
+                        return Err(ConnError::Unauthorized("invalid enrollment token"));
                     }
                     Err(EnrollError::Ca(e)) => {
+                        enrollment_result("invalid_csr");
                         warn!(conn_id, "enrollment CSR rejected: {e}");
                         return Err(ConnError::Protocol("invalid certificate signing request"));
                     }
                     Err(EnrollError::Db(e)) => return Err(e.into()),
                 };
             info!(conn_id, agent_id = %enrolled.agent_id, fingerprint = %enrolled.fingerprint, "agent enrolled");
+            enrollment_result("enrolled");
             write_frame(
                 &mut send,
                 &Message::Enrolled {
@@ -371,14 +499,15 @@ async fn dispatch(
 /// An authenticated agent: heartbeats, monitor lists and video, plus
 /// commands from the relay written back on the control stream.
 async fn serve_agent(
-    conn: &quinn::Connection,
+    conn: &Connection,
     conn_id: usize,
     agent_id: &str,
     version: u32,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: transport::SendStream,
+    mut recv: transport::RecvStream,
     hooks: &Hooks,
 ) -> Result<(), ConnError> {
+    let _connected = ConnectedGuard::agent(conn.kind());
     let (to_agent, mut outbox) = mpsc::unbounded_channel::<Message>();
     let link = hooks
         .hub
@@ -399,6 +528,7 @@ async fn serve_agent(
         while let Some(msg) = read_frame(&mut recv).await? {
             match msg {
                 Message::Heartbeat { ts, seq, telemetry } => {
+                    metrics::get().heartbeats.inc();
                     let remote = conn.remote_address();
                     debug!(%agent_id, seq, ts, %remote, ?telemetry, "heartbeat");
                     hooks.emit(ServerEvent::Heartbeat {
@@ -446,6 +576,7 @@ async fn serve_agent(
                     }
                 }
                 Message::UserTerminatedSessions => {
+                    metrics::get().user_terminations.inc();
                     warn!(%agent_id, viewers = link.viewers(), "user pressed Ctrl+F12");
                     link.user_terminated();
                 }
@@ -491,15 +622,28 @@ async fn serve_agent(
 
 /// A viewer session with `grant.agent_id`, through the relay: consent
 /// first, then video out and input/clipboard in.
+/// A viewer's connection and control stream.
+struct ViewerConn<'a> {
+    conn: &'a Connection,
+    /// Protocol version from its `ViewerHello`.
+    version: u32,
+    send: transport::SendStream,
+    recv: transport::RecvStream,
+}
+
 async fn serve_viewer(
-    conn: &quinn::Connection,
+    viewer: ViewerConn<'_>,
     pool: &PgPool,
     grant: &ViewerGrant,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
     hooks: &Hooks,
     frames_sent: &mut u64,
 ) -> Result<(), ConnError> {
+    let ViewerConn {
+        conn,
+        version,
+        mut send,
+        mut recv,
+    } = viewer;
     let link = hooks
         .hub
         .get(&grant.agent_id)
@@ -561,6 +705,13 @@ async fn serve_viewer(
         }
     };
     viewers::record_consent(pool, grant, mode, outcome).await?;
+    metrics::get()
+        .sessions
+        .get_or_create(&SessionLabels {
+            mode: consent_mode_name(mode),
+            outcome: outcome.as_str(),
+        })
+        .inc();
     if !outcome.allows_session() {
         info!(session_id, %outcome, "session refused");
         return Err(ConnError::ConsentRefused(outcome));
@@ -579,8 +730,14 @@ async fn serve_viewer(
         monitors: monitors.borrow_and_update().clone(),
         active_monitor: *stream_monitor.borrow(),
     });
+    // Viewers that can acknowledge frames take part in adaptive bitrate.
+    let tracked = (version >= protocol::MIN_ADAPTIVE_VERSION).then(|| {
+        let _ = to_viewer.send(Message::EnableFrameAcks);
+        link.track_viewer(viewer_id)
+    });
     let mut subscription = link.subscribe(viewer_id);
     let mut video = conn.open_uni().await?;
+    let _connected = ConnectedGuard::viewer(conn.kind());
 
     let writer = async {
         while let Some(msg) = outbox.recv().await {
@@ -592,6 +749,12 @@ async fn serve_viewer(
         while let Some(frame) = subscription.frames.recv().await {
             write_frame(&mut video, frame.as_ref()).await?;
             *frames_sent += 1;
+            let metrics = metrics::get();
+            metrics.relay_frames_out.inc();
+            metrics.relay_bytes_out.inc_by(frame.payload.len() as u64);
+            if let Some(tracked) = &tracked {
+                tracked.forwarded(frame.seq);
+            }
         }
         Ok(())
     };
@@ -629,6 +792,11 @@ async fn serve_viewer(
             match msg {
                 Message::SelectMonitor { monitor } => link.select_monitor(monitor),
                 Message::RequestKeyframe => link.viewer_requests_keyframe(viewer_id),
+                Message::FrameAck { seq } if tracked.is_some() => {
+                    if let Some(tracked) = &tracked {
+                        tracked.acked(seq);
+                    }
+                }
                 Message::Input(event) => link.send(Message::SessionInput { session_id, event }),
                 Message::Clipboard(data) if data.size() <= MAX_CLIPBOARD_BYTES => {
                     link.send(Message::SessionClipboard { session_id, data })
@@ -653,6 +821,21 @@ async fn serve_viewer(
         r = forward => r,
         r = notify => r,
         r = reader => r,
+    }
+}
+
+fn enrollment_result(result: &'static str) {
+    metrics::get()
+        .enrollments
+        .get_or_create(&ResultLabels { result })
+        .inc();
+}
+
+fn consent_mode_name(mode: ConsentMode) -> &'static str {
+    match mode {
+        ConsentMode::Require => "require",
+        ConsentMode::Notify => "notify",
+        ConsentMode::Unattended => "unattended",
     }
 }
 

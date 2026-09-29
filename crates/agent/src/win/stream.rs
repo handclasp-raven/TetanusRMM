@@ -7,6 +7,11 @@
 //! static screen costs almost nothing. If the pipe to the service is backed
 //! up, frames are dropped rather than queued, and the next frame sent is a
 //! keyframe so viewers resynchronise.
+//!
+//! The encoder starts at the resolution's full-quality bitrate
+//! (`media::rate::max_bitrate`); the service lowers and raises it as the
+//! network allows (`SetBitrate`, from the adaptive-bitrate controller).
+//! The target survives monitor switches and is forgotten on `Stop`.
 
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -17,14 +22,12 @@ use tracing::{info, warn};
 
 use super::capture::{self, CaptureError, Captured, Duplicator};
 use super::encoder::H264Encoder;
+use crate::media::rate::max_bitrate;
 
 pub const MAX_FPS: u32 = 30;
 
 /// How many times to re-feed an unchanged picture to coax out buffered output.
 const MAX_OWED: u32 = 8;
-
-/// Target bitrate for a 1080p stream; scaled by area for other sizes.
-const BITS_PER_1080P: u32 = 4_000_000;
 
 /// Retry interval while the desktop cannot be duplicated (secure desktop,
 /// mode switch in progress).
@@ -33,9 +36,13 @@ const RETRY: Duration = Duration::from_millis(500);
 #[derive(Debug)]
 pub enum WorkerCommand {
     ListMonitors,
-    Start { monitor: u32 },
+    Start {
+        monitor: u32,
+    },
     Stop,
     ForceKeyframe,
+    /// Adaptive bitrate: encode at most this many bits per second.
+    SetBitrate(u32),
 }
 
 /// Start the worker thread. Frames and monitor lists go to `out`.
@@ -48,9 +55,10 @@ pub fn spawn(out: mpsc::Sender<IpcMessage>) -> std_mpsc::Sender<WorkerCommand> {
     tx
 }
 
-fn bitrate_for(width: u32, height: u32) -> u32 {
-    let area = u64::from(width) * u64::from(height);
-    ((u64::from(BITS_PER_1080P) * area) / (1920 * 1080)).clamp(1_000_000, 20_000_000) as u32
+/// The bitrate for a `width` x `height` stream under `target`.
+fn bitrate_for(width: u32, height: u32, target: Option<u32>) -> u32 {
+    let max = max_bitrate(width, height);
+    target.map_or(max, |t| t.min(max))
 }
 
 struct Stream {
@@ -68,10 +76,10 @@ struct Stream {
 }
 
 impl Stream {
-    fn open(monitor: u32) -> Result<Self, CaptureError> {
+    fn open(monitor: u32, target: Option<u32>) -> Result<Self, CaptureError> {
         let duplicator = Duplicator::new(monitor)?;
         let (w, h) = (duplicator.frame().width, duplicator.frame().height);
-        let encoder = H264Encoder::new(w, h, MAX_FPS, bitrate_for(w, h))?;
+        let encoder = H264Encoder::new(w, h, MAX_FPS, bitrate_for(w, h, target))?;
         info!(
             monitor,
             width = w,
@@ -153,6 +161,8 @@ impl Worker {
     fn run(self) {
         let mut stream: Option<Stream> = None;
         let mut wanted: Option<u32> = None;
+        // Adaptive-bitrate target from the service, if it lowered it.
+        let mut target: Option<u32> = None;
         let frame_interval = Duration::from_secs(1) / MAX_FPS;
         loop {
             // Idle: block until told what to do. Streaming: just drain.
@@ -187,6 +197,21 @@ impl Worker {
                         info!("capture stopped");
                     }
                     wanted = None;
+                    target = None;
+                    continue;
+                }
+                Some(WorkerCommand::SetBitrate(bps)) => {
+                    target = Some(bps);
+                    if let Some(s) = &mut stream {
+                        let (w, h) = s.encoder.size();
+                        let bps = bitrate_for(w, h, target);
+                        match s.encoder.set_bitrate(bps) {
+                            Ok(()) => info!(bps, "encoder bitrate changed"),
+                            // Some encoders only take it at creation; the
+                            // next stream start applies it.
+                            Err(e) => warn!(bps, "changing the encoder bitrate: {e}"),
+                        }
+                    }
                     continue;
                 }
                 Some(WorkerCommand::ForceKeyframe) => {
@@ -201,7 +226,7 @@ impl Worker {
 
             let s = match &mut stream {
                 Some(s) => s,
-                None => match Stream::open(monitor) {
+                None => match Stream::open(monitor, target) {
                     Ok(s) => stream.insert(s),
                     Err(e) => {
                         warn!(monitor, "cannot start capture, retrying: {e}");
@@ -302,10 +327,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bitrate_scales_with_area_within_bounds() {
-        assert_eq!(bitrate_for(1920, 1080), 4_000_000);
-        assert_eq!(bitrate_for(2560, 1440), 7_111_111);
-        assert_eq!(bitrate_for(640, 480), 1_000_000);
-        assert_eq!(bitrate_for(7680, 4320), 20_000_000);
+    fn the_target_lowers_but_never_raises_the_resolutions_bitrate() {
+        assert_eq!(bitrate_for(1920, 1080, None), 4_000_000);
+        assert_eq!(bitrate_for(1920, 1080, Some(1_500_000)), 1_500_000);
+        assert_eq!(bitrate_for(640, 480, Some(3_000_000)), 1_000_000);
     }
 }

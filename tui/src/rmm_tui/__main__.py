@@ -61,12 +61,17 @@ def main(argv: list[str] | None = None) -> None:
 
     from .app import RmmApp
 
-    RmmApp(
+    app = RmmApp(
         config=config,
         session=SessionManager(api, store),
         library=ScriptLibrary(config.scripts_path),
         log_dir=log_dir,
-    ).run()
+    )
+    try:
+        app.run()
+    finally:
+        # The app closes them on unmount; this covers a crash before that.
+        app.close_viewers()
 
 
 if __name__ == "__main__":

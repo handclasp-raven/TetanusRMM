@@ -14,7 +14,7 @@ from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
 from . import formatting
-from .api import Agent, ApiError, Forbidden, Unauthorized
+from .api import DESKTOP, SCRIPT, SHELL, Agent, ApiError, Forbidden, Unauthorized
 from .viewer import ViewerError, build_command
 
 if TYPE_CHECKING:
@@ -92,6 +92,7 @@ class LoginScreen(Screen):
 AGENT_COLUMNS = [
     ("host", "Hostname"),
     ("status", "Status"),
+    ("groups", "Groups"),
     ("last_seen", "Last seen"),
     ("cpu", "CPU"),
     ("ram", "RAM"),
@@ -115,7 +116,8 @@ class MainScreen(Screen):
         Binding("q", "app.quit", "Quit"),
     ]
 
-    CONTROL_ACTIONS = {"desktop", "shell", "scripts"}
+    #: Actions on the selected agent, and the capability each needs there.
+    AGENT_ACTIONS = {"desktop": DESKTOP, "shell": SHELL}
 
     def __init__(self) -> None:
         super().__init__()
@@ -144,11 +146,24 @@ class MainScreen(Screen):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         user = self.app.session.user
-        if action in self.CONTROL_ACTIONS:
+        if action in self.AGENT_ACTIONS:
+            # Per agent: support engineers may only act where granted.
+            agent = self.selected()
+            if agent is None:
+                return bool(user and user.can_control)
+            return agent.allows(self.AGENT_ACTIONS[action], user)
+        if action == "scripts":
+            if self.agents:
+                return any(a.allows(SCRIPT, user) for a in self.agents.values())
             return bool(user and user.can_control)
         if action == "audit":
             return bool(user and user.can_read_audit)
         return True
+
+    @on(DataTable.RowHighlighted, "#agents")
+    def selection_moved(self) -> None:
+        # What the footer offers depends on the selected agent.
+        self.refresh_bindings()
 
     # --- agent list -----------------------------------------------------------
 
@@ -181,6 +196,7 @@ class MainScreen(Screen):
         for agent in sorted(new, key=lambda a: (not a.online, a.label.lower())):
             table.add_row(*formatting.agent_row(agent, now), key=agent.id)
         self.agents = fresh
+        self.refresh_bindings()
         online = sum(a.online for a in agents)
         self.query_one("#status", Static).update(
             f"{len(agents)} agents, {online} online · updated {now.astimezone():%H:%M:%S}"
@@ -215,8 +231,14 @@ class MainScreen(Screen):
 
     def action_desktop(self) -> None:
         agent = self._online_selection("start a remote session")
-        if agent:
+        if agent and self._allowed(agent, DESKTOP, "remote desktop"):
             self.launch_viewer(agent)
+
+    def _allowed(self, agent: Agent, capability: str, what: str) -> bool:
+        if agent.allows(capability, self.app.session.user):
+            return True
+        self.app.notify(f"You have no {what} access to {agent.label}.", severity="error")
+        return False
 
     @work(group="viewer")
     async def launch_viewer(self, agent: Agent) -> None:
@@ -231,7 +253,9 @@ class MainScreen(Screen):
             self.app.session_expired()
             return
         except Forbidden:
-            self.app.notify("Your role may not start remote sessions.", severity="error")
+            self.app.notify(
+                f"You may not start remote sessions on {agent.label}.", severity="error"
+            )
             return
         except (ApiError, ViewerError) as e:
             self.app.notify(str(e), severity="error")
@@ -242,7 +266,7 @@ class MainScreen(Screen):
         from .console import ConsoleScreen
 
         agent = self._online_selection("open a shell")
-        if agent:
+        if agent and self._allowed(agent, SHELL, "shell"):
             self.app.push_screen(ConsoleScreen(agent))
 
     def action_scripts(self) -> None:
@@ -250,7 +274,11 @@ class MainScreen(Screen):
 
         selected = self.selected()
         self.app.push_screen(
-            ScriptScreen(list(self.agents.values()), [selected.id] if selected else [])
+            ScriptScreen(
+                list(self.agents.values()),
+                [selected.id] if selected else [],
+                self.app.session.user,
+            )
         )
 
     def action_audit(self) -> None:

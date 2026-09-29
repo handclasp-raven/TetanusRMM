@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import signal
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -14,7 +17,7 @@ from .auth import SessionManager
 from .config import Config, data_dir
 from .screens import LoginScreen, MainScreen, SplashScreen
 from .scripts import ScriptLibrary
-from .viewer import ViewerCommand
+from .viewer import ViewerCommand, close_all
 from .viewer import launch as launch_process
 
 Launcher = Callable[[ViewerCommand, Path], "subprocess.Popen[bytes]"]
@@ -38,8 +41,14 @@ class RmmApp(App):
         self.library = library
         self._launcher = launcher
         self.log_dir = log_dir or data_dir()
+        self.viewers: list[subprocess.Popen[bytes]] = []
 
     def on_mount(self) -> None:
+        if sys.platform != "win32":
+            # Closing the terminal or `kill` should still close the viewers.
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGHUP, signal.SIGTERM):
+                loop.add_signal_handler(sig, self.exit)
         self.push_screen(SplashScreen())
         self.restore_session()
 
@@ -73,7 +82,17 @@ class RmmApp(App):
         self.show_login("Your session has expired. Sign in again.")
 
     def launch_viewer(self, command: ViewerCommand) -> subprocess.Popen[bytes]:
-        return self._launcher(command, self.log_dir / "viewer.log")
+        process = self._launcher(command, self.log_dir / "viewer.log")
+        self.viewers = [p for p in self.viewers if p.poll() is None]
+        self.viewers.append(process)
+        return process
+
+    def close_viewers(self) -> None:
+        """Close every viewer this TUI started. Safe to call more than once."""
+        viewers, self.viewers = self.viewers, []
+        close_all(viewers)
 
     async def on_unmount(self) -> None:
+        # Viewer windows must not outlive the TUI that opened them.
+        await asyncio.to_thread(self.close_viewers)
         await self.session.api.aclose()

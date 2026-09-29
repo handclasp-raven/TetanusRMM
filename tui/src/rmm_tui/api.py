@@ -17,8 +17,15 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-#: Roles that may control agents: remote desktop, shell, scripts.
+#: Roles that may control agents: remote desktop, shell, scripts. Support
+#: engineers only where their grants allow (see :meth:`Agent.allows`).
 CONTROL_ROLES = frozenset({"admin", "support_engineer"})
+
+#: Capability names, as the server grants them per agent.
+DESKTOP = "desktop"
+SHELL = "shell"
+SCRIPT = "script"
+FILE_TRANSFER = "file_transfer"
 #: Roles that may read the audit log.
 AUDIT_ROLES = frozenset({"admin", "auditor"})
 
@@ -93,9 +100,16 @@ class Agent:
     uptime_secs: int | None
     viewer_sessions: int
     shell_sessions: int
+    #: ``"quic"`` or ``"websocket"`` (UDP blocked) while online.
+    transport: str | None = None
+    groups: tuple[str, ...] = ()
+    #: What the signed-in user may do on this agent. ``None`` from servers
+    #: older than per-agent grants: then the role decides.
+    capabilities: frozenset[str] | None = None
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Agent:
+        caps = d.get("capabilities")
         return cls(
             id=d["id"],
             hostname=d.get("hostname"),
@@ -110,7 +124,16 @@ class Agent:
             uptime_secs=d.get("uptime_secs"),
             viewer_sessions=int(d.get("viewer_sessions", 0)),
             shell_sessions=int(d.get("shell_sessions", 0)),
+            transport=d.get("transport"),
+            groups=tuple(d.get("groups") or ()),
+            capabilities=frozenset(caps) if caps is not None else None,
         )
+
+    def allows(self, capability: str, user: User | None) -> bool:
+        """Whether ``user`` may use ``capability`` here."""
+        if self.capabilities is not None:
+            return capability in self.capabilities
+        return bool(user and user.can_control)
 
     @property
     def label(self) -> str:
@@ -124,6 +147,25 @@ class Agent:
         if not self.hostname:
             return self.id
         return f"{self.hostname} [{self.id.removeprefix('agt-')[:6]}]"
+
+
+@dataclass(frozen=True)
+class Group:
+    """An agent group (members limited to agents the user can see)."""
+
+    id: int
+    name: str
+    description: str
+    agent_ids: tuple[str, ...]
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Group:
+        return cls(
+            id=int(d["id"]),
+            name=d["name"],
+            description=d.get("description", ""),
+            agent_ids=tuple(d.get("agent_ids") or ()),
+        )
 
 
 @dataclass(frozen=True)
@@ -281,6 +323,9 @@ class ApiClient:
     async def list_agents(self) -> list[Agent]:
         return [Agent.from_json(a) for a in (await self._request("GET", "/api/agents")).json()]
 
+    async def list_groups(self) -> list[Group]:
+        return [Group.from_json(g) for g in (await self._request("GET", "/api/groups")).json()]
+
     async def create_viewer_session(self, agent_id: str) -> ViewerSession:
         response = await self._request(
             "POST", f"/api/agents/{quote(agent_id, safe='')}/viewer-sessions"
@@ -290,11 +335,18 @@ class ApiClient:
     # --- script runner ----------------------------------------------------
 
     async def run_script(
-        self, agent_ids: list[str], script: str, timeout_secs: int | None = None
+        self,
+        agent_ids: list[str],
+        script: str,
+        timeout_secs: int | None = None,
+        group_ids: list[int] | None = None,
     ) -> dict[str, Any]:
-        """Run ``script`` on every agent and wait for all results (the raw
-        report; see :mod:`rmm_tui.scripts`)."""
+        """Run ``script`` on every agent (and every member of ``group_ids``,
+        resolved by the server at run time) and wait for all results (the
+        raw report; see :mod:`rmm_tui.scripts`)."""
         body: dict[str, Any] = {"agent_ids": agent_ids, "script": script}
+        if group_ids:
+            body["group_ids"] = group_ids
         if timeout_secs is not None:
             body["timeout_secs"] = timeout_secs
         wait = (timeout_secs or 300) + SCRIPT_REPLY_GRACE

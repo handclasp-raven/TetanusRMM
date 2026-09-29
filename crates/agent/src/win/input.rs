@@ -1,15 +1,16 @@
-//! Input injection in the helper (it runs on the user's desktop; the
-//! session-0 service cannot inject there).
+//! Input injection on the user's desktop (the session-0 service cannot
+//! inject there). The input helper uses this as SYSTEM, so input reaches
+//! elevated windows; the session helper uses it as a fallback.
 //!
-//! The helper is per-monitor DPI aware (see `helper::run`), so the virtual
+//! Both helpers are per-monitor DPI aware (see `helper::run`), so the virtual
 //! desktop metrics are in physical pixels, the same space DXGI reports
 //! monitor positions in and the viewer's coordinates are based on. Mapping
 //! is in `crate::input` so it is tested on every platform.
 //!
 //! Limits (Phase 9 territory): injection does not reach the secure desktop
-//! (UAC prompts, the lock and login screens), and because the helper runs
-//! at the user's integrity level, Windows (UIPI) drops input aimed at
-//! elevated windows.
+//! (UAC prompts, the lock and login screens). From the session helper,
+//! which runs at the user's integrity level, Windows (UIPI) also drops
+//! input aimed at elevated windows.
 
 use std::time::{Duration, Instant};
 

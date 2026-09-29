@@ -9,16 +9,20 @@ for the architecture and phase plan.
 |---|---|---|
 | `crates/protocol` | lib | Wire `Message` enum, framing, close codes, update manifest and signed-message format |
 | `crates/common` | lib | Logging init, PEM loading, quinn/rustls TLS configs, dev cert generation |
+| `crates/transport` | lib | Connections to the server: QUIC, or the WebSocket-over-TLS fallback (a small stream multiplexer), and dialing with fallback |
 | `crates/server` | bin + lib | QUIC listener for agents, HTTPS API, Postgres, auth, audit log, enrollment CA, update publishing |
 | `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray, remote shell / scripts / file transfer |
-| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC to the server, OpenH264 decode, winit + softbuffer window |
+| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC (or the WebSocket fallback) to the server, OpenH264 decode, winit + softbuffer window |
 | `tui/` | Python project | Support TUI (Textual): sign in, live agent table, launch the viewer, shell console and script runner through the server ([tui/README.md](tui/README.md)) |
 
-Server modules: `quic` (agent listener), `api` (HTTPS routes), `auth` (Argon2id,
-TOTP, sessions), `users`, `audit` (hash chain), `registry` (agents, policies),
-`enroll` (tokens, internal CA), `updates` (signing, publishing), `relay` (video
-fan-out to viewers), `viewers` (viewer-session tokens), `remote` (shell, script
-and file-transfer relay to agents), `db` (pool, migrations), `config`.
+Server modules: `quic` (agent and viewer listeners: QUIC and the WebSocket
+fallback), `api` (HTTPS routes; `api::rbac` for users, grants and groups),
+`auth` (Argon2id, TOTP, sessions), `users`, `access` (RBAC: roles and
+per-agent grants), `groups` (agent groups), `audit` (hash chain), `registry`
+(agents, policies), `enroll` (tokens, internal CA), `updates` (signing,
+publishing), `relay` (video fan-out to viewers, adaptive-bitrate feedback),
+`viewers` (viewer-session tokens), `remote` (shell, script and file-transfer
+relay to agents), `metrics` (Prometheus), `db` (pool, migrations), `config`.
 
 Agent modules:
 - `core`: the connect/heartbeat/update loop, shared by console and service mode.
@@ -27,13 +31,14 @@ Agent modules:
 - `telemetry`: sysinfo.
 - `session`: the helper supervisor state machine.
 - `update` (download and verify) and `updater` (rename-and-replace).
-- `media`: NV12 conversion, H.264 fix-ups, and the source link used for
-  streaming.
+- `media`: NV12 conversion, H.264 fix-ups, the source link used for
+  streaming, and the adaptive-bitrate controller (`rate`).
 - `remote`: the agent's end of the remote shell (`pty`, `shell`), the script
   runner (`script`) and file transfer (`transfer`).
 - `paths`
 - `win` (Windows only): `service`, `process` (spawn into a session), `pipe`,
-  `helper` (tray), `acl`, `capture` (DXGI), `encoder` (Media Foundation),
+  `helper` (tray), `indicator` (on-screen session banner), `input_helper`
+  (SYSTEM input injector), `acl`, `capture` (DXGI), `encoder` (Media Foundation),
   `stream` (capture worker), `bridge` (service ↔ helper media), `conpty`
   (PowerShell on a pseudoconsole).
 
@@ -88,7 +93,9 @@ Put overrides in a `.env` file next to `docker-compose.yml`:
 |---|---|---|
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `rmm` / `rmm-dev-password` / `rmm` | Database credentials. **Change the password outside local dev.** |
 | `RMM_API_PORT` | `8443` | Host TCP port for the HTTPS API |
-| `RMM_QUIC_PORT` | `4433` | Host UDP port for agents |
+| `RMM_QUIC_PORT` | `4433` | Host UDP port for agents and viewers (QUIC) |
+| `RMM_WS_PORT` | `4433` | Host TCP port for the WebSocket fallback. Publish it as `443` where firewalls only allow HTTPS out, and give clients `--ws-server host:443`. |
+| `RMM_METRICS_PORT` | `9464` | Prometheus `/metrics`, published on `127.0.0.1` only |
 | `RMM_UID` / `RMM_GID` | `1000` / `1000` | User the server runs as. Must be able to read the `0600` keys in `./dev-certs` (use `id -u` / `id -g`). |
 | `RMM_DB_MAX_CONNECTIONS`, `RMM_SESSION_TTL_SECS`, `RUST_LOG` | see below | Passed through to the server |
 
@@ -111,7 +118,9 @@ Agents do not share a certificate. Each one gets its own at enrollment:
    ```
 
    Each link mints a random, single-use token that expires after `ttl_secs`
-   (default 24 h, max 7 days). Only its SHA-256 is stored. The link downloads
+   (default 24 h, max 7 days). Only its SHA-256 is stored. An admin can add
+   `"group_ids": [..]` so the agent joins those [groups](#access-control-rbac-and-agent-groups)
+   when it enrolls. The link downloads
    the latest published build for that platform (see
    [Publishing a signed update](#publishing-a-signed-update)). It keeps working
    until the token is used to enroll.
@@ -125,7 +134,8 @@ Agents do not share a certificate. Each one gets its own at enrollment:
    ```
 
    The agent generates its key pair locally and sends only a certificate
-   signing request, over QUIC without a client certificate. The server checks
+   signing request, over QUIC (or the [WebSocket fallback](#connectivity-quic-and-the-websocket-fallback))
+   without a client certificate. The server checks
    and consumes the token, assigns an id (`agt-…`), signs a client
    certificate, and pins its fingerprint to the agent. Reusing the token, or
    using an expired one, is refused.
@@ -186,8 +196,13 @@ for development; point it at its own `--state-dir`.
 │ LocalSystem, auto-start      │──────▶│ runs as the logged-on user  │
 │ - QUIC + heartbeat/telemetry │       │ - tray icon                 │
 │ - signed updates             │◀─────▶│ - (later) capture + input   │
-│ - supervises the helper      │ pipe  │                             │
-└──────────────────────────────┘       └─────────────────────────────┘
+│ - supervises the helpers     │ pipe  │                             │
+│                              │       └─────────────────────────────┘
+│                              │ spawn ┌─────────────────────────────┐
+│                              │──────▶│ rmm-agent.exe input-helper  │
+│                              │◀─────▶│ runs as SYSTEM, no windows  │
+└──────────────────────────────┘ pipe  │ - injects technician input  │
+                                       └─────────────────────────────┘
 ```
 
 Why a helper is needed: services run in **session 0**, which Windows isolates
@@ -203,6 +218,15 @@ starts a helper process *inside* the user's session:
   environment block, via `CreateProcessAsUser` on `winsta0\default`. It runs
   **as the user, not SYSTEM**. (The secure desktop for UAC and the logon
   screen needs a SYSTEM token and is Phase 9.)
+- **The input helper:** a second, window-less process that only injects the
+  technician's input. Windows drops input from a lower integrity level aimed
+  at a higher one (UIPI), so input from the user-level helper can't reach
+  elevated windows, e.g. anything the user accepted a UAC prompt for. The
+  input helper runs **as SYSTEM** in the user's session instead: the service
+  duplicates its own token, moves it to that session, and starts
+  `rmm-agent.exe input-helper` on `winsta0\default`. It's supervised like the
+  helper. While it's connected, all input goes to it; if it isn't, input
+  falls back to the user-level helper.
 - **When nobody is logged on,** the service keeps running and heartbeating.
   It re-checks every 5 s, and immediately on session-change notifications
   (logon, logoff, user switch), then spawns the helper when a user appears.
@@ -219,8 +243,11 @@ The service and helper talk over the named pipe `\\.\pipe\rmm-agent-helper`.
 Only SYSTEM, Administrators and interactive users may open it, and remote
 clients are rejected. The service creates it with `first_pipe_instance`, so
 another process can't claim the name first. It also accepts a connection only
-from the exact process ID it just spawned; the helper starts suspended until
-that ID is recorded. For now the pipe carries status for the tray; screen
+from the exact process IDs it just spawned; each helper starts suspended
+until its ID is recorded. The input helper checks the other direction too:
+since interactive users may create instances of the pipe, it refuses a
+server that isn't the service's process ID (passed on its command line),
+so a user can't get SYSTEM to inject input for them. For now the pipe carries status for the tray; screen
 capture and input come in later phases.
 
 The **tray icon** is a green, amber or grey dot for connected, disconnected
@@ -238,8 +265,45 @@ restart it on the new binary.
 **Logs:**
 - service: `C:\ProgramData\RMM\agent\agent.log`
 - helper: `%LOCALAPPDATA%\RMM\helper.log` for the logged-on user
+- input helper: `C:\ProgramData\RMM\agent\input-helper.log`
 
-Both are appended to with no rotation yet.
+All are appended to with no rotation yet.
+
+## Connectivity: QUIC and the WebSocket fallback
+
+Agents and viewers connect to the server over **QUIC** (UDP) by default:
+TLS 1.3, multiplexed streams, and connection migration across network
+changes. Some networks block outbound UDP, so the server also accepts the
+same protocol over a **WebSocket on TLS/TCP**:
+
+- **Same port number, TCP.** The server listens for it on `--ws-listen`
+  (default `0.0.0.0:4433/tcp`, next to QUIC on `4433/udp`), so one
+  `host:port` reaches both. It can be published elsewhere (e.g. `443`); tell
+  clients with `--ws-server`.
+- **Same security.** The TLS layer uses the same server certificate and the
+  same client-certificate check as QUIC (mutual TLS for agents), and the
+  server runs the same code on the connection once it is up.
+- **Same streams.** `transport::mux` carries QUIC-like bidirectional and
+  unidirectional streams over one WebSocket, with per-stream flow control
+  (256 KiB windows, so a stalled video or file stream never holds up the
+  others), and the control stream's frames jump the queue ahead of bulk
+  data. Heartbeats, video, input, shells, scripts and file transfers all
+  work unchanged.
+- **Automatic.** In `auto` mode (the default) a client tries QUIC for 5 s,
+  then the WebSocket. An agent that had to fall back tries the WebSocket
+  first for the next hour, so reconnects are quick, then gives QUIC another
+  chance. A server that *refuses* a client (bad certificate or token) is
+  not retried on the other transport.
+
+Force one with `--transport quic|websocket|auto` (`RMM_TRANSPORT`); agents
+store their transport settings with the credential at enrollment.
+`GET /api/agents` shows each agent's `transport`, and the TUI marks
+fallback agents `online (ws)`.
+
+Trade-offs on the fallback: it is TCP, so a lost packet stalls every stream
+behind it (head-of-line blocking), and it cannot migrate: a network change
+drops the connection and the agent reconnects. Use QUIC wherever UDP is
+allowed.
 
 ## Remote desktop viewing
 
@@ -262,6 +326,33 @@ fans the one stream out. Other points:
   rather than slowing anyone else.
 - **Monitor choice is shared:** picking a monitor changes it for everyone
   watching that agent, because there is only one stream.
+
+### Adaptive bitrate
+
+The one stream has to fit the agent's uplink *and* every viewer's downlink,
+so the agent adjusts its encoder's bitrate to both, a few times a second:
+
+- **Measurement.** The server acknowledges the agent's frames
+  (`StreamReport`, every 200 ms while frames flow), and viewers acknowledge
+  them to the server (`FrameAck`, every 100 ms). A frame's round trip above
+  the recent minimum is time it spent queued: on the uplink, or in the
+  slowest viewer's path. A viewer that stops acknowledging altogether (jammed
+  link, stalled decoder) counts as falling behind.
+- **Control** (`agent::media::rate`, AIMD like TCP): queueing over 250 ms
+  cuts the target by 20% (50% over 1 s, and never above what the uplink is
+  shown to deliver), at most every 500 ms; under 80 ms for a second grows
+  it by 8%. It stays between 300 kbit/s and the resolution's full quality
+  (4 Mbit/s at 1080p).
+- **Encoder.** The service passes each new target to the session helper,
+  which applies it to the running Media Foundation encoder
+  (`CODECAPI_AVEncCommonMeanBitRate`); it carries over to monitor switches
+  and resets when streaming stops.
+
+It works the same on QUIC and the WebSocket fallback, and only agents and
+viewers of protocol 7 or later take part (older ones keep a fixed bitrate).
+The agent logs every change (`bitrate adapted bps=… reason=…
+uplink_delay_ms=… viewer_delay_ms=…`); the server exports the viewer delay
+it reports as `rmm_stream_viewer_delay_seconds`.
 
 ### Launching the viewer
 
@@ -331,6 +422,12 @@ reported kind no longer changes it. `on_no_user` defaults to `deny`,
 - The tray tooltip and menu list every connected technician (`notify` and
   `require` sessions; `unattended` ones are silent). The tray icon turns
   blue while anyone is connected.
+- An **on-screen session indicator**: a small always-on-top banner at the
+  top of the primary screen, "● Remote support session: *names* · Ctrl+F12
+  to end", for as long as anyone is connected (same technicians as the
+  tray). It is click-through and never takes focus, so it can't get in the
+  user's way or be clicked by injected input, and it is excluded from screen
+  capture (Windows 10 2004+) so it does not cover the technician's view.
 - **Ctrl+F12** (or the tray's *End all remote sessions*) immediately ends
   every session. Viewers are closed with "the user ended the session", and
   each session is audited as `session.user_terminated` (outcome
@@ -353,10 +450,13 @@ viewer; the files themselves are not transferred). Content over 1 MiB is not
 synced, what was on either clipboard before connecting is never sent, and a
 loop guard stops the two sides echoing a copy back and forth.
 
-Known limits (planned for Phase 9, secure desktop): input cannot reach UAC
-prompts or the lock/login screen, and because the helper runs as the user,
-Windows drops input aimed at elevated windows. A locked workstation cannot
-answer a `require` prompt, so the request times out.
+Input reaches elevated windows too: it's injected by the SYSTEM input helper
+(see [Service and helper model](#service-and-helper-model)).
+
+Known limits (planned for Phase 9, secure desktop): neither capture nor input
+reaches UAC prompts or the lock/login screen, so the user has to accept a UAC
+prompt locally. A locked workstation cannot answer a `require` prompt, so the
+request times out.
 
 ### Capture and encoding on the agent
 
@@ -373,8 +473,8 @@ answer a `require` prompt, so the request times out.
 - **Stream format:** Constrained Baseline profile, low-latency mode, Annex B,
   with SPS/PPS repeated on every keyframe. Baseline keeps it decodable by the
   portable OpenH264 decoder the viewer uses.
-- **Bitrate:** scales with resolution (4 Mbit/s at 1080p) and can be changed
-  at runtime (`H264Encoder::set_bitrate`, for Phase 9's adaptive bitrate).
+- **Bitrate:** starts at full quality for the resolution (4 Mbit/s at
+  1080p) and follows the network from there ([adaptive bitrate](#adaptive-bitrate)).
 - **Display changes:** display switches (UAC, lock screen, resolution change)
   invalidate the duplication; capture restarts and resends the monitor list.
 - **Backpressure:** if the network can't keep up, frames are dropped rather
@@ -621,7 +721,10 @@ never updates itself.
 |---|---|---|---|
 | `DATABASE_URL` | `--database-url` | *(required)* | Postgres URL, e.g. `postgres://rmm:pw@localhost:5432/rmm` |
 | `RMM_DB_MAX_CONNECTIONS` | `--db-max-connections` | `10` | Pool size upper bound |
-| `RMM_QUIC_LISTEN` | `--quic-listen` | `0.0.0.0:4433` | UDP address for agents |
+| `RMM_QUIC_LISTEN` | `--quic-listen` | `0.0.0.0:4433` | UDP address for agents and viewers (QUIC) |
+| `RMM_WS_LISTEN` | `--ws-listen` | `0.0.0.0:4433` | TCP address for the [WebSocket fallback](#connectivity-quic-and-the-websocket-fallback) |
+| `RMM_NO_WEBSOCKET` | `--no-websocket` | off | Disable the WebSocket fallback |
+| `RMM_METRICS_LISTEN` | `--metrics-listen` | *(unset: off)* | Plain-HTTP address for Prometheus [metrics](#metrics) at `/metrics` |
 | `RMM_API_LISTEN` | `--api-listen` | `0.0.0.0:8443` | TCP address for the HTTPS API |
 | `RMM_CERTS_DIR` | `--certs-dir` | `dev-certs` | Holds `ca.crt` + `ca.key` (CA that signs agent certs), `server.crt`, `server.key` |
 | `RMM_API_TLS_CERT` | `--api-tls-cert` | *(unset)* | PEM chain for HTTPS, e.g. from a public CA. Set together with the key. If unset, HTTPS uses `server.crt` from the certs dir. |
@@ -638,7 +741,9 @@ never updates itself.
 | Env var | Flag | Default | Purpose |
 |---|---|---|---|
 | `RMM_STATE_DIR` | `--state-dir` | `%ProgramData%\RMM\agent` / `agent-state` | Where the protected credential lives |
-| `RMM_SERVER` | `enroll --server` | `127.0.0.1:4433` | Server UDP address (stored at enrollment) |
+| `RMM_SERVER` | `enroll --server` | `127.0.0.1:4433` | Server QUIC (UDP) address (stored at enrollment) |
+| `RMM_TRANSPORT` | `enroll --transport` | `auto` | `auto`, `quic` or `websocket` (stored at enrollment) |
+| `RMM_WS_SERVER` | `enroll --ws-server` | *(the `--server` address)* | TCP address of the WebSocket fallback, if published elsewhere (stored at enrollment) |
 | `RMM_SERVER_NAME` | `enroll --server-name` | `localhost` | Name the server certificate must match |
 | `RMM_SERVER_CA` | `enroll --server-ca` | *(required)* | CA certificate that signed the server certificate |
 | `RMM_ENROLL_TOKEN` | `enroll --token` | *(required)* | Token from the download link |
@@ -656,22 +761,34 @@ Sessions are sent as `Authorization: Bearer <token>`. Errors come back as
 | POST | `/api/auth/login` | none | `{username, password}` → `{challenge_token, expires_in_secs}` |
 | POST | `/api/auth/totp` | none | `{challenge_token, code}` → `{session_token, expires_at, user}` |
 | POST | `/api/auth/logout` | session | Ends the session |
-| POST | `/api/enrollment-links` | admin, support_engineer | `{ttl_secs?, platform?}` → `{token, expires_at, download_url}` |
-| POST | `/api/agents/{id}/viewer-sessions` | admin, support_engineer | → `{token, expires_at, agent_id, online}`: single-use viewer token, valid 60 s |
+| POST | `/api/enrollment-links` | admin, support_engineer | `{ttl_secs?, platform?, group_ids?}` → `{token, expires_at, download_url}`. `group_ids`: admins only. |
+| POST | `/api/agents/{id}/viewer-sessions` | `desktop` on the agent | → `{token, expires_at, agent_id, online}`: single-use viewer token, valid 60 s |
 | GET | `/api/download/{platform}?token=` | enrollment token | Latest published agent build. Does not use up the token. |
 | GET | `/api/updates/{platform}/manifest` | none | `{platform, version, sha256, size}` |
 | GET | `/api/updates/{platform}/binary` | none | Agent build (signed, so public) |
 | GET | `/api/updates/{platform}/signature` | none | 64-byte detached ed25519 signature |
 | GET | `/api/me` | session | Current user |
-| GET | `/api/agents` | session | Agent registry, with hostname, telemetry and live `online` / `viewer_sessions` / `shell_sessions` |
+| GET | `/api/agents` | session | The agents the user can see (engineers: granted ones), with hostname, telemetry, `groups`, the user's `capabilities` on each, and live `online` / `transport` / `viewer_sessions` / `shell_sessions` |
 | GET | `/api/audit?limit=` | admin, auditor | Newest audit entries first (default 100, at most 1000) |
 | GET | `/api/audit/verify` | admin, auditor | Walks the whole chain: `{"status":"valid","entries":n}` or `{"status":"broken","id":…,"reason":…}` |
-| GET | `/api/agents/{id}/policy` | session | Consent policy |
+| GET | `/api/agents/{id}/policy` | session; agent visible to the user | Consent policy |
 | PUT | `/api/agents/{id}/policy` | admin | `{consent_mode, on_no_user, consent_timeout_secs}` |
-| GET | `/api/agents/{id}/shell?cols=&rows=` | admin, support_engineer | WebSocket: interactive PowerShell ([details](#interactive-shell)) |
-| POST | `/api/script-runs` | admin, support_engineer | `{agent_ids, script, timeout_secs?}` → per-agent results ([details](#script-runner)) |
-| PUT | `/api/agents/{id}/files?path=&overwrite=` | admin, support_engineer | Upload the body; needs `x-content-sha256` ([details](#file-transfer)) |
-| GET | `/api/agents/{id}/files?path=` | admin, support_engineer | Download, with `x-content-sha256` |
+| GET | `/api/agents/{id}/shell?cols=&rows=` | `shell` on the agent | WebSocket: interactive PowerShell ([details](#interactive-shell)) |
+| POST | `/api/script-runs` | `script` on every target | `{agent_ids?, group_ids?, script, timeout_secs?}` → per-agent results ([details](#script-runner)). Groups are expanded when the run starts. |
+| PUT | `/api/agents/{id}/files?path=&overwrite=` | `file_transfer` on the agent | Upload the body; needs `x-content-sha256` ([details](#file-transfer)) |
+| GET | `/api/agents/{id}/files?path=` | `file_transfer` on the agent | Download, with `x-content-sha256` |
+| GET | `/api/users` | admin | Users and roles |
+| POST | `/api/users` | admin | `{username, password, role}` → `{user, totp_secret, otpauth_url}` (201) |
+| PUT | `/api/users/{id}/role` | admin | `{role}`; refused (409) if it would leave no admin |
+| DELETE | `/api/users/{id}` | admin | Deletes the user, their sessions and grants; not yourself, not the last admin |
+| GET | `/api/grants?user_id=` | admin; anyone for their own `user_id` | Access grants |
+| POST | `/api/grants` | admin | `{user_id, agent_id \| group_id \| all_agents: true, capabilities?}` (201). Capabilities default to all four. |
+| DELETE | `/api/grants/{id}` | admin | Revoke a grant |
+| GET | `/api/groups` | session | Groups, with the members the user can see |
+| POST | `/api/groups` | admin | `{name, description?, agent_ids?}` (201) |
+| GET / PATCH / DELETE | `/api/groups/{id}` | GET: session; else admin | PATCH `{name?, description?}` |
+| PUT / POST | `/api/groups/{id}/agents` | admin | `{agent_ids}`: PUT sets the members, POST adds |
+| DELETE | `/api/groups/{id}/agents/{agent_id}` | admin | Remove one member |
 
 Login is two steps:
 1. A correct password returns a 5-minute challenge token.
@@ -684,9 +801,89 @@ Every login attempt (successful or not), every logout, user creation, policy
 change, download-link creation and agent enrollment is written to the
 hash-chained `audit_log` table. So is every remote shell (`shell.open`,
 `shell.close`), script run (`script.run`, `script.complete`), file transfer
-(`file.upload`, `file.download`) and refused remote operation
-(`permission.denied`). Chain verification is
-`server::audit::verify`, exposed as `GET /api/audit/verify`.
+(`file.upload`, `file.download`), refused operation (`permission.denied`),
+and every RBAC change (`user.role_change`, `user.delete`, `grant.create`,
+`grant.delete`, `group.create`, `group.update`, `group.delete`,
+`group.members`). Chain verification is `server::audit::verify`, exposed as
+`GET /api/audit/verify`.
+
+## Access control (RBAC) and agent groups
+
+The **role** says what kind of thing a user may do; for support engineers,
+**grants** say where:
+
+| Role | Sees | May do |
+|---|---|---|
+| `admin` | every agent | everything, including managing users, grants and groups |
+| `support_engineer` | only agents a grant covers | only what those grants allow |
+| `auditor` | every agent, and the audit log | nothing: read-only |
+
+A **grant** gives one support engineer a set of **capabilities** on one
+agent, on every agent in one group, or on all agents:
+
+| Capability | Allows |
+|---|---|
+| `desktop` | Remote desktop: viewer tokens, and so input and clipboard |
+| `shell` | Interactive shell |
+| `script` | Script runs |
+| `file_transfer` | Upload and download |
+
+Grants add up and there are no deny rules. A group grant follows the
+group's membership as it changes, and an all-agents grant covers agents
+enrolled later. Access is checked when a viewer token is minted *and* when
+it is used, so revoking a grant stops a session that hasn't started yet. A
+multi-agent script run needs `script` on every target; otherwise nothing
+runs. Agents a user cannot see don't exist for them (404, and absent from
+the agent list), and every refusal is audited as `permission.denied`.
+
+**Groups** are named sets of agents; an agent can be in any number of them.
+Use them to grant access to many agents at once, to run a script on a
+whole group (`"group_ids"` in `/api/script-runs`), and to have new agents
+join groups as they enroll (`"group_ids"` on an enrollment link, admins
+only, since membership extends grants).
+
+**Upgrading:** the migration gives every existing support engineer an
+all-agents grant with every capability, so nobody is locked out; narrow
+them from there. Engineers created afterwards start with no access.
+
+```sh
+# A group, and a support engineer who may view and script its machines:
+curl … -d '{"name":"Branch office","agent_ids":["agt-1","agt-2"]}' https://…/api/groups
+curl … -d '{"user_id":7,"group_id":1,"capabilities":["desktop","script"]}' https://…/api/grants
+```
+
+## Metrics
+
+With `--metrics-listen` set (Compose: `127.0.0.1:9464`), the server serves
+Prometheus metrics in the OpenMetrics text format at `/metrics`, over plain
+HTTP and without credentials. Keep it on a private address. It shows
+activity levels, never agent ids, user names or content, and label values
+come from small fixed sets so the number of series stays bounded.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `rmm_agents_connected` | gauge | `transport` (`quic`, `websocket`) |
+| `rmm_viewers_connected` | gauge | `transport` |
+| `rmm_agents_registered` | gauge | |
+| `rmm_connections_rejected_total` | counter | `reason` |
+| `rmm_agent_heartbeats_total` | counter | |
+| `rmm_enrollments_total` | counter | `result` |
+| `rmm_relay_frames_received_total`, `rmm_relay_received_bytes_total` | counter | |
+| `rmm_relay_frames_sent_total`, `rmm_relay_sent_bytes_total` | counter | |
+| `rmm_relay_frames_dropped_total` | counter | (frames skipped for a lagging viewer) |
+| `rmm_stream_viewer_delay_seconds` | histogram | (worst viewer delay reported to agents) |
+| `rmm_sessions_total` | counter | `mode`, `outcome` (consent) |
+| `rmm_user_terminations_total` | counter | (Ctrl+F12) |
+| `rmm_shells_open` | gauge | |
+| `rmm_script_runs_total`, `rmm_script_agent_results_total` | counter | `status` |
+| `rmm_file_transfer_bytes_total` | counter | `direction` |
+| `rmm_logins_total` | counter | `result` |
+| `rmm_permission_denied_total` | counter | `capability` (or `admin`) |
+| `rmm_audit_entries_total` | counter | |
+| `rmm_http_requests_total` | counter | `method`, `route` (template), `status` |
+| `rmm_http_request_duration_seconds` | histogram | `method`, `route` |
+| `rmm_db_connections`, `rmm_db_connections_idle` | gauge | |
+| `rmm_build_info` | gauge | `version` |
 
 ## Support TUI
 
@@ -695,12 +892,15 @@ only to the server's HTTPS API:
 
 - sign in with username, password and TOTP; the session token is kept in the
   OS keyring, so it stays signed in across launches;
-- a live table of agents: hostname, status, last seen, CPU, RAM, disk and
-  active sessions;
+- a live table of agents: hostname, status (`online (ws)` on the WebSocket
+  fallback), groups, last seen, CPU, RAM, disk and active sessions;
 - **remote desktop:** mints a viewer token and starts the native viewer
   (`crates/viewer`) as a separate process. The TUI doesn't render video;
-- **shell console** and **script runner**, which use the server's shell
-  WebSocket and `/api/script-runs` directly. **Neither needs the viewer**;
+- **shell console** and **script runner** (agents and/or whole groups),
+  which use the server's shell WebSocket and `/api/script-runs` directly.
+  **Neither needs the viewer**;
+- actions follow the user's per-agent capabilities: an engineer only gets
+  remote desktop, shell or scripts where a grant allows them;
 - an audit-log view with chain verification for admins and auditors.
   Auditors see agents and the audit log but get none of the control actions.
 
@@ -737,9 +937,12 @@ cargo test --workspace        # needs a running Docker daemon
 ```
 
 The database tests (`crates/server/tests/db.rs`, `api.rs`, `enrollment.rs`,
-`telemetry.rs`, `streaming.rs`, `consent.rs` and `remote.rs`)
+`telemetry.rs`, `streaming.rs`, `consent.rs`, `remote.rs`, `rbac.rs` and
+`metrics.rs`)
 each start a throwaway `postgres:17-alpine` container with testcontainers. The
-container is removed when the test ends. `heartbeat.rs` (QUIC over loopback) and
+container is removed when the test ends. `heartbeat.rs` (QUIC and the
+WebSocket fallback over loopback, including falling back from a UDP port
+that drops everything) and
 `updates.rs` (signed updates over HTTPS) need no database. `streaming.rs` runs a
 real agent session with a synthetic two-monitor source (OpenH264 standing in
 for DXGI + Media Foundation), the real relay, and two real viewer clients. It
@@ -748,15 +951,22 @@ checks:
   frames);
 - a monitor switch applies to both;
 - the agent stops capturing when both leave;
-- viewer tokens are single-use and role-checked.
+- viewer tokens are single-use and role-checked;
+- the same over the WebSocket fallback;
+- a viewer that stops keeping up makes the agent lower its bitrate.
 
 `remote.rs` drives the shell, script and file APIs with plain HTTPS and
-WebSocket clients against two real agents. No viewer is used. It checks:
+WebSocket clients against two real agents, one on QUIC and one on the
+WebSocket fallback. No viewer is used. It checks:
 - an interactive shell with resize and exit code;
 - a script fanned out to both agents, plus an offline one;
 - a 24 MiB upload and download with hash checks;
 - corrupted, short and conflicting transfers leave no file;
 - an auditor is refused and audited on all three.
+
+`rbac.rs` covers roles, agent/group/all-agents grants, groups, user
+administration and group-assigning enrollment links; `metrics.rs` scrapes
+`/metrics` after real traffic.
 
 It runs the agents' development fallbacks (`/bin/sh`), so it runs on Linux
 and macOS only.

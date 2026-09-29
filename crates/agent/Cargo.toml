@@ -22,6 +22,7 @@ reqwest.workspace = true
 ring.workspace = true
 rustls.workspace = true
 semver.workspace = true
+transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true

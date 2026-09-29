@@ -92,6 +92,15 @@ async fn audit_transfer(
         bytes,
         size,
     } = record;
+    let direction = if action == Action::FileUpload {
+        "upload"
+    } else {
+        "download"
+    };
+    crate::metrics::get()
+        .file_bytes
+        .get_or_create(&crate::metrics::DirectionLabels { direction })
+        .inc_by(bytes);
     let mut detail = json!({ "path": path, "bytes": bytes, "size": size });
     match result {
         Ok(sha256) => {
@@ -203,7 +212,7 @@ where
     .await;
     if let Err(e @ RemoteError::BadRequest(_)) = forwarded {
         // The agent discards the partial file when the stream is reset.
-        let _ = send.reset(0u32.into());
+        let _ = send.reset(0);
         return Err(e);
     }
     let _ = send.shutdown().await;
@@ -285,7 +294,7 @@ pub async fn download(
 async fn start_download(
     link: &AgentLink,
     path: &str,
-) -> Result<(FileManifest, quinn::RecvStream), RemoteError> {
+) -> Result<(FileManifest, transport::RecvStream), RemoteError> {
     let (mut send, mut recv) = super::open_stream(link).await?;
     write_frame(
         &mut send,

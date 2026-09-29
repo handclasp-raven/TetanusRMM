@@ -13,6 +13,7 @@ use anyhow::{bail, Context};
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::info;
+use transport::{TransportMode, TransportSettings};
 
 #[derive(Parser)]
 #[command(about = "RMM agent", version)]
@@ -33,6 +34,14 @@ enum Command {
     /// Session helper started by the service in the user's session (internal).
     #[command(hide = true)]
     Helper,
+    /// Input injector started by the service as SYSTEM in the user's
+    /// session (internal).
+    #[command(hide = true)]
+    InputHelper {
+        /// Only this process may feed it input.
+        #[arg(long)]
+        service_pid: u32,
+    },
     /// Capture and encode the screen to a raw .h264 file (development aid;
     /// Windows only, run in an interactive session).
     #[command(hide = true)]
@@ -66,12 +75,29 @@ enum ServiceCommand {
 
 #[derive(Args)]
 struct ServerArgs {
-    /// Server UDP address.
+    /// Server QUIC (UDP) address.
     #[arg(long, env = "RMM_SERVER", default_value = "127.0.0.1:4433")]
     server: SocketAddr,
     /// Name the server certificate must be valid for.
     #[arg(long, env = "RMM_SERVER_NAME", default_value = "localhost")]
     server_name: String,
+    /// auto (QUIC, falling back to WebSocket over TLS when UDP is blocked),
+    /// quic, or websocket. Stored with the credential.
+    #[arg(long, env = "RMM_TRANSPORT", default_value_t = TransportMode::Auto)]
+    transport: TransportMode,
+    /// TCP address of the server's WebSocket fallback, if it is not the
+    /// --server address (e.g. published on 443). Stored with the credential.
+    #[arg(long, env = "RMM_WS_SERVER")]
+    ws_server: Option<SocketAddr>,
+}
+
+impl ServerArgs {
+    fn transport(&self) -> TransportSettings {
+        TransportSettings {
+            mode: self.transport,
+            ws_addr: self.ws_server,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -131,6 +157,7 @@ fn main() -> anyhow::Result<()> {
         // These two set up their own logging (to files) and runtimes.
         Command::Service(ServiceCommand::Run) => service_run(),
         Command::Helper => helper(),
+        Command::InputHelper { service_pid } => input_helper(service_pid),
         Command::CaptureTest {
             monitor,
             seconds,
@@ -150,7 +177,9 @@ async fn console(command: Command) -> anyhow::Result<()> {
         Command::Enroll(args) => enroll(args).await,
         Command::Run(args) => run(args).await,
         Command::Service(command) => service(command),
-        Command::Helper | Command::CaptureTest { .. } => unreachable!(),
+        Command::Helper | Command::InputHelper { .. } | Command::CaptureTest { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -165,6 +194,7 @@ async fn enroll(args: EnrollArgs) -> anyhow::Result<()> {
     let server_ca_pem = std::fs::read_to_string(&args.server_ca)
         .with_context(|| format!("reading {}", args.server_ca.display()))?;
     let credential = agent::enroll::enroll(&EnrollOptions {
+        transport: args.server.transport(),
         server_addr: args.server.server,
         server_name: args.server.server_name,
         server_ca_pem,
@@ -227,6 +257,7 @@ fn service(command: ServiceCommand) -> anyhow::Result<()> {
     use agent::win::service::{self, InstallOptions};
     match command {
         ServiceCommand::Install(args) => service::install(InstallOptions {
+            transport: args.server.transport(),
             server: args.server.server,
             server_name: args.server.server_name,
             server_ca: args.server_ca,
@@ -249,6 +280,11 @@ fn service_run() -> anyhow::Result<()> {
 #[cfg(windows)]
 fn helper() -> anyhow::Result<()> {
     agent::win::helper::run()
+}
+
+#[cfg(windows)]
+fn input_helper(service_pid: u32) -> anyhow::Result<()> {
+    agent::win::input_helper::run(service_pid)
 }
 
 #[cfg(windows)]
@@ -281,4 +317,9 @@ fn service_run() -> anyhow::Result<()> {
 #[cfg(not(windows))]
 fn helper() -> anyhow::Result<()> {
     bail!("the session helper is only available on Windows")
+}
+
+#[cfg(not(windows))]
+fn input_helper(_service_pid: u32) -> anyhow::Result<()> {
+    bail!("the input helper is only available on Windows")
 }

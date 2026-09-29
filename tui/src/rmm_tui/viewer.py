@@ -14,7 +14,8 @@ import shutil
 import socket
 import subprocess
 import sys
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,3 +118,25 @@ def launch(command: ViewerCommand, log_path: Path) -> subprocess.Popen[bytes]:
             )
         except OSError as e:
             raise ViewerError(f"cannot start the viewer: {e}") from e
+
+
+#: How long viewers get to exit after being asked before they are killed.
+CLOSE_TIMEOUT = 3.0
+
+
+def close_all(processes: Iterable[subprocess.Popen[bytes]], timeout: float = CLOSE_TIMEOUT) -> None:
+    """Close every viewer still running: ask them all to exit, then kill any
+    that are still there after ``timeout``."""
+    running = [p for p in processes if p.poll() is None]
+    for process in running:
+        try:
+            process.terminate()
+        except OSError:  # exited in the meantime
+            pass
+    deadline = time.monotonic() + timeout
+    for process in running:
+        try:
+            process.wait(max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()

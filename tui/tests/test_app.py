@@ -24,7 +24,24 @@ LATER = datetime.now(UTC) + timedelta(hours=8)
 
 
 class FakeProcess:
+    """A viewer that exits as soon as it is asked to."""
+
     pid = 4242
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
 
 
 def make_app(server: FakeServer, kr: MemoryKeyring, tmp_path: Path, launched: list) -> RmmApp:
@@ -90,7 +107,7 @@ async def test_login_persists_and_shows_the_agent_table(tmp_path) -> None:
         table = app.screen.query_one("#agents", DataTable)
         await wait_for(pilot, lambda: table.row_count == 3)
         assert table.get_row("agt-2")[0] == "WS-02"
-        assert table.get_row("agt-2")[6] == "1 shell"
+        assert table.get_row("agt-2")[7] == "1 shell"
         assert table.get_row("agt-3")[1] == "offline"
     assert kr.entries, "the token was saved to the keyring"
 
@@ -139,6 +156,10 @@ async def test_remote_desktop_launches_the_viewer_with_a_fresh_token(tmp_path) -
         await wait_for(pilot, lambda: app.screen.query_one("#agents", DataTable).row_count == 3)
         await pilot.press("d")
         await wait_for(pilot, lambda: launched)
+        (viewer,) = app.viewers
+        assert viewer.poll() is None
+    # Quitting the TUI closes the viewer window it opened.
+    assert viewer.returncode == -15 and not app.viewers
     (command,) = launched
     assert command.argv == [
         "/opt/viewer",
@@ -259,6 +280,32 @@ async def test_console_streams_a_shell_without_the_viewer(tmp_path) -> None:
     assert shell.closed and not launched
 
 
+async def test_closing_a_live_console_hangs_up_the_shell(tmp_path) -> None:
+    server, kr, launched = FakeServer(), MemoryKeyring(), []
+    TokenStore(BASE, kr).save(StoredSession("sess", LATER, "jane"))
+    serve_agents(server)
+    app = make_app(server, kr, tmp_path, launched)
+    shell = FakeShell()
+
+    async def open_shell(agent_id, cols, rows):
+        await shell.incoming.put('{"type":"started"}')
+        return shell
+
+    app.session.api.open_shell = open_shell
+    async with app.run_test(size=(120, 40)) as pilot:
+        await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+        await wait_for(pilot, lambda: app.screen.query_one("#agents", DataTable).row_count == 3)
+        await pilot.press("s")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConsoleScreen))
+        box = app.screen.query_one("#shell-input", Input)
+        await wait_for(pilot, lambda: not box.disabled)
+        # Esc while the shell is still running, not after it exited.
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+        await wait_for(pilot, lambda: shell.closed)
+        await pilot.pause(0.2)
+
+
 async def test_script_runner_fires_at_two_agents_and_shows_both(tmp_path) -> None:
     server, kr, launched = FakeServer(), MemoryKeyring(), []
     TokenStore(BASE, kr).save(StoredSession("sess", LATER, "jane"))
@@ -345,3 +392,104 @@ async def test_saving_a_script_to_the_library(tmp_path) -> None:
         await pilot.pause(0.05)
         assert "Spooler status" in [s.name for s in screen.scripts]
     assert "Get-Service Spooler" in (tmp_path / "scripts.json").read_text()
+
+
+async def test_engineers_get_only_the_actions_their_grants_allow(tmp_path) -> None:
+    server, kr, launched = FakeServer(), MemoryKeyring(), []
+    TokenStore(BASE, kr).save(StoredSession("sess", LATER, "jane"))
+    server.on("GET", "/api/me", body=USER)
+    server.on(
+        "GET",
+        "/api/agents",
+        body=[
+            agent_json("agt-1", hostname="A-DESK", capabilities=["desktop"]),
+            agent_json("agt-2", hostname="B-SHELL", capabilities=["shell"], transport="websocket"),
+        ],
+    )
+    app = make_app(server, kr, tmp_path, launched)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+        table = app.screen.query_one("#agents", DataTable)
+        await wait_for(pilot, lambda: table.row_count == 2)
+        screen = app.screen
+        assert table.get_row("agt-2")[1] == "online (ws)"
+
+        table.move_cursor(row=table.get_row_index("agt-1"))
+        await pilot.pause(0.05)
+        assert screen.check_action("desktop", ()) is True
+        assert screen.check_action("shell", ()) is False
+        # Nobody may run scripts anywhere: the script runner is off.
+        assert screen.check_action("scripts", ()) is False
+
+        table.move_cursor(row=table.get_row_index("agt-2"))
+        await pilot.pause(0.05)
+        assert screen.check_action("desktop", ()) is False
+        assert screen.check_action("shell", ()) is True
+        await pilot.press("d")
+        await pilot.pause(0.1)
+        assert not any("viewer-sessions" in r.url.path for r in server.requests)
+
+
+async def test_scripts_run_on_a_group_resolved_by_the_server(tmp_path) -> None:
+    server, kr, launched = FakeServer(), MemoryKeyring(), []
+    TokenStore(BASE, kr).save(StoredSession("sess", LATER, "jane"))
+    server.on("GET", "/api/me", body=USER)
+    server.on(
+        "GET",
+        "/api/agents",
+        body=[
+            agent_json("agt-1", hostname="WS-01", capabilities=["script"], groups=["Branch"]),
+            agent_json("agt-2", hostname="WS-02", capabilities=["desktop"]),
+        ],
+    )
+    server.on(
+        "GET",
+        "/api/groups",
+        body=[{"id": 5, "name": "Branch", "description": "", "agent_ids": ["agt-1"]}],
+    )
+
+    def result(agent_id: str) -> dict:
+        return {
+            "agent_id": agent_id,
+            "status": "completed",
+            "exit_code": 0,
+            "stdout": f"{agent_id}\n",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "duration_ms": 10,
+            "error": None,
+        }
+
+    # agt-7 joined the group after the TUI loaded it.
+    server.on(
+        "POST",
+        "/api/script-runs",
+        body={"run_id": 3, "results": [result("agt-1"), result("agt-7")]},
+    )
+    app = make_app(server, kr, tmp_path, launched)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+        await wait_for(pilot, lambda: app.screen.query_one("#agents", DataTable).row_count == 2)
+        await pilot.press("r")
+        await wait_for(pilot, lambda: isinstance(app.screen, ScriptScreen))
+        screen = app.screen
+        targets = screen.query_one("#targets", SelectionList)
+        # Only agents the user may run scripts on are offered.
+        assert [targets.get_option_at_index(i).value for i in range(targets.option_count)] == [
+            "agt-1"
+        ]
+        targets.deselect_all()
+        groups = screen.query_one("#groups", SelectionList)
+        await wait_for(pilot, lambda: groups.option_count == 1)
+        groups.select(5)
+        screen.query_one("#script-body", TextArea).text = "hostname"
+        await pilot.press("ctrl+r")
+        await wait_for(pilot, lambda: screen.current_run and screen.current_run.done)
+        await pilot.pause(0.05)
+        results = screen.query_one("#results", DataTable)
+        assert results.row_count == 2
+        assert results.get_row("agt-7")[0] == "agt-7"
+        assert "2/2 succeeded" in str(screen.query_one("#run-summary", Static).render())
+
+    assert server.body(-1) == {"agent_ids": [], "script": "hostname", "group_ids": [5]}

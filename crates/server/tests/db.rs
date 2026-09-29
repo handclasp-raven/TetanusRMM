@@ -486,3 +486,41 @@ async fn policy_update_validates_and_audits_before_and_after() {
     assert_eq!(detail["before"]["consent_mode"], "notify");
     assert_eq!(detail["after"]["consent_mode"], "unattended");
 }
+
+#[tokio::test]
+async fn upgrading_to_rbac_keeps_existing_engineers_access() {
+    // A database from before RBAC, with an engineer and an agent in it.
+    let db = support::start_db_unmigrated().await;
+    server::db::MIGRATOR
+        .run_to(20260929000005, &db.pool)
+        .await
+        .unwrap();
+    let engineer = create_user(&db.pool, "old-hand", Role::SupportEngineer).await;
+    create_user(&db.pool, "reader", Role::Auditor).await;
+    support::insert_agent(&db.pool, "agt-1").await;
+
+    server::db::MIGRATOR.run(&db.pool).await.unwrap();
+
+    // The engineer can still do everything everywhere (until an admin
+    // narrows it); nobody else got a grant.
+    let visibility = server::access::visibility(&db.pool, &engineer.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        visibility.capabilities("agt-1"),
+        server::access::all_capabilities()
+    );
+    let grants = server::access::list_grants(&db.pool, None).await.unwrap();
+    assert_eq!(grants.len(), 1);
+    assert!(grants[0].all_agents);
+    assert_eq!(grants[0].created_by, "migration");
+
+    // Engineers created from now on start with nothing.
+    let newcomer = create_user(&db.pool, "newcomer", Role::SupportEngineer).await;
+    assert_eq!(
+        server::access::visibility(&db.pool, &newcomer.user)
+            .await
+            .unwrap(),
+        server::access::Visibility::Only(Default::default())
+    );
+}

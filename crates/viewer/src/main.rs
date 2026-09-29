@@ -42,6 +42,14 @@ struct Cli {
     /// PEM CA certificate the server's certificate chains to.
     #[arg(long, env = "RMM_SERVER_CA")]
     ca: PathBuf,
+    /// auto (QUIC, falling back to WebSocket over TLS when UDP is blocked),
+    /// quic, or websocket.
+    #[arg(long, env = "RMM_TRANSPORT", default_value_t = transport::TransportMode::Auto)]
+    transport: transport::TransportMode,
+    /// TCP address of the server's WebSocket fallback, if it is not the
+    /// --server address.
+    #[arg(long, env = "RMM_WS_SERVER")]
+    ws_server: Option<SocketAddr>,
     /// Viewer-session token (from POST /api/agents/{id}/viewer-sessions).
     #[arg(long, env = "RMM_VIEWER_TOKEN", hide_env_values = true)]
     token: String,
@@ -61,6 +69,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let options = ViewerOptions {
         server: cli.server,
+        transport: transport::TransportSettings {
+            mode: cli.transport,
+            ws_addr: cli.ws_server,
+        },
         server_name: cli.server_name.clone(),
         ca_pem: std::fs::read_to_string(&cli.ca)
             .with_context(|| format!("reading {}", cli.ca.display()))?,

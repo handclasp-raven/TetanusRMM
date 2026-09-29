@@ -7,23 +7,43 @@
 //! | POST   | /api/auth/totp              | challenge token |
 //! | POST   | /api/auth/logout            | session         |
 //! | GET    | /api/me                     | session         |
-//! | GET    | /api/agents                 | session         |
+//! | GET    | /api/agents                 | session (engineers: granted agents only) |
 //! | GET    | /api/audit?limit=           | session (admin, auditor) |
 //! | GET    | /api/audit/verify           | session (admin, auditor) |
-//! | GET    | /api/agents/{id}/policy     | session         |
+//! | GET    | /api/agents/{id}/policy     | session (agent visible to the user) |
 //! | PUT    | /api/agents/{id}/policy     | session (admin) |
-//! | POST   | /api/enrollment-links       | session (admin, support_engineer) |
-//! | POST   | /api/agents/{id}/viewer-sessions | session (admin, support_engineer) |
-//! | GET    | /api/agents/{id}/shell?cols=&rows= | session (admin, support_engineer); WebSocket |
-//! | POST   | /api/script-runs            | session (admin, support_engineer) |
-//! | PUT    | /api/agents/{id}/files?path=&overwrite= | session (admin, support_engineer) |
-//! | GET    | /api/agents/{id}/files?path= | session (admin, support_engineer) |
+//! | POST   | /api/enrollment-links       | session (admin, support_engineer; `group_ids` admin only) |
+//! | POST   | /api/agents/{id}/viewer-sessions | `desktop` on the agent |
+//! | GET    | /api/agents/{id}/shell?cols=&rows= | `shell` on the agent; WebSocket |
+//! | POST   | /api/script-runs            | `script` on every target agent |
+//! | PUT    | /api/agents/{id}/files?path=&overwrite= | `file_transfer` on the agent |
+//! | GET    | /api/agents/{id}/files?path= | `file_transfer` on the agent |
+//! | GET    | /api/users                  | session (admin) |
+//! | POST   | /api/users                  | session (admin) |
+//! | PUT    | /api/users/{id}/role        | session (admin) |
+//! | DELETE | /api/users/{id}             | session (admin) |
+//! | GET    | /api/grants?user_id=        | session (admin; anyone for their own) |
+//! | POST   | /api/grants                 | session (admin) |
+//! | DELETE | /api/grants/{id}            | session (admin) |
+//! | GET    | /api/groups                 | session |
+//! | POST   | /api/groups                 | session (admin) |
+//! | GET    | /api/groups/{id}            | session |
+//! | PATCH  | /api/groups/{id}            | session (admin) |
+//! | DELETE | /api/groups/{id}            | session (admin) |
+//! | PUT    | /api/groups/{id}/agents     | session (admin): set members |
+//! | POST   | /api/groups/{id}/agents     | session (admin): add members |
+//! | DELETE | /api/groups/{id}/agents/{agent_id} | session (admin) |
 //! | GET    | /api/download/{platform}?token= | enrollment token |
 //! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
 //! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
 //! | GET    | /api/updates/{platform}/signature| none |
 //!
 //! Sessions are passed as `Authorization: Bearer <token>`.
+//!
+//! "`capability` on the agent" means the user's role allows it and, for
+//! support engineers, one of their grants covers that agent (see
+//! `crate::access`). Refusals of those are audited as `permission.denied`,
+//! as are non-admins' attempts at the admin-only endpoints above.
 
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -46,6 +66,9 @@ use serde_json::json;
 use sqlx::PgPool;
 use tracing::error;
 
+mod rbac;
+
+use crate::access;
 use crate::audit;
 use crate::auth::{self, AuthSettings, LoginError};
 use crate::enroll;
@@ -95,6 +118,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/updates/{platform}/manifest", get(update_manifest))
         .route("/api/updates/{platform}/binary", get(update_binary))
         .route("/api/updates/{platform}/signature", get(update_signature))
+        .merge(rbac::routes())
+        // Per route, so the route template is known (unmatched requests
+        // are not counted).
+        .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .with_state(state)
 }
 
@@ -241,11 +268,24 @@ struct LoginResponse {
     expires_in_secs: u64,
 }
 
+fn count_login(result: &'static str) {
+    crate::metrics::get()
+        .logins
+        .get_or_create(&crate::metrics::ResultLabels { result })
+        .inc();
+}
+
 async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    let challenge = auth::login_password(&state.pool, &req.username, &req.password).await?;
+    let challenge = auth::login_password(&state.pool, &req.username, &req.password)
+        .await
+        .inspect_err(|e| {
+            if matches!(e, LoginError::InvalidCredentials) {
+                count_login("bad_password");
+            }
+        })?;
     Ok(Json(LoginResponse {
         challenge_token: challenge.challenge_token,
         expires_in_secs: challenge.expires_in.as_secs(),
@@ -269,7 +309,14 @@ async fn login_totp(
     State(state): State<AppState>,
     Json(req): Json<TotpRequest>,
 ) -> Result<Json<TotpResponse>, ApiError> {
-    let grant = auth::login_totp(&state.pool, &state.auth, &req.challenge_token, &req.code).await?;
+    let grant = auth::login_totp(&state.pool, &state.auth, &req.challenge_token, &req.code)
+        .await
+        .inspect_err(|e| match e {
+            LoginError::InvalidTotp => count_login("bad_totp"),
+            LoginError::InvalidChallenge => count_login("bad_challenge"),
+            _ => {}
+        })?;
+    count_login("success");
     Ok(Json(TotpResponse {
         session_token: grant.token,
         expires_at: grant.expires_at,
@@ -294,24 +341,39 @@ struct AgentView {
     agent: Agent,
     /// Connected to the server right now.
     online: bool,
+    /// How it is connected (`quic`, or `websocket` when UDP is blocked);
+    /// `null` when offline.
+    transport: Option<transport::TransportKind>,
     /// Remote-desktop viewers watching it.
     viewer_sessions: usize,
     /// Interactive shells open on it.
     shell_sessions: usize,
+    /// Names of the groups it is in.
+    groups: Vec<String>,
+    /// What the requesting user may do on it.
+    capabilities: Vec<crate::users::Capability>,
 }
 
+/// The agents the user can see: all of them for admins and auditors, the
+/// granted ones for support engineers.
 async fn list_agents(
     State(state): State<AppState>,
-    _session: Session,
+    session: Session,
 ) -> Result<Json<Vec<AgentView>>, ApiError> {
+    let visibility = access::visibility(&state.pool, &session.user).await?;
     let agents = registry::list_agents(&state.pool).await?;
+    let mut groups = crate::groups::names_by_agent(&state.pool).await?;
     Ok(Json(
         agents
             .into_iter()
+            .filter(|agent| visibility.sees(&agent.id))
             .map(|agent| {
                 let link = state.hub.as_ref().and_then(|hub| hub.get(&agent.id));
                 AgentView {
+                    groups: groups.remove(&agent.id).unwrap_or_default(),
+                    capabilities: visibility.capabilities(&agent.id).into_iter().collect(),
                     online: link.is_some(),
+                    transport: link.as_ref().and_then(|l| l.transport()),
                     viewer_sessions: link.as_ref().map_or(0, |l| l.viewers()),
                     shell_sessions: link.as_ref().map_or(0, |l| l.shells()),
                     agent,
@@ -358,9 +420,16 @@ async fn verify_audit(
 
 async fn get_policy(
     State(state): State<AppState>,
-    _session: Session,
+    session: Session,
     Path(agent_id): Path<String>,
 ) -> Result<Json<DevicePolicy>, ApiError> {
+    // Agents the user cannot see do not exist, as far as they know.
+    if !access::visibility(&state.pool, &session.user)
+        .await?
+        .sees(&agent_id)
+    {
+        return Err(ApiError::NotFound);
+    }
     registry::get_policy(&state.pool, &agent_id)
         .await?
         .map(Json)
@@ -392,6 +461,9 @@ struct EnrollmentLinkRequest {
     ttl_secs: Option<u64>,
     /// Which agent build the link downloads; defaults to `windows-x86_64`.
     platform: Option<String>,
+    /// Groups the agent joins when it enrolls (admins only).
+    #[serde(default)]
+    group_ids: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -425,7 +497,16 @@ async fn create_enrollment_link(
             )))
         }
     };
-    let minted = enroll::create_token(&state.pool, &session.user.username, ttl).await?;
+    if !req.group_ids.is_empty() {
+        // Group membership extends grants: only admins decide it.
+        rbac::require_admin(&state.pool, &session.user, "enrollment_link_groups").await?;
+        crate::groups::check_exist(&state.pool, &req.group_ids)
+            .await
+            .map_err(rbac::group_error)?;
+    }
+    let minted =
+        enroll::create_token_in_groups(&state.pool, &session.user.username, ttl, &req.group_ids)
+            .await?;
     Ok(Json(EnrollmentLinkResponse {
         download_url: format!(
             "{}/api/download/{platform}?token={}",
@@ -583,16 +664,14 @@ async fn open_shell(
             protocol::shell::MAX_DIMENSION
         ))
     })?;
-    if !session.user.role.can(crate::users::Capability::Shell) {
-        // Audit the refusal even for a request that is not a WebSocket.
-        remote::authorize(
-            &state.pool,
-            &session.user,
-            crate::users::Capability::Shell,
-            std::slice::from_ref(&agent_id),
-        )
-        .await?;
-    }
+    // Audit a refusal even for a request that is not a WebSocket.
+    remote::authorize(
+        &state.pool,
+        &session.user,
+        crate::users::Capability::Shell,
+        std::slice::from_ref(&agent_id),
+    )
+    .await?;
     let upgrade = upgrade.map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let opened = shell::open(&state.pool, hub(&state)?, &session.user, &agent_id, size).await?;
     Ok(upgrade.on_upgrade(move |socket| shell::relay(socket, opened)))
@@ -600,7 +679,11 @@ async fn open_shell(
 
 #[derive(Deserialize)]
 struct ScriptRunRequest {
+    #[serde(default)]
     agent_ids: Vec<String>,
+    /// Groups whose members are targeted too (at the time of the run).
+    #[serde(default)]
+    group_ids: Vec<i64>,
     /// PowerShell on Windows agents.
     script: String,
     /// Defaults to 300; at most 3600.
@@ -613,7 +696,17 @@ async fn run_script(
     session: Session,
     Json(req): Json<ScriptRunRequest>,
 ) -> Result<Json<script::RunReport>, ApiError> {
-    let agents = script::normalize_agents(&req.agent_ids)?;
+    let mut targets = req.agent_ids;
+    if !req.group_ids.is_empty() {
+        let members = crate::groups::members_of(&state.pool, &req.group_ids)
+            .await
+            .map_err(rbac::group_error)?;
+        if members.is_empty() && targets.is_empty() {
+            return Err(ApiError::BadRequest("the groups have no agents".into()));
+        }
+        targets.extend(members);
+    }
+    let agents = script::normalize_agents(&targets)?;
     let request = protocol::script::ScriptRequest::new(req.script, req.timeout_secs)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let report = script::run(&state.pool, hub(&state)?, &session.user, agents, request).await?;

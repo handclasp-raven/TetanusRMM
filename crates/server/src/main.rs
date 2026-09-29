@@ -140,6 +140,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
     let quic = Server::bind(ServerConfig {
         listen: config.quic_listen,
+        ws_listen: config.ws_listen(),
         identity: config
             .quic_identity()
             .context("loading server certificate (run `gen-certs` first?)")?,
@@ -156,6 +157,22 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let tls = common::tls::https_server_config(
         &config.api_identity().context("loading API certificate")?,
     )?;
+    let metrics = match config.metrics_listen {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding metrics listener on {addr}"))?;
+            info!(%addr, "Prometheus metrics at /metrics");
+            Some(server::metrics::serve(listener, pool.clone()))
+        }
+        None => None,
+    };
+    let metrics = async {
+        match metrics {
+            Some(serving) => serving.await,
+            None => std::future::pending().await,
+        }
+    };
     let app = api::router(AppState {
         pool,
         auth: AuthSettings {
@@ -172,6 +189,10 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
     tokio::select! {
         () = quic.run() => bail!("QUIC listener stopped"),
+        res = metrics => {
+            res.context("metrics listener stopped")?;
+            bail!("metrics listener stopped");
+        }
         res = api::serve(listener, tls, app, handle.clone()) => {
             res.context("HTTPS API stopped")?;
             bail!("HTTPS API stopped");

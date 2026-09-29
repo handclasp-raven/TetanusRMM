@@ -7,6 +7,11 @@
 //! and only their SHA-256 is stored. Create, connect and disconnect are all
 //! audited, as are the consent outcome (`session.start`) and a Ctrl+F12
 //! termination (`session.user_terminated`).
+//!
+//! Access (the `desktop` capability, see `crate::access`) is checked when
+//! the token is minted and again when it is used, so a grant revoked in
+//! between still stops the session. Refusals are audited as
+//! `permission.denied`.
 
 use std::time::Duration;
 
@@ -15,9 +20,10 @@ use protocol::consent::{ConsentMode, Outcome};
 use serde_json::json;
 use sqlx::PgPool;
 
+use crate::access;
 use crate::audit::{self, Action, NewEntry};
 use crate::auth::{new_token, token_hash};
-use crate::users::User;
+use crate::users::{Capability, Role, User};
 
 /// How long a viewer-session token stays valid if unused.
 pub const TOKEN_TTL: Duration = Duration::from_secs(60);
@@ -34,14 +40,6 @@ pub enum ViewerError {
     Db(#[from] sqlx::Error),
 }
 
-/// Whether `user` may watch `agent_id`'s screen.
-///
-/// Today this is a role check: admins and support engineers may, auditors
-/// (read-only) may not. Per-agent access grants plug in here in Phase 9.
-pub fn authorize(user: &User, _agent_id: &str) -> bool {
-    user.role.can_view_desktop()
-}
-
 #[derive(Debug)]
 pub struct NewViewerSession {
     pub id: i64,
@@ -55,7 +53,11 @@ pub async fn create(
     user: &User,
     agent_id: &str,
 ) -> Result<NewViewerSession, ViewerError> {
-    if !authorize(user, agent_id) {
+    let agents = [agent_id.to_owned()];
+    if access::check(pool, user, Capability::Desktop, &agents)
+        .await?
+        .is_err()
+    {
         return Err(ViewerError::Forbidden);
     }
     let token = new_token();
@@ -88,6 +90,15 @@ pub async fn create(
     })
 }
 
+#[derive(sqlx::FromRow)]
+struct ViewerGrantRow {
+    session_id: i64,
+    user_id: i64,
+    username: String,
+    agent_id: String,
+    role: Role,
+}
+
 /// A consumed token: who is watching which agent.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ViewerGrant {
@@ -98,21 +109,46 @@ pub struct ViewerGrant {
 }
 
 /// Consume a token on connect. Single-use and time-limited. Audited as
-/// `viewer.connect`. The user's role is re-checked, in case it changed
-/// since the token was minted.
+/// `viewer.connect`. The user's access is re-checked, in case their role
+/// or grants changed since the token was minted; a refusal still uses up
+/// the token and is audited as `permission.denied`.
 pub async fn connect(pool: &PgPool, token: &str) -> Result<ViewerGrant, ViewerError> {
     let mut tx = pool.begin().await?;
-    let grant: Option<ViewerGrant> = sqlx::query_as(
+    let row: Option<(ViewerGrant, Role)> = sqlx::query_as(
         "UPDATE viewer_sessions v SET connected_at = now()
          FROM users u
          WHERE v.token_hash = $1 AND v.connected_at IS NULL AND v.expires_at > now()
-           AND u.id = v.user_id AND u.role IN ('admin', 'support_engineer')
-         RETURNING v.id AS session_id, v.user_id, u.username, v.agent_id",
+           AND u.id = v.user_id
+         RETURNING v.id AS session_id, v.user_id, u.username, v.agent_id, u.role",
     )
     .bind(token_hash(token))
     .fetch_optional(&mut *tx)
-    .await?;
-    let grant = grant.ok_or(ViewerError::InvalidToken)?;
+    .await?
+    .map(|row: ViewerGrantRow| {
+        (
+            ViewerGrant {
+                session_id: row.session_id,
+                user_id: row.user_id,
+                username: row.username,
+                agent_id: row.agent_id,
+            },
+            row.role,
+        )
+    });
+    let (grant, role) = row.ok_or(ViewerError::InvalidToken)?;
+    let user = User {
+        id: grant.user_id,
+        username: grant.username.clone(),
+        role,
+    };
+    let allowed = access::agent_capabilities(&mut *tx, &user, &grant.agent_id)
+        .await?
+        .contains(&Capability::Desktop);
+    if !allowed {
+        tx.commit().await?;
+        access::audit_denied(pool, &user, Capability::Desktop, &[grant.agent_id]).await?;
+        return Err(ViewerError::Forbidden);
+    }
     audit::append(
         &mut tx,
         NewEntry::new(&grant.username, Action::ViewerConnect)

@@ -20,4 +20,5 @@ softbuffer.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+transport.workspace = true
 winit.workspace = true

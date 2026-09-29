@@ -67,8 +67,11 @@ fn set_connected(status: &watch::Sender<AgentStatus>, connected: bool) {
 /// Connect and heartbeat, reconnecting after any failure. "Connected" means
 /// the server has acknowledged a heartbeat, not merely that TLS succeeded.
 async fn connect_forever(config: &crate::AgentConfig, status: &watch::Sender<AgentStatus>) {
+    // Remembers when UDP is blocked, so reconnects go straight to the
+    // WebSocket fallback for a while.
+    let mut preference = transport::Preference::default();
     loop {
-        match crate::connect(config).await {
+        match crate::connect_with(config, &mut preference).await {
             Ok(session) => {
                 let (acks_tx, mut acks) = mpsc::unbounded_channel();
                 let mark_connected = async {

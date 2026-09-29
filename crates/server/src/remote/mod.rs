@@ -8,8 +8,9 @@
 //!
 //! The server opens one bidirectional QUIC stream per operation on the
 //! agent's existing connection (agents are behind NAT; they never accept
-//! connections). Each operation checks the user's role first; a refusal is
-//! audited as `permission.denied`. Every shell, script run and transfer is
+//! connections). Each operation checks the user's access first (role and
+//! grants, see `crate::access`); a refusal is audited as
+//! `permission.denied`. Every shell, script run and transfer is
 //! audited too, with who, which agent(s) and what happened.
 
 pub mod files;
@@ -20,10 +21,8 @@ use std::sync::Arc;
 
 use protocol::transfer::ErrorKind;
 use protocol::MIN_REMOTE_OPS_VERSION;
-use serde_json::json;
 use sqlx::PgPool;
 
-use crate::audit::{self, Action, NewEntry};
 use crate::relay::{AgentLink, Hub};
 use crate::users::{Capability, User};
 
@@ -48,8 +47,8 @@ pub enum RemoteError {
     Db(#[from] sqlx::Error),
 }
 
-impl From<quinn::ConnectionError> for RemoteError {
-    fn from(e: quinn::ConnectionError) -> Self {
+impl From<transport::ConnectionError> for RemoteError {
+    fn from(e: transport::ConnectionError) -> Self {
         RemoteError::Transport(e.to_string())
     }
 }
@@ -60,27 +59,21 @@ impl From<protocol::FrameError> for RemoteError {
     }
 }
 
-/// Check that `user` may use `capability` on `agents`. A refusal is audited
-/// as `permission.denied` and returned as [`RemoteError::Forbidden`].
+/// Check that `user` may use `capability` on every one of `agents` (its
+/// role, and for support engineers its grants). A refusal is audited as
+/// `permission.denied`, naming the agents refused, and returned as
+/// [`RemoteError::Forbidden`]: a multi-agent operation runs everywhere
+/// or nowhere.
 pub async fn authorize(
     pool: &PgPool,
     user: &User,
     capability: Capability,
     agents: &[String],
 ) -> Result<(), RemoteError> {
-    if user.role.can(capability) {
-        return Ok(());
+    match crate::access::check(pool, user, capability, agents).await? {
+        Ok(()) => Ok(()),
+        Err(_) => Err(RemoteError::Forbidden),
     }
-    let mut entry = NewEntry::new(&user.username, Action::PermissionDenied).detail(json!({
-        "capability": capability,
-        "role": user.role,
-        "agents": agents,
-    }));
-    if let [agent] = agents {
-        entry = entry.target(agent);
-    }
-    audit::append_now(pool, entry).await?;
-    Err(RemoteError::Forbidden)
 }
 
 /// The connected agent `agent_id`, if it can serve remote operations.
@@ -95,7 +88,7 @@ pub fn agent(hub: &Hub, agent_id: &str) -> Result<Arc<AgentLink>, RemoteError> {
 /// A new stream to the agent.
 pub async fn open_stream(
     link: &AgentLink,
-) -> Result<(quinn::SendStream, quinn::RecvStream), RemoteError> {
+) -> Result<(transport::SendStream, transport::RecvStream), RemoteError> {
     link.open_stream()
         .await
         .ok_or(RemoteError::AgentOffline)?

@@ -137,6 +137,7 @@ impl Fanout {
                 Err(TrySendError::Full(_)) => {
                     sub.waiting_for_keyframe = true;
                     need_keyframe = true;
+                    crate::metrics::get().relay_frames_dropped.inc();
                 }
                 Err(TrySendError::Closed(_)) => closed.push(*id),
             }

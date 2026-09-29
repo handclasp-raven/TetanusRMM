@@ -65,6 +65,9 @@ pub enum IpcMessage {
     Clipboard(ClipboardData),
     /// Helper to service: the user pressed Ctrl+F12.
     KillSwitch,
+    /// Service to helper: encode at (at most) this many bits per second,
+    /// from now on and for streams started later (adaptive bitrate).
+    SetBitrate { bps: u32 },
 }
 
 /// An encoded video frame from the helper.
@@ -177,6 +180,7 @@ mod tests {
             IpcMessage::SetClipboard(ClipboardData::Text("hi".into())),
             IpcMessage::Clipboard(ClipboardData::Files(vec![r"C:\a".into()])),
             IpcMessage::KillSwitch,
+            IpcMessage::SetBitrate { bps: 1_500_000 },
         ];
         let mut buf = Vec::new();
         for m in &msgs {

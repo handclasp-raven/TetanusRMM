@@ -1,4 +1,5 @@
-//! End-to-end tests: real server and agent, in-process, over loopback QUIC.
+//! End-to-end tests: real server and agent, in-process, over loopback QUIC
+//! and the WebSocket-over-TLS fallback.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ fn start_server(certs: &DevCerts) -> (Arc<Server>, SocketAddr, UnboundedReceiver
     let (tx, rx) = unbounded_channel();
     let server = Server::bind(ServerConfig {
         listen: LOOPBACK.parse().unwrap(),
+        ws_listen: Some(LOOPBACK.parse().unwrap()),
         identity: certs.server_identity().unwrap(),
         client_ca: certs.ca().unwrap(),
     })
@@ -34,6 +36,7 @@ fn start_server(certs: &DevCerts) -> (Arc<Server>, SocketAddr, UnboundedReceiver
 fn agent_config(server_addr: SocketAddr, trust: &DevCerts, client: &DevCerts) -> AgentConfig {
     AgentConfig {
         server_addr,
+        transport: Default::default(),
         server_name: "localhost".into(),
         agent_id: "test-agent".into(),
         server_ca: trust.ca().unwrap(),
@@ -282,4 +285,154 @@ async fn server_closes_connection_that_skips_hello() {
         server_rx.try_recv().is_err(),
         "no Hello or Heartbeat should be reported"
     );
+}
+
+fn websocket_only(server: &Server) -> transport::TransportSettings {
+    transport::TransportSettings {
+        mode: transport::TransportMode::WebSocket,
+        ws_addr: server.ws_local_addr(),
+    }
+}
+
+#[tokio::test]
+async fn agent_heartbeats_over_the_websocket_fallback() {
+    let certs = devcerts::generate("test-agent").unwrap();
+    let (server, addr, mut server_rx) = start_server(&certs);
+    let mut config = agent_config(addr, &certs, &certs);
+    config.transport = websocket_only(&server);
+    let (agent, mut agent_rx) = start_agent(&config).await;
+    assert_eq!(agent.transport(), transport::TransportKind::WebSocket);
+    assert!(agent.local_addr().is_err(), "no UDP socket on the fallback");
+
+    let mut server_seen = Vec::new();
+    collect_until(&mut server_rx, &mut server_seen, |e| {
+        heartbeats(e).len() >= 3
+    })
+    .await;
+    assert!(matches!(
+        &server_seen[0],
+        ServerEvent::Hello { transport: transport::TransportKind::WebSocket, agent_id, .. }
+            if agent_id == "test-agent"
+    ));
+    let mut acks = Vec::new();
+    collect_until(&mut agent_rx, &mut acks, |a| {
+        a.contains(&AgentEvent::Ack { seq: 2 })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auto_falls_back_to_websocket_when_udp_is_blocked_and_remembers() {
+    let certs = devcerts::generate("test-agent").unwrap();
+    let (server, _addr, mut server_rx) = start_server(&certs);
+    // A UDP port that swallows everything: what a firewall dropping
+    // outbound UDP looks like from the agent.
+    let black_hole = UdpSocket::bind(LOOPBACK).unwrap();
+    let mut config = agent_config(black_hole.local_addr().unwrap(), &certs, &certs);
+    config.transport = transport::TransportSettings {
+        mode: transport::TransportMode::Auto,
+        ws_addr: server.ws_local_addr(),
+    };
+
+    let mut preference = transport::Preference::default();
+    let started = std::time::Instant::now();
+    let session = timeout(
+        transport::dial::QUIC_ATTEMPT + DEADLINE,
+        agent::connect_with(&config, &mut preference),
+    )
+    .await
+    .expect("fallback should not hang")
+    .expect("connects over the fallback");
+    assert_eq!(session.transport(), transport::TransportKind::WebSocket);
+    assert!(started.elapsed() >= transport::dial::QUIC_ATTEMPT);
+    let session = Arc::new(session);
+    let runner = session.clone();
+    tokio::spawn(async move { runner.run(None).await });
+    let mut seen = Vec::new();
+    collect_until(&mut server_rx, &mut seen, |e| !heartbeats(e).is_empty()).await;
+    session.close();
+
+    // Reconnecting goes straight to the WebSocket: no second QUIC wait.
+    let started = std::time::Instant::now();
+    let again = agent::connect_with(&config, &mut preference).await.unwrap();
+    assert_eq!(again.transport(), transport::TransportKind::WebSocket);
+    assert!(started.elapsed() < transport::dial::QUIC_ATTEMPT);
+}
+
+#[tokio::test]
+async fn auto_uses_quic_when_it_works() {
+    let certs = devcerts::generate("test-agent").unwrap();
+    let (server, addr, _server_rx) = start_server(&certs);
+    let mut config = agent_config(addr, &certs, &certs);
+    config.transport = transport::TransportSettings {
+        mode: transport::TransportMode::Auto,
+        ws_addr: server.ws_local_addr(),
+    };
+    let session = agent::connect(&config).await.unwrap();
+    assert_eq!(session.transport(), transport::TransportKind::Quic);
+}
+
+#[tokio::test]
+async fn the_websocket_fallback_enforces_the_same_client_certificates() {
+    let certs = devcerts::generate("test-agent").unwrap();
+    let rogue = devcerts::generate("rogue-agent").unwrap();
+    let (server, addr, mut server_rx) = start_server(&certs);
+
+    let mut config = agent_config(addr, &certs, &rogue);
+    config.transport = websocket_only(&server);
+    let result = timeout(DEADLINE, async {
+        agent::connect(&config).await?.run(None).await
+    })
+    .await
+    .expect("rejection should not hang");
+    assert!(result.is_err());
+    assert!(server_rx.try_recv().is_err(), "server must not see a Hello");
+
+    // Nor may a certificate-less connection say Hello.
+    let tls =
+        common::quic::mutual_tls_client(&certs.ca().unwrap(), None, transport::ws::ALPN).unwrap();
+    let conn = transport::ws::connect(server.ws_local_addr().unwrap(), "localhost", Arc::new(tls))
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &Message::Hello {
+            agent_id: "anon".into(),
+            version: protocol::PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    let reason = timeout(DEADLINE, conn.closed()).await.unwrap();
+    assert_eq!(
+        reason,
+        transport::ConnectionError::ApplicationClosed {
+            code: close_code::UNAUTHORIZED,
+            reason: "client certificate required".into()
+        }
+    );
+    assert!(server_rx.try_recv().is_err(), "server must not see a Hello");
+}
+
+#[tokio::test]
+async fn the_tunnel_only_upgrades_its_own_path() {
+    let certs = devcerts::generate("test-agent").unwrap();
+    let (server, _addr, _server_rx) = start_server(&certs);
+    let tls =
+        common::quic::mutual_tls_client(&certs.ca().unwrap(), None, transport::ws::ALPN).unwrap();
+    let tcp = tokio::net::TcpStream::connect(server.ws_local_addr().unwrap())
+        .await
+        .unwrap();
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
+        .connect("localhost".try_into().unwrap(), tcp)
+        .await
+        .unwrap();
+    let result = tokio_tungstenite::client_async("wss://localhost/somewhere-else", stream).await;
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 404)
+        }
+        other => panic!("expected 404, got {:?}", other.map(|_| ())),
+    }
 }

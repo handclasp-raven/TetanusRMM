@@ -29,6 +29,13 @@ pub struct TestDb {
 }
 
 pub async fn start_db() -> TestDb {
+    let db = start_db_unmigrated().await;
+    server::db::MIGRATOR.run(&db.pool).await.expect("migrate");
+    db
+}
+
+/// A throwaway Postgres with an empty schema, for migration tests.
+pub async fn start_db_unmigrated() -> TestDb {
     let container = Postgres::default()
         .with_tag("17-alpine")
         .start()
@@ -39,9 +46,11 @@ pub async fn start_db() -> TestDb {
         .await
         .expect("postgres port");
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = server::db::connect(&url, 5)
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
         .await
-        .expect("connect + migrate");
+        .expect("connect");
     TestDb {
         pool,
         _container: container,
@@ -202,6 +211,7 @@ pub fn start_quic(
     let (tx, rx) = unbounded_channel();
     let quic = Server::bind(ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
+        ws_listen: Some("127.0.0.1:0".parse().unwrap()),
         identity: certs.server_identity().unwrap(),
         client_ca: certs.ca().unwrap(),
     })

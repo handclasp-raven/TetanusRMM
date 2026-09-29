@@ -132,22 +132,38 @@ pub struct NewToken {
 
 /// Mint a single-use enrollment token. Audited as `enrollment.create`.
 pub async fn create_token(pool: &PgPool, actor: &str, ttl: Duration) -> sqlx::Result<NewToken> {
+    create_token_in_groups(pool, actor, ttl, &[]).await
+}
+
+/// [`create_token`] for an agent that joins `group_ids` when it enrolls
+/// (groups deleted meanwhile are skipped). The caller checks the groups
+/// exist and that the actor may assign them.
+pub async fn create_token_in_groups(
+    pool: &PgPool,
+    actor: &str,
+    ttl: Duration,
+    group_ids: &[i64],
+) -> sqlx::Result<NewToken> {
     let token = new_token();
     let mut tx = pool.begin().await?;
     let (id, expires_at): (i64, DateTime<Utc>) = sqlx::query_as(
-        "INSERT INTO enrollment_tokens (token_hash, created_by, expires_at)
-         VALUES ($1, $2, now() + make_interval(secs => $3))
+        "INSERT INTO enrollment_tokens (token_hash, created_by, expires_at, group_ids)
+         VALUES ($1, $2, now() + make_interval(secs => $3), $4)
          RETURNING id, expires_at",
     )
     .bind(token_hash(&token))
     .bind(actor)
     .bind(ttl.as_secs_f64())
+    .bind(group_ids)
     .fetch_one(&mut *tx)
     .await?;
+    let mut detail = json!({ "token_id": id, "expires_at": expires_at });
+    if !group_ids.is_empty() {
+        detail["group_ids"] = json!(group_ids);
+    }
     audit::append(
         &mut tx,
-        NewEntry::new(actor, Action::EnrollmentCreate)
-            .detail(json!({ "token_id": id, "expires_at": expires_at })),
+        NewEntry::new(actor, Action::EnrollmentCreate).detail(detail),
     )
     .await?;
     tx.commit().await?;
@@ -202,15 +218,15 @@ pub async fn enroll(
 
     // FOR UPDATE makes a concurrent enrollment with the same token wait for
     // this transaction, then re-check `used_at IS NULL` and find nothing.
-    let token_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM enrollment_tokens
+    let row: Option<(i64, Vec<i64>)> = sqlx::query_as(
+        "SELECT id, group_ids FROM enrollment_tokens
          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
          FOR UPDATE",
     )
     .bind(token_hash(token))
     .fetch_optional(&mut *tx)
     .await?;
-    let token_id = token_id.ok_or(EnrollError::InvalidToken)?;
+    let (token_id, group_ids) = row.ok_or(EnrollError::InvalidToken)?;
 
     let agent_id = new_agent_id();
     let cert_pem = ca.issue(&agent_id, csr_der)?;
@@ -224,11 +240,24 @@ pub async fn enroll(
         .bind(&agent_id)
         .execute(&mut *tx)
         .await?;
+    let joined: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO agent_group_members (group_id, agent_id)
+         SELECT id, $2 FROM agent_groups WHERE id = ANY($1)
+         RETURNING group_id",
+    )
+    .bind(&group_ids)
+    .bind(&agent_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut detail = json!({ "token_id": token_id, "cert_fingerprint": fingerprint });
+    if !joined.is_empty() {
+        detail["group_ids"] = json!(joined);
+    }
     audit::append(
         &mut tx,
         NewEntry::new(format!("agent:{agent_id}"), Action::AgentEnroll)
             .target(&agent_id)
-            .detail(json!({ "token_id": token_id, "cert_fingerprint": fingerprint })),
+            .detail(detail),
     )
     .await?;
     tx.commit().await?;

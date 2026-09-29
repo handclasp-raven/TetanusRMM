@@ -1,5 +1,6 @@
-"""Script runner: pick agents, type or load a script, fire it through the
-server, and read each agent's result. No viewer involved."""
+"""Script runner: pick agents and/or agent groups, type or load a script,
+fire it through the server, and read each agent's result. No viewer
+involved. Only agents the user may run scripts on are offered."""
 
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from .api import Agent, ApiError, Forbidden, Unauthorized
+from .api import SCRIPT, Agent, ApiError, Forbidden, Group, Unauthorized
 from .scripts import SavedScript, ScriptError, ScriptLibrary, ScriptRun, validate_timeout
 
 if TYPE_CHECKING:
@@ -39,11 +40,14 @@ class ScriptScreen(Screen):
         Binding("escape", "app.pop_screen", "Back"),
     ]
 
-    def __init__(self, agents: list[Agent], preselected: list[str]) -> None:
+    def __init__(self, agents: list[Agent], preselected: list[str], user=None) -> None:
         super().__init__()
-        self.agents = sorted(agents, key=lambda a: a.label.lower())
+        self.agents = sorted(
+            (a for a in agents if a.allows(SCRIPT, user)), key=lambda a: a.label.lower()
+        )
         self.labels = {a.id: a.long_label for a in agents}
         self.preselected = set(preselected)
+        self.groups: dict[int, Group] = {}
         self.current_run: ScriptRun | None = None
         self.scripts: list[SavedScript] = []
 
@@ -67,6 +71,8 @@ class ScriptScreen(Screen):
                     ],
                     id="targets",
                 )
+                yield Label("Groups (members at run time)")
+                yield SelectionList[int](id="groups")
             with Vertical(id="library-box"):
                 yield Label("Saved scripts (Enter loads)")
                 yield OptionList(id="library")
@@ -94,7 +100,20 @@ class ScriptScreen(Screen):
         results.add_column("Exit", key="exit")
         results.add_column("Time", key="time")
         self.reload_library()
+        self.load_groups()
         self.query_one("#script-body", TextArea).focus()
+
+    @work(exclusive=True, group="groups")
+    async def load_groups(self) -> None:
+        try:
+            groups = await self.app.session.api.list_groups()
+        except ApiError:
+            # An older server has no groups; the agent list still works.
+            return
+        self.groups = {g.id: g for g in groups}
+        selection = self.query_one("#groups", SelectionList)
+        selection.clear_options()
+        selection.add_options([(f"{g.name} ({len(g.agent_ids)} agents)", g.id) for g in groups])
 
     # --- library ------------------------------------------------------------------
 
@@ -156,9 +175,16 @@ class ScriptScreen(Screen):
             return
         try:
             timeout = validate_timeout(self.query_one("#timeout", Input).value)
+            group_ids = list(self.query_one("#groups", SelectionList).selected)
+            agent_ids = list(self.query_one("#targets", SelectionList).selected)
+            # Show the members we know of as running; the server has the
+            # final say on membership.
+            for group_id in group_ids:
+                agent_ids += self.groups[group_id].agent_ids
             run = ScriptRun(
-                agent_ids=list(self.query_one("#targets", SelectionList).selected),
+                agent_ids=agent_ids,
                 script=self.query_one("#script-body", TextArea).text,
+                group_ids=group_ids,
             )
         except ScriptError as e:
             self.app.notify(str(e), severity="error")
@@ -171,14 +197,17 @@ class ScriptScreen(Screen):
     async def fire(self, run: ScriptRun, timeout: int | None) -> None:
         self.query_one("#run", Button).disabled = True
         try:
-            report = await self.app.session.api.run_script(run.agent_ids, run.script, timeout)
+            explicit = list(self.query_one("#targets", SelectionList).selected)
+            report = await self.app.session.api.run_script(
+                explicit, run.script, timeout, group_ids=run.group_ids
+            )
             run.apply_report(report)
         except Unauthorized:
             run.fail("session expired")
             self.app.session_expired()
             return
         except Forbidden:
-            run.fail("your role may not run scripts")
+            run.fail("you may not run scripts on every one of these agents")
         except ApiError as e:
             run.fail(e.message)
         finally:

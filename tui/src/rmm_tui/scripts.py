@@ -189,10 +189,16 @@ class AgentResult:
 
 @dataclass
 class ScriptRun:
-    """A run from the TUI's point of view: every target, in order."""
+    """A run from the TUI's point of view: every target, in order.
+
+    ``group_ids`` are sent to the server, which resolves their members when
+    the run starts; ``agent_ids`` should already include the members the
+    TUI knows of, so they show as running meanwhile. Any other agent the
+    report mentions is added at the end."""
 
     agent_ids: list[str]
     script: str
+    group_ids: list[int] = field(default_factory=list)
     run_id: int | None = None
     results: dict[str, AgentResult] = field(default_factory=dict)
     #: Set if the whole request failed (e.g. forbidden, server unreachable).
@@ -206,8 +212,8 @@ class ScriptRun:
         for agent_id in self.agent_ids:
             if agent_id.strip():
                 seen.setdefault(agent_id.strip())
-        if not seen:
-            raise ScriptError("choose at least one agent")
+        if not seen and not self.group_ids:
+            raise ScriptError("choose at least one agent or group")
         self.agent_ids = list(seen)
         self.results = {a: AgentResult(a, "running") for a in self.agent_ids}
 
@@ -220,6 +226,8 @@ class ScriptRun:
         report does not mention is marked failed."""
         self.run_id = report.get("run_id")
         by_agent = {r["agent_id"]: AgentResult.from_json(r) for r in report.get("results", [])}
+        # Group members the TUI did not know of (joined meanwhile).
+        self.agent_ids += [a for a in by_agent if a not in self.results]
         for agent_id in self.agent_ids:
             self.results[agent_id] = by_agent.get(
                 agent_id, AgentResult(agent_id, "failed", error="no result in the report")

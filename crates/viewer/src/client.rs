@@ -1,6 +1,6 @@
 //! The viewer's connection to the server.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use protocol::clipboard::ClipboardData;
 use protocol::input::InputEvent;
@@ -8,9 +8,13 @@ use protocol::media::{MediaFrame, MonitorInfo};
 use protocol::{read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use tracing::debug;
+use transport::{Connection, ConnectionError, Preference, TransportSettings};
 
 pub struct ViewerOptions {
+    /// Server QUIC (UDP) address.
     pub server: SocketAddr,
+    /// Which transports to use, and where the WebSocket fallback is.
+    pub transport: TransportSettings,
     /// Name the server certificate must be valid for.
     pub server_name: String,
     /// PEM CA the server certificate must chain to.
@@ -24,12 +28,10 @@ pub struct ViewerOptions {
 pub enum ClientError {
     #[error(transparent)]
     Tls(#[from] common::TlsError),
-    #[error("binding local UDP socket: {0}")]
-    Bind(#[source] std::io::Error),
+    #[error("cannot reach the server: {0}")]
+    Unreachable(String),
     #[error(transparent)]
-    Connect(#[from] quinn::ConnectError),
-    #[error(transparent)]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] ConnectionError),
     #[error(transparent)]
     Frame(#[from] FrameError),
     /// The server closed the connection, with its reason.
@@ -63,7 +65,7 @@ pub enum ViewerEvent {
 #[derive(Clone)]
 pub struct ViewerHandle {
     commands: mpsc::UnboundedSender<Message>,
-    connection: quinn::Connection,
+    connection: Connection,
 }
 
 impl ViewerHandle {
@@ -89,21 +91,28 @@ impl ViewerHandle {
 
     pub fn close(&self) {
         self.connection
-            .close(protocol::close_code::NORMAL.into(), b"viewer closed");
+            .close(protocol::close_code::NORMAL, b"viewer closed");
+    }
+
+    /// Which transport the session runs on.
+    pub fn transport(&self) -> transport::TransportKind {
+        self.connection.kind()
     }
 }
 
 /// Frames buffered between network and decoder.
 const EVENT_QUEUE: usize = 64;
 
+/// How often to acknowledge frames, once the server asks (adaptive
+/// bitrate; the server's `relay::delay` allows for this interval).
+pub const ACK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The server's reason for closing. The stream can end a moment before the
 /// connection close (which carries the reason) arrives, so wait briefly.
-async fn close_reason(conn: &quinn::Connection, fallback: impl std::fmt::Display) -> String {
+async fn close_reason(conn: &Connection, fallback: impl std::fmt::Display) -> String {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), conn.closed()).await;
     match conn.close_reason() {
-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
-            String::from_utf8_lossy(&close.reason).into_owned()
-        }
+        Some(ConnectionError::ApplicationClosed { reason, .. }) => reason,
         Some(other) => other.to_string(),
         None => fallback.to_string(),
     }
@@ -131,16 +140,20 @@ pub async fn connect_with_status(
     mut status: impl FnMut(Pending),
 ) -> Result<(Welcome, ViewerHandle, mpsc::Receiver<ViewerEvent>), ClientError> {
     let ca = common::tls::certs_from_pem(&options.ca_pem)?;
-    let bind = options.bind.unwrap_or(match options.server {
-        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-    });
-    let mut endpoint = quinn::Endpoint::client(bind).map_err(ClientError::Bind)?;
-    // No client certificate: the token is the credential.
-    endpoint.set_default_client_config(common::quic::client_config(&ca, None)?);
-    let conn = endpoint
-        .connect(options.server, &options.server_name)?
-        .await?;
+    let target = options
+        .transport
+        .target(options.server, &options.server_name, options.bind);
+    // No client certificate: the token is the credential. The token is
+    // only spent once connected, so falling back cannot waste it.
+    let dialer = transport::Dialer::new(target, &ca, None)?;
+    let dialed = dialer
+        .dial(&mut Preference::default())
+        .await
+        .map_err(|e| match e {
+            transport::dial::DialError::Tls(e) => ClientError::Tls(e),
+            other => ClientError::Unreachable(other.to_string()),
+        })?;
+    let (conn, endpoint) = (dialed.connection, dialed.endpoint);
 
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(
@@ -184,7 +197,13 @@ pub async fn connect_with_status(
         connection: conn.clone(),
     };
 
+    // Newest frame handed to the app (0 = none yet), and whether the
+    // server wants acknowledgements.
+    let received = std::sync::atomic::AtomicU64::new(0);
+    let acks_enabled = std::sync::atomic::AtomicBool::new(false);
+    let ack_commands = handle.commands.clone();
     tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
         let writer = async {
             while let Some(msg) = outbox.recv().await {
                 write_frame(&mut send, &msg).await?;
@@ -194,6 +213,10 @@ pub async fn connect_with_status(
         let control = async {
             while let Some(msg) = read_frame::<_, Message>(&mut recv).await? {
                 let event = match msg {
+                    Message::EnableFrameAcks => {
+                        acks_enabled.store(true, Ordering::Relaxed);
+                        continue;
+                    }
                     Message::MonitorList { monitors } => ViewerEvent::Monitors(monitors),
                     Message::StreamMonitor { monitor } => ViewerEvent::StreamMonitor(monitor),
                     Message::Clipboard(data) => ViewerEvent::Clipboard(data),
@@ -211,23 +234,43 @@ pub async fn connect_with_status(
         let video = async {
             let mut stream = conn.accept_uni().await?;
             while let Some(frame) = read_frame::<_, MediaFrame>(&mut stream).await? {
+                let seq = frame.seq;
+                // Blocks while the app is behind: then acknowledgements
+                // stall too, and the server sees this viewer lagging.
                 if events_tx.send(ViewerEvent::Frame(frame)).await.is_err() {
                     break;
                 }
+                received.store(seq + 1, Ordering::Relaxed);
             }
             Ok(())
+        };
+        let acks = async {
+            let mut ticker = tokio::time::interval(ACK_INTERVAL);
+            let mut acked = 0;
+            loop {
+                ticker.tick().await;
+                let newest = received.load(Ordering::Relaxed);
+                if newest != acked && acks_enabled.load(Ordering::Relaxed) {
+                    acked = newest;
+                    let _ = ack_commands.send(Message::FrameAck { seq: newest - 1 });
+                }
+            }
         };
         let result = tokio::select! {
             r = writer => r,
             r = control => r,
             r = video => r,
+            () = acks => unreachable!("acknowledging never ends"),
         };
         let reason = match result {
             Ok(()) => close_reason(&conn, "stream ended").await,
             Err(e) => close_reason(&conn, e).await,
         };
         let _ = events_tx.send(ViewerEvent::Closed(reason)).await;
-        endpoint.close(protocol::close_code::NORMAL.into(), b"");
+        conn.close(protocol::close_code::NORMAL, b"");
+        if let Some(endpoint) = endpoint {
+            endpoint.close(protocol::close_code::NORMAL.into(), b"");
+        }
     });
 
     Ok((welcome, handle, events))

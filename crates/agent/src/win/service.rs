@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
@@ -53,6 +53,7 @@ const UPDATE_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub struct InstallOptions {
     pub server: SocketAddr,
+    pub transport: transport::TransportSettings,
     pub server_name: String,
     pub server_ca: Option<PathBuf>,
     pub token: Option<String>,
@@ -77,6 +78,7 @@ pub fn install(opts: InstallOptions) -> anyhow::Result<()> {
                 server_ca_pem: std::fs::read_to_string(ca)
                     .with_context(|| format!("reading {}", ca.display()))?,
                 token: token.clone(),
+                transport: opts.transport,
             }
             .save(&state_dir)
             .context("saving enrollment request")?;
@@ -236,8 +238,8 @@ enum Exit {
 
 fn run_service(state_dir: &Path) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let session_changed = Arc::new(Notify::new());
-    let notify = session_changed.clone();
+    // Bumped on every session change; each helper supervisor watches it.
+    let (session_tx, session_changed) = watch::channel(0u64);
     let handler = move |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
             let _ = shutdown_tx.send(true);
@@ -246,7 +248,7 @@ fn run_service(state_dir: &Path) -> anyhow::Result<()> {
         // Logon, logoff, lock, user switch: re-check the console session now
         // rather than at the next poll.
         ServiceControl::SessionChange(_) => {
-            notify.notify_one();
+            session_tx.send_modify(|n| *n += 1);
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -295,13 +297,13 @@ fn run_service(state_dir: &Path) -> anyhow::Result<()> {
 async fn service_body(
     state_dir: &Path,
     mut shutdown: watch::Receiver<bool>,
-    session_changed: Arc<Notify>,
+    session_changed: watch::Receiver<u64>,
 ) -> anyhow::Result<Exit> {
     let paths = UpdatePaths::for_current_exe()?;
     updater::cleanup(&paths);
 
     let (status_tx, status_rx) = watch::channel(core::initial_status(None));
-    let helper_pid = Arc::new(AtomicU32::new(0));
+    let pids = pipe::HelperPids::default();
     // Screen streaming: the core talks to the helper through the bridge.
     let (media_link, media_source) = media_channel();
     // Consent, input and clipboard: likewise, through the helper. A user is
@@ -309,20 +311,27 @@ async fn service_body(
     let (desktop_link, desktop_end) = desktop_channel(|| process::console_user_session().is_some());
     let bridge = Bridge::start(media_source, desktop_end);
     tokio::spawn({
-        let helper_pid = helper_pid.clone();
+        let pids = pids.clone();
         async move {
-            if let Err(e) = pipe::serve(status_rx, helper_pid, Some(bridge)).await {
+            if let Err(e) = pipe::serve(status_rx, pids, Some(bridge)).await {
                 error!("helper pipe server stopped: {e}");
             }
         }
     });
     let (stop_helper_tx, stop_helper_rx) = watch::channel(false);
-    let supervisor = tokio::spawn(supervise_helper(
-        paths.current.clone(),
-        helper_pid,
-        session_changed,
-        stop_helper_rx,
-    ));
+    let supervisors = [
+        (HelperKind::Session, pids.helper),
+        (HelperKind::Input, pids.input),
+    ]
+    .map(|(kind, pid)| {
+        tokio::spawn(supervise_helper(
+            kind,
+            paths.current.clone(),
+            pid,
+            session_changed.clone(),
+            stop_helper_rx.clone(),
+        ))
+    });
 
     let agent = async {
         let credential = obtain_credential(state_dir).await?;
@@ -342,7 +351,9 @@ async fn service_body(
         update = agent => install_update(&paths, update?).map(|()| Exit::UpdateInstalled),
     };
     let _ = stop_helper_tx.send(true);
-    let _ = supervisor.await;
+    for supervisor in supervisors {
+        let _ = supervisor.await;
+    }
     result
 }
 
@@ -378,53 +389,82 @@ async fn obtain_credential(state_dir: &Path) -> anyhow::Result<Credential> {
     }
 }
 
-/// Keep a helper running in the console user's session (see
-/// [`crate::session`]). Terminates the helper when told to stop.
+/// The processes the service keeps running in the console user's session.
+#[derive(Debug, Clone, Copy)]
+enum HelperKind {
+    /// Tray, prompts, clipboard and capture, as the user.
+    Session,
+    /// Input injection, as SYSTEM, so it reaches elevated windows.
+    Input,
+}
+
+impl HelperKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Session => "helper",
+            Self::Input => "input helper",
+        }
+    }
+
+    fn spawn(self, session_id: u32, exe: &Path) -> windows::core::Result<process::HelperProcess> {
+        match self {
+            Self::Session => process::spawn_in_session(session_id, exe, "helper"),
+            Self::Input => process::spawn_system_in_session(
+                session_id,
+                exe,
+                &format!("input-helper --service-pid {}", std::process::id()),
+            ),
+        }
+    }
+}
+
+/// Keep a helper of `kind` running in the console user's session (see
+/// [`crate::session`]). Terminates it when told to stop.
 async fn supervise_helper(
+    kind: HelperKind,
     exe: PathBuf,
     helper_pid: Arc<AtomicU32>,
-    session_changed: Arc<Notify>,
+    mut session_changed: watch::Receiver<u64>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let name = kind.name();
     let mut supervisor = Supervisor::new(Backoff::default());
     let mut helper: Option<process::HelperProcess> = None;
     loop {
         let now = Instant::now();
         let running = helper.as_ref().is_some_and(|h| h.is_running());
         if let Some(h) = helper.as_ref().filter(|_| !running) {
-            info!(pid = h.pid, exit_code = ?h.exit_code(), "helper exited");
+            info!(pid = h.pid, exit_code = ?h.exit_code(), "{name} exited");
             helper = None;
             helper_pid.store(0, Ordering::SeqCst);
         }
         let console = process::console_user_session();
         match supervisor.poll(now, console, running) {
             Action::Idle => {}
-            Action::Spawn { session_id } => {
-                match process::spawn_in_session(session_id, &exe, "helper") {
-                    Ok(h) => {
-                        // Publish the pid before the helper can connect.
-                        helper_pid.store(h.pid, Ordering::SeqCst);
-                        h.resume();
-                        info!(pid = h.pid, session_id, "helper started");
-                        helper = Some(h);
-                        supervisor.spawned(now, session_id, true);
-                    }
-                    Err(e) => {
-                        supervisor.spawned(now, session_id, false);
-                        warn!(
-                            session_id,
-                            failures = supervisor.failures(),
-                            "could not start helper: {e}"
-                        );
-                    }
+            Action::Spawn { session_id } => match kind.spawn(session_id, &exe) {
+                Ok(h) => {
+                    // Publish the pid before the helper can connect.
+                    helper_pid.store(h.pid, Ordering::SeqCst);
+                    h.resume();
+                    info!(pid = h.pid, session_id, "{name} started");
+                    helper = Some(h);
+                    supervisor.spawned(now, session_id, true);
                 }
-            }
+                Err(e) => {
+                    supervisor.spawned(now, session_id, false);
+                    warn!(
+                        session_id,
+                        failures = supervisor.failures(),
+                        "could not start {name}: {e}"
+                    );
+                }
+            },
             Action::Terminate => {
                 if let Some(h) = helper.take() {
                     info!(
                         pid = h.pid,
                         session_id = h.session_id,
-                        "console user changed; stopping helper"
+                        "console user changed; stopping {name}"
                     );
                     h.terminate();
                     helper_pid.store(0, Ordering::SeqCst);
@@ -433,7 +473,7 @@ async fn supervise_helper(
         }
         tokio::select! {
             () = tokio::time::sleep(supervisor.next_wake(now)) => {}
-            () = session_changed.notified() => {}
+            Ok(()) = session_changed.changed() => {}
             _ = stop.wait_for(|stop| *stop) => {
                 if let Some(h) = helper.take() {
                     h.terminate();

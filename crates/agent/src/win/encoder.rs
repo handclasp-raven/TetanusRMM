@@ -10,8 +10,9 @@
 //! mode, in Annex B. Baseline keeps the stream decodable by the portable
 //! OpenH264 decoder the viewer uses on every platform.
 //!
-//! Bitrate is changed at runtime through `ICodecAPI` ([`H264Encoder::set_bitrate`]),
-//! which Phase 9's adaptive bitrate will drive.
+//! Bitrate is changed at runtime through `ICodecAPI`
+//! ([`H264Encoder::set_bitrate`]), driven by adaptive bitrate (see
+//! `crate::media::rate` and `super::stream`).
 //!
 //! Hardware MFTs are usually *asynchronous*: they signal "need input" and
 //! "have output" through events instead of answering `ProcessInput`/

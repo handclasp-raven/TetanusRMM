@@ -31,7 +31,14 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   server opens (see [`StreamOpen`]). Older agents never accept those
 ///   streams, so the server refuses these operations for them.
 /// - 6: `AgentInfo` (appended variant): the agent reports its hostname.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// - 7: adaptive bitrate (appended variants): `StreamReport` to agents,
+///   `EnableFrameAcks` to viewers and `FrameAck` from them. Each is only
+///   sent to a peer that said it speaks version 7, so older agents and
+///   viewers keep working at a fixed bitrate.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Oldest agent and viewer protocol that takes part in adaptive bitrate.
+pub const MIN_ADAPTIVE_VERSION: u32 = 7;
 
 /// Oldest agent protocol that serves [`StreamOpen`] streams.
 pub const MIN_REMOTE_OPS_VERSION: u32 = 5;
@@ -154,6 +161,24 @@ pub enum Message {
     /// technicians. At most [`MAX_HOSTNAME_LEN`] bytes; the server trims and
     /// cleans it (see `sanitize_hostname`).
     AgentInfo { hostname: String },
+
+    // --- Adaptive bitrate (Phase 9) -------------------------------------
+    //
+    // The agent encodes one stream for every viewer, so its bitrate must
+    // suit its own uplink *and* the slowest viewer's downlink. Both are
+    // measured the same way: acknowledgements of frame sequence numbers
+    // give round trips on the sender's own clock, and a round trip above
+    // the recent minimum is time spent queued. See `media::StreamReport`.
+    /// Server to agent (version 7+), a few times a second while frames
+    /// arrive: delivery of the agent's video, and the viewers' delay.
+    StreamReport(media::StreamReport),
+    /// Server to viewer (version 7+), after `ViewerWelcome`: acknowledge
+    /// frames with `FrameAck`. Viewers never send `FrameAck` unasked, so a
+    /// new viewer does not upset an older server.
+    EnableFrameAcks,
+    /// Viewer to server, periodically once enabled: the newest frame
+    /// received.
+    FrameAck { seq: u64 },
 }
 
 /// Longest hostname the server stores, in bytes (the DNS limit).
@@ -281,6 +306,24 @@ mod tests {
         // Variant 24: indices 0-23 are unchanged for older peers.
         assert_eq!(bytes[0], 24);
         assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn adaptive_bitrate_messages_are_appended_after_agent_info() {
+        let msgs = [
+            Message::StreamReport(media::StreamReport {
+                seq: 7,
+                bytes: 1 << 20,
+                viewer_delay_ms: 35,
+            }),
+            Message::EnableFrameAcks,
+            Message::FrameAck { seq: 99 },
+        ];
+        for (i, msg) in msgs.into_iter().enumerate() {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            assert_eq!(usize::from(bytes[0]), 25 + i);
+            assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+        }
     }
 
     #[test]

@@ -147,6 +147,7 @@ async fn rig_as(kind: DeviceKind) -> Rig {
         .token;
     let credential = agent::enroll::enroll(&agent::enroll::EnrollOptions {
         server_addr: addr,
+        transport: Default::default(),
         server_name: "localhost".into(),
         server_ca_pem: certs.ca_cert.clone(),
         token,
@@ -224,6 +225,7 @@ impl Rig {
     fn options(&self, token: String) -> ViewerOptions {
         ViewerOptions {
             server: self.addr,
+            transport: Default::default(),
             server_name: "localhost".into(),
             ca_pem: self.certs.ca_cert.clone(),
             token,
@@ -540,6 +542,16 @@ async fn nobody_logged_on_follows_on_no_user() {
 async fn concurrent_technicians_each_toast_and_ctrl_f12_drops_them_all() {
     let rig = rig().await;
     let jane = create_user(&rig.db.pool, "jane", Role::SupportEngineer).await;
+    // Engineers need a grant: remote desktop on this agent only.
+    server::access::create_grant(
+        &rig.db.pool,
+        "root",
+        jane.user.id,
+        server::access::Scope::Agent(rig.agent_id.clone()),
+        &[server::users::Capability::Desktop].into(),
+    )
+    .await
+    .unwrap();
 
     let (_root_viewer, mut root_events) = rig.connect().await;
     let (jane_viewer, mut jane_events) = rig.connect_as(&jane).await.0.unwrap();

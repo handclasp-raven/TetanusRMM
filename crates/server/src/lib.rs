@@ -3,6 +3,9 @@
 //! - [`quic`]: QUIC listener for agents (mutual TLS, heartbeats).
 //! - [`api`]: HTTPS API for users.
 //! - [`auth`], [`users`]: Argon2id passwords, TOTP, sessions, roles.
+//! - [`access`]: role- and grant-based access to agents (RBAC).
+//! - [`groups`]: agent groups.
+//! - [`metrics`]: Prometheus metrics.
 //! - [`audit`]: hash-chained audit log.
 //! - [`registry`]: agents and per-device policies.
 //! - [`enroll`]: enrollment tokens and the internal CA for agent certificates.
@@ -12,12 +15,15 @@
 //! - [`remote`]: remote shell, script runner and file transfer, relayed to
 //!   agents for API clients (no viewer needed).
 
+pub mod access;
 pub mod api;
 pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
 pub mod enroll;
+pub mod groups;
+pub mod metrics;
 pub mod quic;
 pub mod registry;
 pub mod relay;

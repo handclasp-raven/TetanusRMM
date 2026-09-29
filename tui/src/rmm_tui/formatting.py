@@ -41,7 +41,14 @@ def ago(when: datetime | None, now: datetime | None = None) -> str:
 def status(agent: Agent) -> str:
     if agent.enrollment_state == "revoked":
         return "revoked"
-    return "online" if agent.online else "offline"
+    if not agent.online:
+        return "offline"
+    # On the WebSocket fallback: worth knowing when a session feels slow.
+    return "online (ws)" if agent.transport == "websocket" else "online"
+
+
+def groups(agent: Agent) -> str:
+    return ", ".join(agent.groups) or "–"
 
 
 def sessions(agent: Agent) -> str:
@@ -54,10 +61,12 @@ def sessions(agent: Agent) -> str:
 
 
 def agent_row(agent: Agent, now: datetime | None = None) -> tuple[str, ...]:
-    """Cells in column order: host, status, last seen, CPU, RAM, disk, sessions."""
+    """Cells in column order: host, status, groups, last seen, CPU, RAM,
+    disk, sessions."""
     return (
         agent.label,
         status(agent),
+        groups(agent),
         ago(agent.last_seen, now),
         cpu(agent.cpu_percent),
         usage(agent.mem_used_bytes, agent.mem_total_bytes),

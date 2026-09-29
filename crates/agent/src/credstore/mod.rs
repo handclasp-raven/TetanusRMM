@@ -32,6 +32,10 @@ pub struct Credential {
     pub server_addr: SocketAddr,
     pub server_name: String,
     pub api_url: String,
+    /// Transport settings from enrollment. Credentials from before the
+    /// WebSocket fallback existed get the default (auto, same port).
+    #[serde(default)]
+    pub transport: transport::TransportSettings,
 }
 
 // Keep the private key out of logs and panic messages.
@@ -42,6 +46,7 @@ impl std::fmt::Debug for Credential {
             .field("server_addr", &self.server_addr)
             .field("server_name", &self.server_name)
             .field("api_url", &self.api_url)
+            .field("transport", &self.transport)
             .finish_non_exhaustive()
     }
 }
@@ -51,6 +56,7 @@ impl Credential {
     pub fn agent_config(&self, heartbeat_interval: Duration) -> Result<AgentConfig, StoreError> {
         Ok(AgentConfig {
             server_addr: self.server_addr,
+            transport: self.transport,
             server_name: self.server_name.clone(),
             agent_id: self.agent_id.clone(),
             server_ca: common::tls::certs_from_pem(&self.ca_pem)?,
@@ -164,6 +170,7 @@ mod tests {
             server_addr: "127.0.0.1:4433".parse().unwrap(),
             server_name: "localhost".into(),
             api_url: "https://localhost:8443".into(),
+            transport: Default::default(),
         }
     }
 
@@ -204,6 +211,19 @@ mod tests {
         blob[mid] ^= 0x01;
         std::fs::write(&path, blob).unwrap();
         assert!(matches!(store.load(), Err(StoreError::Decrypt)));
+    }
+
+    #[test]
+    fn credentials_saved_before_the_websocket_fallback_still_load() {
+        let old = r#"{"agent_id":"agt-1","cert_pem":"c","key_pem":"k","ca_pem":"ca",
+            "server_addr":"192.168.122.1:4433","server_name":"localhost",
+            "api_url":"https://192.168.122.1:8443"}"#;
+        let credential: Credential = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            credential.transport,
+            transport::TransportSettings::default()
+        );
+        assert_eq!(credential.transport.mode, transport::TransportMode::Auto);
     }
 
     #[test]

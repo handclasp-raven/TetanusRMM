@@ -1,16 +1,22 @@
-//! Finding the logged-on console user and starting the helper in their session.
+//! Finding the logged-on console user and starting the helpers in their
+//! session: the session helper as the user, the input helper as SYSTEM.
 
 use std::ffi::c_void;
 use std::path::Path;
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+use windows::Win32::Security::{
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_QUERY,
+};
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, ResumeThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// No session is attached to the physical console (e.g. mid-switch).
@@ -108,9 +114,9 @@ impl Drop for EnvironmentBlock {
 ///
 /// It runs with the *user's* token rather than SYSTEM's. That is what a
 /// process on the user's desktop should have, and it keeps a compromised
-/// helper from being a SYSTEM process in an unprivileged session. (Driving
-/// the secure desktop for UAC and the logon screen needs a SYSTEM token in
-/// the session; that is Phase 9.)
+/// helper from being a SYSTEM process in an unprivileged session. Only the
+/// input helper, which has no windows, runs as SYSTEM (see
+/// [`spawn_system_in_session`]).
 pub fn spawn_in_session(
     session_id: u32,
     exe: &Path,
@@ -123,7 +129,63 @@ pub fn spawn_in_session(
     // SAFETY: out-parameter, freed by the guard.
     unsafe { CreateEnvironmentBlock(&mut env, Some(token.0), false)? };
     let env = EnvironmentBlock(env);
+    create_on_desktop(&token, Some(&env), session_id, exe, args)
+}
 
+/// Start `exe args` as SYSTEM, but in `session_id` on its interactive
+/// desktop, suspended like [`spawn_in_session`].
+///
+/// This is for the input helper. Windows drops input from a lower
+/// integrity level aimed at a higher one (UIPI), so a helper running as the
+/// user cannot type into elevated windows; one running as SYSTEM can.
+/// Moving a token to another session needs SE_TCB_NAME, which LocalSystem
+/// has.
+pub fn spawn_system_in_session(
+    session_id: u32,
+    exe: &Path,
+    args: &str,
+) -> windows::core::Result<HelperProcess> {
+    let mut own = HANDLE::default();
+    // SAFETY: pseudo-handle for this process; out-parameter owned below.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut own)? };
+    let own = OwnedHandle(own);
+    let mut token = HANDLE::default();
+    // SAFETY: valid token handle; out-parameter owned below.
+    unsafe {
+        DuplicateTokenEx(
+            own.0,
+            TOKEN_ASSIGN_PRIMARY
+                | TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut token,
+        )?
+    };
+    let token = OwnedHandle(token);
+    // SAFETY: the buffer is a u32, the size TokenSessionId expects.
+    unsafe {
+        SetTokenInformation(
+            token.0,
+            TokenSessionId,
+            std::ptr::from_ref(&session_id).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )?
+    };
+    // No environment block: it inherits the service's (SYSTEM's).
+    create_on_desktop(&token, None, session_id, exe, args)
+}
+
+fn create_on_desktop(
+    token: &OwnedHandle,
+    env: Option<&EnvironmentBlock>,
+    session_id: u32,
+    exe: &Path,
+    args: &str,
+) -> windows::core::Result<HelperProcess> {
     let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -147,7 +209,7 @@ pub fn spawn_in_session(
             None,
             false,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
-            Some(env.0),
+            env.map(|e| e.0.cast_const()),
             PCWSTR::null(),
             &startup,
             &mut info,

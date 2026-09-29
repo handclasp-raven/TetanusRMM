@@ -4,9 +4,13 @@
 //! The helper can come and go (logon, logoff, crash, update) independently
 //! of the server connection. The bridge remembers what the server wants
 //! (which monitor, or nothing) and who is connected (the tray list), and
-//! replays both to each newly attached helper, so a stream and the tray
-//! survive a helper restart. A consent prompt that cannot reach a helper,
-//! or whose helper goes away, is answered `Unavailable`.
+//! replays both (and any adaptive-bitrate target) to each newly attached
+//! helper, so a stream and the tray survive a helper restart. A consent
+//! prompt that cannot reach a helper, or whose helper goes away, is
+//! answered `Unavailable`.
+//!
+//! Input goes to the input helper (SYSTEM, so it reaches elevated windows)
+//! when one is attached, and to the session helper otherwise.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +27,11 @@ use crate::media::source::{MediaCommand, MediaEvent, MediaSourceEnd};
 #[derive(Default)]
 struct State {
     helper: Option<mpsc::UnboundedSender<IpcMessage>>,
+    /// The input helper, if attached.
+    injector: Option<mpsc::UnboundedSender<IpcMessage>>,
     monitor: Option<u32>,
+    /// Adaptive-bitrate target, if lowered (cleared by a stop).
+    bitrate: Option<u32>,
     /// A frame was dropped here; ask the helper for a keyframe (once).
     resync_requested: bool,
     /// Who is connected, for the tray.
@@ -83,9 +91,14 @@ impl Bridge {
             }
             MediaCommand::Stop => {
                 state.monitor = None;
+                state.bitrate = None;
                 IpcMessage::StopCapture
             }
             MediaCommand::ForceKeyframe => IpcMessage::ForceKeyframe,
+            MediaCommand::SetBitrate(bps) => {
+                state.bitrate = Some(bps);
+                IpcMessage::SetBitrate { bps }
+            }
         };
         if let Some(helper) = &state.helper {
             let _ = helper.send(message);
@@ -124,7 +137,14 @@ impl Bridge {
                 state.technicians = list.clone();
                 IpcMessage::Technicians(list)
             }
-            DesktopCommand::Input(event) => IpcMessage::Input(event),
+            DesktopCommand::Input(event) => {
+                if let Some(injector) = &state.injector {
+                    if injector.send(IpcMessage::Input(event)).is_ok() {
+                        return;
+                    }
+                }
+                IpcMessage::Input(event)
+            }
             DesktopCommand::SetClipboard(data) => IpcMessage::SetClipboard(data),
         };
         if let Some(helper) = &state.helper {
@@ -136,6 +156,9 @@ impl Bridge {
     pub fn attach(&self, helper: mpsc::UnboundedSender<IpcMessage>) {
         let mut state = self.state();
         let _ = helper.send(IpcMessage::ListMonitors);
+        if let Some(bps) = state.bitrate {
+            let _ = helper.send(IpcMessage::SetBitrate { bps });
+        }
         if let Some(monitor) = state.monitor {
             let _ = helper.send(IpcMessage::StartCapture { monitor });
         }
@@ -143,13 +166,38 @@ impl Bridge {
         state.helper = Some(helper);
     }
 
-    pub fn detach(&self) {
+    /// `helper` disconnected. Ignored if another helper has attached since.
+    pub fn detach(&self, helper: &mpsc::UnboundedSender<IpcMessage>) {
         let mut state = self.state();
+        if !state
+            .helper
+            .as_ref()
+            .is_some_and(|h| h.same_channel(helper))
+        {
+            return;
+        }
         state.helper = None;
         // Their prompts went with the helper.
         for (request_id, reply) in state.prompts.drain() {
             info!(request_id, "helper gone while a consent prompt was open");
             let _ = reply.send(PromptAnswer::Unavailable);
+        }
+    }
+
+    /// An input helper connected: input goes to it from now on.
+    pub fn attach_injector(&self, injector: mpsc::UnboundedSender<IpcMessage>) {
+        self.state().injector = Some(injector);
+    }
+
+    /// `injector` disconnected: input falls back to the session helper.
+    pub fn detach_injector(&self, injector: &mpsc::UnboundedSender<IpcMessage>) {
+        let mut state = self.state();
+        if state
+            .injector
+            .as_ref()
+            .is_some_and(|i| i.same_channel(injector))
+        {
+            state.injector = None;
         }
     }
 

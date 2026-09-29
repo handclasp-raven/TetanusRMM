@@ -143,6 +143,31 @@ impl Sessions {
     }
 }
 
+/// Most names the on-screen indicator lists before "+N more".
+const INDICATOR_NAMES: usize = 3;
+
+/// The on-screen session indicator's text for the technicians the user
+/// should see (see [`Sessions::technicians`]), or `None` to hide it.
+/// A technician with several viewers open is named once.
+pub fn indicator_text(technicians: &[String]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    for t in technicians {
+        if !names.contains(&t.as_str()) {
+            names.push(t);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut who = names[..names.len().min(INDICATOR_NAMES)].join(", ");
+    if names.len() > INDICATOR_NAMES {
+        who += &format!(" +{} more", names.len() - INDICATOR_NAMES);
+    }
+    Some(format!(
+        "Remote support session: {who} \u{b7} Ctrl+F12 to end"
+    ))
+}
+
 /// Commands for whatever owns the user's desktop.
 #[derive(Debug)]
 pub enum DesktopCommand {
@@ -363,6 +388,20 @@ mod tests {
         assert_eq!(s.technicians(), ["jane", "sam", "jane"]);
         s.ended(7);
         assert_eq!(s.technicians(), ["jane", "jane"]);
+    }
+
+    #[test]
+    fn indicator_names_each_technician_once_and_hides_when_nobody_is_there() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(indicator_text(&[]), None);
+        assert_eq!(
+            indicator_text(&names(&["jane", "sam", "jane"])).as_deref(),
+            Some("Remote support session: jane, sam \u{b7} Ctrl+F12 to end")
+        );
+        assert_eq!(
+            indicator_text(&names(&["a", "b", "c", "d", "e", "a"])).as_deref(),
+            Some("Remote support session: a, b, c +2 more \u{b7} Ctrl+F12 to end")
+        );
     }
 
     #[tokio::test]

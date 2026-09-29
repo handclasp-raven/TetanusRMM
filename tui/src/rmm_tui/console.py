@@ -141,10 +141,13 @@ class ConsoleScreen(Screen):
             else:
                 self.set_status("[red]The connection closed.[/red] Esc to close.")
         finally:
-            self.input.disabled = True
-            self._dirty = True
-            await self.connection.close()
-            self.connection = None
+            connection, self.connection = self.connection, None
+            # Closing the screen with Esc cancels this worker after the
+            # widgets are gone, so only touch them while still attached.
+            if self.is_attached:
+                self.input.disabled = True
+                self._dirty = True
+            await connection.close()
 
     def redraw(self) -> None:
         if self._dirty and self.terminal is not None:

@@ -9,11 +9,13 @@ directly. What it does:
 - **Agents:** a live table showing hostname, status, last seen, CPU, RAM,
   disk and active sessions.
 - **Remote desktop:** starts the native viewer for the selected agent. The
-  TUI doesn't render video itself.
+  TUI doesn't render video itself. Quitting the TUI closes every viewer
+  window it opened.
 - **Shell console:** interactive PowerShell on the agent, in a pane. Needs
   **no viewer**.
-- **Script runner:** runs a command or script on one or more agents and
-  shows each agent's stdout, stderr and exit code. Also needs **no viewer**.
+- **Script runner:** runs a command or script on one or more agents, or on
+  whole agent groups, and shows each agent's stdout, stderr and exit code.
+  Also needs **no viewer**.
   Saved scripts live in a small local library.
 - **Audit log:** recent entries and a chain check (admins and auditors).
 
@@ -120,10 +122,16 @@ server-side session then expires on its own.
 | `l` | Sign out |
 | `q` | Quit |
 
-The footer shows only the actions your role allows. An **auditor** sees the
-agent table and the audit log, but not remote desktop, shell or scripts. The
-server enforces the same rules: a refused request returns 403 and is audited
-as `permission.denied`.
+The footer shows only the actions you may take on the **selected agent**. A
+**support engineer** only sees the agents an admin has granted them, and
+only gets remote desktop, shell or scripts where their grant covers that
+(the server says so per agent). An **auditor** sees the agent table and the
+audit log, but no control actions. The server enforces the same rules: a
+refused request returns 403 and is audited as `permission.denied`.
+
+The **Status** column says `online (ws)` for an agent connected over the
+WebSocket fallback (its network blocks UDP), and **Groups** lists its agent
+groups.
 
 **Shell console:** type a command in the input box and press Enter. The
 output pane is a VT terminal emulator, so colours and cursor movement render
@@ -134,7 +142,9 @@ correctly, and scrollback is kept.
 - The PTY follows the pane's size, so resizing your terminal resizes it too.
 
 **Script runner:**
-1. Tick targets with `Space`.
+1. Tick targets with `Space`: agents (only those you may run scripts on),
+   and/or groups. A group's members are decided by the server when the run
+   starts, so an agent that joined it meanwhile is included.
 2. Type a script, or load a saved one with `Enter`.
 3. Optionally set a timeout (1–3600 s; default 300).
 4. Press `Ctrl+R`.

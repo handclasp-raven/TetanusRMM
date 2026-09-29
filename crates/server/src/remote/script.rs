@@ -237,6 +237,7 @@ pub async fn run(
     )
     .await?;
     let run_id = started.id;
+    crate::metrics::get().script_runs.inc();
     info!(run_id, user = %user.username, agents = agent_ids.len(), "script run started");
 
     let outcomes = join_all(agent_ids.iter().map(|id| {
@@ -245,6 +246,19 @@ pub async fn run(
     }))
     .await;
     let (results, summary) = aggregate(&agent_ids, outcomes);
+    for result in &results {
+        let status = match result.status {
+            Status::Completed => "completed",
+            Status::TimedOut => "timed_out",
+            Status::Offline => "offline",
+            Status::Unsupported => "unsupported",
+            Status::Failed => "failed",
+        };
+        crate::metrics::get()
+            .script_results
+            .get_or_create(&crate::metrics::StatusLabels { status })
+            .inc();
+    }
 
     audit::append_now(
         pool,

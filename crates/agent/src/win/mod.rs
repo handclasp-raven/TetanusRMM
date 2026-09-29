@@ -7,14 +7,21 @@
 //!  ┌──────────────────────────────┐       ┌─────────────────────────────┐
 //!  │ rmm-agent.exe service run    │ spawn │ rmm-agent.exe helper        │
 //!  │ LocalSystem, auto-start      │──────▶│ runs as the logged-on user  │
-//!  │ - QUIC + heartbeat/telemetry │       │ - tray icon, Ctrl+F12       │
+//!  │ - QUIC + heartbeat/telemetry │       │ - tray, indicator, Ctrl+F12 │
 //!  │ - updates                    │◀─────▶│ - capture + encode          │
 //!  │ - consent decisions          │ pipe  │ - input, clipboard          │
-//!  │ - supervises the helper      │       │ - consent prompt, toasts    │
-//!  └──────────────────────────────┘       └─────────────────────────────┘
+//!  │ - supervises the helpers     │       │ - consent prompt, toasts    │
+//!  │                              │       └─────────────────────────────┘
+//!  │                              │ spawn ┌─────────────────────────────┐
+//!  │                              │──────▶│ rmm-agent.exe input-helper  │
+//!  │                              │◀─────▶│ runs as SYSTEM, no windows  │
+//!  └──────────────────────────────┘ pipe  │ - input into any window,    │
+//!                                         │   elevated ones included    │
+//!                                         └─────────────────────────────┘
 //! ```
 //!
-//! See [`crate::session`] for why the helper exists.
+//! See [`crate::session`] for why the helper exists, and [`input_helper`]
+//! for why input has a process of its own.
 
 pub mod acl;
 pub mod bridge;
@@ -25,7 +32,9 @@ pub mod conpty;
 pub mod consent;
 pub mod encoder;
 pub mod helper;
+pub mod indicator;
 pub mod input;
+pub mod input_helper;
 pub mod pipe;
 pub mod process;
 pub mod service;

@@ -58,16 +58,15 @@ fn transport(keep_alive: Option<Duration>) -> quinn::TransportConfig {
     transport
 }
 
-/// Server-side QUIC config: presents `identity`. A client certificate is
-/// optional, but if one is presented it must chain to one of `client_ca`.
-///
-/// Certificate-less connections are allowed only so unenrolled agents can
-/// enroll. The server's connection handler admits exactly one `Enroll`
-/// message on them and nothing else (see `server::quic`).
-pub fn server_config(
+/// rustls config for the server end of an agent/viewer connection, shared by
+/// QUIC and the WebSocket fallback so both enforce the same policy: TLS 1.3,
+/// presents `identity`, and a client certificate is optional but, if
+/// presented, must chain to one of `client_ca`.
+pub fn mutual_tls_server(
     identity: &Identity,
     client_ca: &[CertificateDer<'static>],
-) -> Result<quinn::ServerConfig, TlsError> {
+    alpn: &[u8],
+) -> Result<rustls::ServerConfig, TlsError> {
     let provider = provider();
     // WebPkiClientVerifier rejects the handshake if the client sends a
     // certificate that does not chain to `client_ca`. `allow_unauthenticated`
@@ -82,8 +81,40 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(verifier)
         .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?;
-    tls.alpn_protocols = vec![protocol::ALPN.to_vec()];
+    tls.alpn_protocols = vec![alpn.to_vec()];
+    Ok(tls)
+}
 
+/// rustls config for the client end (agent, viewer): TLS 1.3, trusts only
+/// `server_ca`, and presents `identity` as the client certificate when one
+/// is given.
+pub fn mutual_tls_client(
+    server_ca: &[CertificateDer<'static>],
+    identity: Option<&Identity>,
+    alpn: &[u8],
+) -> Result<rustls::ClientConfig, TlsError> {
+    let builder = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(root_store(server_ca)?);
+    let mut tls = match identity {
+        Some(id) => builder.with_client_auth_cert(id.cert_chain.clone(), id.key.clone_key())?,
+        None => builder.with_no_client_auth(),
+    };
+    tls.alpn_protocols = vec![alpn.to_vec()];
+    Ok(tls)
+}
+
+/// Server-side QUIC config: presents `identity`. A client certificate is
+/// optional, but if one is presented it must chain to one of `client_ca`.
+///
+/// Certificate-less connections are allowed only so unenrolled agents can
+/// enroll. The server's connection handler admits exactly one `Enroll`
+/// message on them and nothing else (see `server::quic`).
+pub fn server_config(
+    identity: &Identity,
+    client_ca: &[CertificateDer<'static>],
+) -> Result<quinn::ServerConfig, TlsError> {
+    let tls = mutual_tls_server(identity, client_ca, protocol::ALPN)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     config.transport_config(Arc::new(transport(None)));
 
@@ -109,15 +140,7 @@ pub fn client_config(
     server_ca: &[CertificateDer<'static>],
     identity: Option<&Identity>,
 ) -> Result<quinn::ClientConfig, TlsError> {
-    let builder = rustls::ClientConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(root_store(server_ca)?);
-    let mut tls = match identity {
-        Some(id) => builder.with_client_auth_cert(id.cert_chain.clone(), id.key.clone_key())?,
-        None => builder.with_no_client_auth(),
-    };
-    tls.alpn_protocols = vec![protocol::ALPN.to_vec()];
-
+    let tls = mutual_tls_client(server_ca, identity, protocol::ALPN)?;
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     config.transport_config(Arc::new(transport(Some(KEEP_ALIVE_INTERVAL))));
     Ok(config)

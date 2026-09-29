@@ -17,6 +17,22 @@ pub struct ServeConfig {
     #[arg(long, env = "RMM_QUIC_LISTEN", default_value = "0.0.0.0:4433")]
     pub quic_listen: SocketAddr,
 
+    /// TCP address for the WebSocket-over-TLS fallback, for agents and
+    /// viewers on networks that block UDP. Same port number as QUIC by
+    /// default, so clients need only one `host:port`.
+    #[arg(long, env = "RMM_WS_LISTEN", default_value = "0.0.0.0:4433")]
+    pub ws_listen: SocketAddr,
+
+    /// Disable the WebSocket fallback (QUIC only).
+    #[arg(long, env = "RMM_NO_WEBSOCKET")]
+    pub no_websocket: bool,
+
+    /// Serve Prometheus metrics over plain HTTP at /metrics on this address
+    /// (e.g. 127.0.0.1:9464). Off unless set. Reachable only by the
+    /// monitoring system: it needs no credentials.
+    #[arg(long, env = "RMM_METRICS_LISTEN")]
+    pub metrics_listen: Option<SocketAddr>,
+
     /// TCP address for the HTTPS API.
     #[arg(long, env = "RMM_API_LISTEN", default_value = "0.0.0.0:8443")]
     pub api_listen: SocketAddr,
@@ -57,6 +73,11 @@ pub struct ServeConfig {
 }
 
 impl ServeConfig {
+    /// Where the WebSocket fallback listens, unless it is disabled.
+    pub fn ws_listen(&self) -> Option<SocketAddr> {
+        (!self.no_websocket).then_some(self.ws_listen)
+    }
+
     /// Certificate presented to agents over QUIC.
     pub fn quic_identity(&self) -> Result<Identity, TlsError> {
         Identity::from_files(

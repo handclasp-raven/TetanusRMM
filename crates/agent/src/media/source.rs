@@ -13,9 +13,15 @@ use tokio::sync::{mpsc, Mutex};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaCommand {
     ListMonitors,
-    Start { monitor: u32 },
+    Start {
+        monitor: u32,
+    },
+    /// Stop capturing. The encoder also forgets any `SetBitrate`.
     Stop,
     ForceKeyframe,
+    /// Encode at most this many bits per second (adaptive bitrate, see
+    /// `media::rate`), for this stream and later ones until `Stop`.
+    SetBitrate(u32),
 }
 
 #[derive(Debug, Clone)]

@@ -38,6 +38,7 @@ async fn start_agent(
     pool: &sqlx::PgPool,
     certs: &common::devcerts::DevCerts,
     addr: std::net::SocketAddr,
+    transport: transport::TransportSettings,
 ) -> String {
     let token = server::enroll::create_token(pool, "root", Duration::from_secs(600))
         .await
@@ -45,6 +46,7 @@ async fn start_agent(
         .token;
     let credential = agent::enroll::enroll(&agent::enroll::EnrollOptions {
         server_addr: addr,
+        transport,
         server_name: "localhost".into(),
         server_ca_pem: certs.ca_cert.clone(),
         token,
@@ -64,6 +66,7 @@ async fn rig() -> Rig {
     let certs = common::devcerts::generate("unused").unwrap();
     let (quic, addr, _events) = support::start_quic(db.pool.clone(), &certs);
     let hub = quic.hub();
+    let ws_addr = quic.ws_local_addr().unwrap();
     std::mem::forget(quic);
     let api = support::start_api_full(
         db.pool.clone(),
@@ -73,9 +76,21 @@ async fn rig() -> Rig {
     )
     .await;
 
+    // The first agent is on QUIC, the second on the WebSocket fallback
+    // (enrolled and connected over it), so every remote operation below
+    // runs over both transports: a shell and file transfers on each, and
+    // scripts fanned out across the two.
+    let quic_only = transport::TransportSettings {
+        mode: transport::TransportMode::Quic,
+        ws_addr: None,
+    };
+    let websocket = transport::TransportSettings {
+        mode: transport::TransportMode::WebSocket,
+        ws_addr: Some(ws_addr),
+    };
     let mut agents = Vec::new();
-    for _ in 0..2 {
-        agents.push(start_agent(&db.pool, &certs, addr).await);
+    for transport in [quic_only, websocket] {
+        agents.push(start_agent(&db.pool, &certs, addr, transport).await);
     }
     timeout(DEADLINE, async {
         while !agents.iter().all(|a| hub.is_online(a)) {
@@ -212,9 +227,15 @@ fn data(len: usize) -> Vec<u8> {
 async fn interactive_shell_over_a_websocket_with_resize() {
     let rig = rig().await;
     let token = rig.session(&rig.admin).await;
-    let agent = &rig.agents[0];
+    // Once on the QUIC agent, once on the WebSocket one.
+    for (n, agent) in rig.agents.iter().enumerate() {
+        shell_session(&rig, &token, agent, n).await;
+    }
+}
+
+async fn shell_session(rig: &Rig, token: &str, agent: &str, n: usize) {
     let mut ws = rig
-        .shell(&token, agent, "?cols=80&rows=24")
+        .shell(token, agent, "?cols=80&rows=24")
         .await
         .expect("shell opens");
 
@@ -261,21 +282,18 @@ async fn interactive_shell_over_a_websocket_with_resize() {
     ));
 
     let opens = rig.audit("shell.open").await;
-    assert_eq!(opens.len(), 1);
-    let (actor, target, detail) = &opens[0];
-    assert_eq!(
-        (actor.as_str(), target.as_deref()),
-        ("root", Some(agent.as_str()))
-    );
+    assert_eq!(opens.len(), n + 1);
+    let (actor, target, detail) = &opens[n];
+    assert_eq!((actor.as_str(), target.as_deref()), ("root", Some(agent)));
     assert_eq!(detail["started"], true);
     assert_eq!(
         (detail["cols"].clone(), detail["rows"].clone()),
         (json!(80), json!(24))
     );
 
-    let closes = rig.wait_for_audit("shell.close", 1).await;
-    let (_, target, detail) = &closes[0];
-    assert_eq!(target.as_deref(), Some(agent.as_str()));
+    let closes = rig.wait_for_audit("shell.close", n + 1).await;
+    let (_, target, detail) = &closes[n];
+    assert_eq!(target.as_deref(), Some(agent));
     assert_eq!(detail["exit_code"], 3);
     assert_eq!(detail["ended_by"], "exit");
     assert!(detail["bytes_in"].as_u64().unwrap() > 0);
@@ -698,10 +716,11 @@ async fn agent_list_shows_hostname_online_state_and_open_shells() {
     })
     .await
     .expect("hostnames recorded");
-    for id in &rig.agents {
+    for (id, transport) in rig.agents.iter().zip(["quic", "websocket"]) {
         let agent = find(&agents, id);
         assert_eq!(agent["hostname"], expected_host.as_str());
         assert_eq!(agent["online"], true);
+        assert_eq!(agent["transport"], transport);
         assert_eq!(agent["viewer_sessions"], 0);
         assert_eq!(agent["shell_sessions"], 0);
     }

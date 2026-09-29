@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import signal
 import socket
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +18,7 @@ from rmm_tui.viewer import (
     ViewerCommand,
     ViewerError,
     build_command,
+    close_all,
     launch,
     pick_address,
     split_host_port,
@@ -118,6 +121,27 @@ def test_launch_runs_the_viewer_detached_with_its_output_logged(tmp_path) -> Non
 # --- config ---------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_close_all_terminates_viewers_and_kills_stubborn_ones() -> None:
+    sleep = "import time; time.sleep(60)"
+    stubborn = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        " print(flush=True); time.sleep(60)"
+    )
+    polite = subprocess.Popen([sys.executable, "-c", sleep])
+    ignores_term = subprocess.Popen([sys.executable, "-c", stubborn], stdout=subprocess.PIPE)
+    ignores_term.stdout.readline()  # its handler is installed
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    done.wait()
+
+    close_all([polite, ignores_term, done], timeout=0.5)
+
+    assert polite.returncode == -signal.SIGTERM
+    assert ignores_term.returncode == -signal.SIGKILL
+    assert done.returncode == 0
+    ignores_term.stdout.close()
+
+
 def test_config_file_with_relative_paths(tmp_path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
@@ -175,6 +199,7 @@ def test_agent_row() -> None:
     assert formatting.agent_row(make_agent(viewer_sessions=2, shell_sessions=1), NOW) == (
         "WS-01",
         "online",
+        "–",
         "5s ago",
         "37%",
         "38% of 16.0 GiB",
@@ -192,6 +217,7 @@ def test_agent_row() -> None:
     assert formatting.agent_row(empty, NOW) == (
         "agt-1",
         "offline",
+        "–",
         "never",
         "–",
         "–",
@@ -199,6 +225,39 @@ def test_agent_row() -> None:
         "–",
     )
     assert formatting.status(make_agent(enrollment_state="revoked")) == "revoked"
+    # The WebSocket fallback is worth a mention; groups are listed.
+    fallback = make_agent(transport="websocket", groups=("Branch", "Servers"))
+    row = formatting.agent_row(fallback, NOW)
+    assert row[1:3] == ("online (ws)", "Branch, Servers")
+
+
+def test_capabilities_decide_per_agent_and_the_role_is_the_fallback() -> None:
+    from rmm_tui.api import User
+
+    engineer = User(id=1, username="jane", role="support_engineer")
+    auditor = User(id=2, username="carol", role="auditor")
+    granted = make_agent(capabilities=frozenset({"desktop"}))
+    assert granted.allows("desktop", engineer)
+    assert not granted.allows("shell", engineer)
+    # An older server sends no capabilities: the role decides.
+    legacy = make_agent()
+    assert legacy.allows("shell", engineer)
+    assert not legacy.allows("shell", auditor)
+    parsed = Agent.from_json(
+        {
+            "id": "agt-9",
+            "enrollment_state": "enrolled",
+            "online": True,
+            "transport": "websocket",
+            "groups": ["Branch"],
+            "capabilities": ["script"],
+        }
+    )
+    assert (parsed.transport, parsed.groups, parsed.capabilities) == (
+        "websocket",
+        ("Branch",),
+        frozenset({"script"}),
+    )
 
 
 @pytest.mark.parametrize(

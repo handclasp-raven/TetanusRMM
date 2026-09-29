@@ -84,6 +84,16 @@ impl SourceLog {
     fn commands(&self) -> Vec<MediaCommand> {
         self.commands.lock().unwrap().clone()
     }
+    fn bitrates(&self) -> Vec<u32> {
+        self.commands()
+            .iter()
+            .filter_map(|c| match c {
+                MediaCommand::SetBitrate(bps) => Some(*bps),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn starts(&self) -> usize {
         self.commands()
             .iter()
@@ -125,6 +135,8 @@ fn run_source(end: MediaSourceEnd, log: Arc<SourceLog>) {
                                     e.force_intra_frame();
                                 }
                             }
+                            // Logged above; the test encoder's rate is fixed.
+                            MediaCommand::SetBitrate(_) => {}
                         }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -156,6 +168,7 @@ struct Rig {
     db: support::TestDb,
     certs: common::devcerts::DevCerts,
     addr: std::net::SocketAddr,
+    transport: transport::TransportSettings,
     api: Api,
     agent_id: String,
     log: Arc<SourceLog>,
@@ -163,9 +176,18 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
+    rig_on(transport::TransportMode::Auto).await
+}
+
+/// A rig whose agent and viewers all use `mode`.
+async fn rig_on(mode: transport::TransportMode) -> Rig {
     let db = start_db().await;
     let certs = common::devcerts::generate("unused").unwrap();
     let (quic, addr, _events) = support::start_quic(db.pool.clone(), &certs);
+    let transport = transport::TransportSettings {
+        mode,
+        ws_addr: quic.ws_local_addr(),
+    };
     let api = start_api_full(
         db.pool.clone(),
         &certs,
@@ -182,6 +204,7 @@ async fn rig() -> Rig {
         .token;
     let credential = agent::enroll::enroll(&agent::enroll::EnrollOptions {
         server_addr: addr,
+        transport,
         server_name: "localhost".into(),
         server_ca_pem: certs.ca_cert.clone(),
         token,
@@ -207,6 +230,7 @@ async fn rig() -> Rig {
         db,
         certs,
         addr,
+        transport,
         api,
         agent_id,
         log,
@@ -239,6 +263,7 @@ impl Rig {
     fn options(&self, token: String) -> ViewerOptions {
         ViewerOptions {
             server: self.addr,
+            transport: self.transport,
             server_name: "localhost".into(),
             ca_pem: self.certs.ca_cert.clone(),
             token,
@@ -306,6 +331,65 @@ fn assert_colour(p: &Picture, expect: (u8, u8, u8)) {
 
 const RED: (u8, u8, u8) = (255, 0, 0);
 const BLUE: (u8, u8, u8) = (0, 0, 255);
+
+#[tokio::test]
+async fn streaming_and_monitor_switching_work_over_the_websocket_fallback() {
+    // Agent and viewers all on WebSocket over TLS: what a UDP-blocked
+    // network gets. Same relay, same fan-out, same frames.
+    let rig = rig_on(transport::TransportMode::WebSocket).await;
+    let mut a = rig.viewer().await;
+    assert_eq!(a.handle.transport(), transport::TransportKind::WebSocket);
+    let first = a.pictures(0, 5).await;
+    assert_colour(&first[0], RED);
+
+    let mut b = rig.viewer().await;
+    b.pictures(0, 3).await;
+    a.handle.select_monitor(1);
+    let switched = b.pictures(1, 3).await;
+    assert_eq!((switched[0].width, switched[0].height), (256, 192));
+    assert_colour(&switched[0], BLUE);
+    a.pictures(1, 3).await;
+
+    let agents: Value = rig
+        .api
+        .client
+        .get(rig.api.url("/api/agents"))
+        .bearer_auth(&rig.admin_session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(agents[0]["transport"], "websocket");
+    assert_eq!(agents[0]["viewer_sessions"], 2);
+}
+
+#[tokio::test]
+async fn a_viewer_that_falls_behind_makes_the_agent_lower_its_bitrate() {
+    // Adaptive bitrate end to end: the viewer acknowledges frames while it
+    // keeps up, then stops consuming them (a jammed link looks the same
+    // from the server). The relay sees it falling behind and reports it;
+    // the agent's controller cuts the encoder's target.
+    let rig = rig().await;
+    let mut viewer = rig.viewer().await;
+    viewer.pictures(0, 10).await;
+    assert!(rig.log.bitrates().is_empty(), "{:?}", rig.log.bitrates());
+
+    let full = agent::media::rate::max_bitrate(320, 240);
+    let cut = timeout(DEADLINE, async {
+        loop {
+            if let Some(bps) = rig.log.bitrates().into_iter().find(|b| *b < full) {
+                return bps;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the agent should have lowered its bitrate");
+    assert!(cut >= agent::media::rate::MIN_BITRATE, "{cut}");
+    drop(viewer);
+}
 
 #[tokio::test]
 async fn two_viewers_are_fed_by_one_encode_via_the_server() {

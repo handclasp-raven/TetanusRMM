@@ -45,6 +45,7 @@ async fn heartbeat_telemetry_is_stored_and_served_by_the_api() {
         .token;
     let credential = agent::enroll::enroll(&agent::enroll::EnrollOptions {
         server_addr: addr,
+        transport: Default::default(),
         server_name: "localhost".into(),
         server_ca_pem: certs.ca_cert.clone(),
         token,

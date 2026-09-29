@@ -36,7 +36,11 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-rmm}:${POSTGRES_PASSWORD:-rmm-dev-password}@db:5432/${POSTGRES_DB:-rmm}
       RMM_DB_MAX_CONNECTIONS: ${RMM_DB_MAX_CONNECTIONS:-10}
       RMM_QUIC_LISTEN: 0.0.0.0:4433
+      # WebSocket-over-TLS fallback for UDP-blocked networks: TCP, same port.
+      RMM_WS_LISTEN: 0.0.0.0:4433
       RMM_API_LISTEN: 0.0.0.0:8443
+      # Prometheus metrics (plain HTTP, no auth): published on loopback only.
+      RMM_METRICS_LISTEN: 0.0.0.0:9464
       RMM_CERTS_DIR: /certs
       RMM_SESSION_TTL_SECS: ${RMM_SESSION_TTL_SECS:-43200}
       RMM_PUBLIC_URL: ${RMM_PUBLIC_URL:-https://localhost:8443}
@@ -48,6 +52,8 @@ services:
     ports:
       - "${RMM_API_PORT:-8443}:8443/tcp"
       - "${RMM_QUIC_PORT:-4433}:4433/udp"
+      - "${RMM_WS_PORT:-4433}:4433/tcp"
+      - "127.0.0.1:${RMM_METRICS_PORT:-9464}:9464/tcp"
 
 volumes:
   pgdata:

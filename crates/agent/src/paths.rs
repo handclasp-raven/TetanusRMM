@@ -6,6 +6,8 @@
 //! - `%ProgramData%\RMM\agent\`: state directory (credential, pending
 //!   enrollment, `agent.log`), readable only by SYSTEM and Administrators.
 //! - `%LOCALAPPDATA%\RMM\helper.log`: the session helper's log, per user.
+//! - `%ProgramData%\RMM\agent\input-helper.log`: the input helper's log
+//!   (it runs as SYSTEM, so it logs next to the service).
 //!
 //! Elsewhere (development): `./agent-state`.
 
@@ -40,6 +42,12 @@ pub fn helper_log() -> PathBuf {
     env_dir("LOCALAPPDATA", "C:\\Users\\Public")
         .join("RMM")
         .join("helper.log")
+}
+
+/// Log file for the input helper (runs as SYSTEM in the user's session).
+#[cfg(windows)]
+pub fn input_helper_log() -> PathBuf {
+    default_state_dir().join("input-helper.log")
 }
 
 #[cfg(windows)]

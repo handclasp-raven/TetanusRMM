@@ -43,26 +43,63 @@ impl Role {
         matches!(self, Role::Admin | Role::SupportEngineer)
     }
 
-    /// Whether this role may use a remote operation on agents.
+    /// Whether this role may ever use `capability` on an agent. Admins
+    /// may anywhere; support engineers only where a grant says so (see
+    /// `crate::access`); auditors never.
     pub fn can(self, capability: Capability) -> bool {
         match capability {
-            Capability::Shell | Capability::Script | Capability::FileTransfer => {
-                matches!(self, Role::Admin | Role::SupportEngineer)
-            }
+            Capability::Desktop
+            | Capability::Shell
+            | Capability::Script
+            | Capability::FileTransfer => matches!(self, Role::Admin | Role::SupportEngineer),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::SupportEngineer => "support_engineer",
+            Role::Auditor => "auditor",
         }
     }
 }
 
-/// Remote operations on an agent that need a role check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Things a user can do to an agent, each granted separately (see
+/// `crate::access`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
+    /// Remote desktop: view, input and clipboard.
+    Desktop,
     /// Interactive remote shell.
     Shell,
     /// Running scripts and commands.
     Script,
     /// Uploading and downloading files.
     FileTransfer,
+}
+
+impl Capability {
+    pub const ALL: [Capability; 4] = [
+        Capability::Desktop,
+        Capability::Shell,
+        Capability::Script,
+        Capability::FileTransfer,
+    ];
+
+    /// The name stored in grants and the API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Desktop => "desktop",
+            Capability::Shell => "shell",
+            Capability::Script => "script",
+            Capability::FileTransfer => "file_transfer",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -154,6 +191,102 @@ pub async fn create_user(
     })
 }
 
+/// All users, by username.
+pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<User>> {
+    sqlx::query_as("SELECT id, username, role FROM users ORDER BY username")
+        .fetch_all(pool)
+        .await
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UserAdminError {
+    #[error("no such user")]
+    NotFound,
+    #[error("that would leave no admin")]
+    LastAdmin,
+    #[error("you cannot delete your own account")]
+    SelfDelete,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Lock `user_id` and the admin set; errors if removing admin rights from
+/// `user_id` would leave none.
+async fn lock_for_change(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: i64,
+    losing_admin: impl Fn(Role) -> bool,
+) -> Result<User, UserAdminError> {
+    // Lock every admin row, so two admins cannot demote each other at once.
+    let admins: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' ORDER BY id FOR UPDATE")
+            .fetch_all(&mut **tx)
+            .await?;
+    let user: User =
+        sqlx::query_as("SELECT id, username, role FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(UserAdminError::NotFound)?;
+    if user.role == Role::Admin && losing_admin(user.role) && admins.len() <= 1 {
+        return Err(UserAdminError::LastAdmin);
+    }
+    Ok(user)
+}
+
+/// Change a user's role. Takes effect on their next request (roles are
+/// read per request). Audited as `user.role_change` by `actor`. Grants are
+/// kept, but only mean something while the user is a support engineer.
+pub async fn set_role(
+    pool: &PgPool,
+    actor: &str,
+    user_id: i64,
+    role: Role,
+) -> Result<User, UserAdminError> {
+    let mut tx = pool.begin().await?;
+    let before = lock_for_change(&mut tx, user_id, |_| role != Role::Admin).await?;
+    if before.role == role {
+        return Ok(before);
+    }
+    sqlx::query("UPDATE users SET role = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(role)
+        .execute(&mut *tx)
+        .await?;
+    audit::append(
+        &mut tx,
+        NewEntry::new(actor, Action::UserRoleChange)
+            .target(&before.username)
+            .detail(json!({ "user_id": user_id, "before": before.role, "after": role })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(User { role, ..before })
+}
+
+/// Delete a user: their sessions and grants go too; the audit log keeps
+/// their name. Audited as `user.delete` by `actor`.
+pub async fn delete_user(pool: &PgPool, actor: &User, user_id: i64) -> Result<(), UserAdminError> {
+    if actor.id == user_id {
+        return Err(UserAdminError::SelfDelete);
+    }
+    let mut tx = pool.begin().await?;
+    let user = lock_for_change(&mut tx, user_id, |_| true).await?;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    audit::append(
+        &mut tx,
+        NewEntry::new(&actor.username, Action::UserDelete)
+            .target(&user.username)
+            .detail(json!({ "user_id": user_id, "role": user.role })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,12 +315,20 @@ mod tests {
     }
 
     #[test]
+    fn capability_names_round_trip_and_match_serde() {
+        for capability in Capability::ALL {
+            assert_eq!(Capability::parse(capability.as_str()), Some(capability));
+            assert_eq!(
+                serde_json::to_value(capability).unwrap(),
+                capability.as_str()
+            );
+        }
+        assert_eq!(Capability::parse("root"), None);
+    }
+
+    #[test]
     fn only_admins_and_engineers_run_remote_operations() {
-        for capability in [
-            Capability::Shell,
-            Capability::Script,
-            Capability::FileTransfer,
-        ] {
+        for capability in Capability::ALL {
             assert!(Role::Admin.can(capability));
             assert!(Role::SupportEngineer.can(capability));
             assert!(!Role::Auditor.can(capability), "{capability:?}");

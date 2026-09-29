@@ -6,6 +6,7 @@
 //! - the tray icon: connection state, and everyone connected right now
 //!   (tooltip and menu), with "End all remote sessions";
 //! - the Ctrl+F12 hotkey, which ends every remote session;
+//! - the on-screen session indicator naming who is connected;
 //! - consent prompts (`require` mode) and "technician connected" toasts;
 //! - input injection, clipboard sync, and (in `stream`) screen capture.
 //!
@@ -16,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::clipboard::{ClipboardData, ClipboardGuard};
 use protocol::ipc::{AgentStatus, IpcMessage, PIPE_NAME};
@@ -40,10 +41,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::clipboard::Listener;
+use super::indicator::Indicator;
 use super::input::Injector;
 use super::stream::{self, WorkerCommand};
 use super::{consent, toast};
 use crate::core;
+use crate::interactive::indicator_text;
+
+/// How often the indicator is put back on top of other topmost windows.
+const INDICATOR_REFRESH: Duration = Duration::from_secs(3);
 
 /// Windows error code when all pipe instances are busy.
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -99,7 +105,7 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn current_session_id() -> Option<u32> {
+pub(super) fn current_session_id() -> Option<u32> {
     let mut session = 0;
     // SAFETY: out-parameter.
     unsafe { ProcessIdToSessionId(std::process::id(), &mut session).ok()? };
@@ -209,6 +215,7 @@ async fn pipe_client(
                 IpcMessage::StartCapture { monitor } => WorkerCommand::Start { monitor },
                 IpcMessage::StopCapture => WorkerCommand::Stop,
                 IpcMessage::ForceKeyframe => WorkerCommand::ForceKeyframe,
+                IpcMessage::SetBitrate { bps } => WorkerCommand::SetBitrate(bps),
                 other => {
                     debug!(?other, "ignoring message from service");
                     continue;
@@ -226,7 +233,7 @@ async fn pipe_client(
     }
 }
 
-async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+pub(super) async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     let mut attempts = 0;
     loop {
         match ClientOptions::new().open(PIPE_NAME) {
@@ -266,6 +273,7 @@ struct Tray {
     dirty: Cell<bool>,
     clipboard: Option<Listener>,
     guard: RefCell<ClipboardGuard>,
+    indicator: RefCell<Option<Indicator>>,
     /// To the service.
     ctl: UnboundedSender<IpcMessage>,
 }
@@ -315,6 +323,13 @@ impl Tray {
                 None
             }
         };
+        let indicator = match Indicator::new() {
+            Ok(i) => Some(i),
+            Err(e) => {
+                warn!("session indicator unavailable: {e}");
+                None
+            }
+        };
         let mut guard = ClipboardGuard::default();
         // Whatever the user copied before a technician connected stays private.
         guard.prime(clipboard.as_ref().and_then(Listener::read));
@@ -330,6 +345,7 @@ impl Tray {
             dirty: Cell::new(false),
             clipboard,
             guard: RefCell::new(guard),
+            indicator: RefCell::new(indicator),
             ctl,
         })
     }
@@ -337,6 +353,7 @@ impl Tray {
     /// Win32 message loop plus polling of menu, clipboard and service
     /// events. Returns when the service disconnects.
     fn run(&self, ui: &mpsc::Receiver<UiEvent>) {
+        let mut indicator_refreshed = Instant::now();
         loop {
             // Sleep until there is window input, or at most 100 ms.
             // SAFETY: no handles; just waits on this thread's message queue.
@@ -384,6 +401,9 @@ impl Tray {
                         self.dirty.set(true);
                     }
                     Ok(UiEvent::Technicians(list)) => {
+                        if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
+                            indicator.set(indicator_text(&list));
+                        }
                         *self.technicians.borrow_mut() = list;
                         self.dirty.set(true);
                     }
@@ -397,6 +417,12 @@ impl Tray {
                 }
             }
             self.apply();
+            if indicator_refreshed.elapsed() >= INDICATOR_REFRESH {
+                indicator_refreshed = Instant::now();
+                if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
+                    indicator.refresh();
+                }
+            }
         }
     }
 

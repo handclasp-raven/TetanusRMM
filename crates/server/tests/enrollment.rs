@@ -26,6 +26,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 fn enroll_opts(addr: std::net::SocketAddr, certs: &DevCerts, token: &str) -> EnrollOptions {
     EnrollOptions {
         server_addr: addr,
+        transport: Default::default(),
         server_name: "localhost".into(),
         server_ca_pem: certs.ca_cert.clone(),
         token: token.to_owned(),
@@ -62,8 +63,8 @@ async fn assert_rejected(mut config: agent::AgentConfig, code: u32) {
         .expect("rejection should not hang");
     assert!(result.is_err(), "Hello should have been refused");
     match session.close_reason() {
-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
-            assert_eq!(u64::from(close.error_code), u64::from(code), "{close:?}");
+        Some(transport::ConnectionError::ApplicationClosed { code: got, reason }) => {
+            assert_eq!(got, code, "{reason}");
         }
         other => panic!("expected an application close, got {other:?}"),
     }
