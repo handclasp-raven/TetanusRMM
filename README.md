@@ -50,7 +50,12 @@ curl --cacert dev-certs/ca.crt https://localhost:8443/api/health
 ```
 
 `gen-certs` writes `ca.crt`, `ca.key`, `server.crt` and `server.key`. The
-server uses `ca.key` to sign agent certificates at enrollment. If your
+server uses `ca.key` to sign agent certificates at enrollment. Issued
+certificates carry subject and authority key identifiers, which strict
+verifiers such as Python 3.13+'s default TLS context require. Certificates
+generated before Phase 7 lack them: regenerate with `gen-certs --force` (and
+re-enroll agents) if a Python client reports "Missing Authority Key
+Identifier". If your
 `dev-certs/` predates Phase 3 it has no `ca.key`: run `gen-certs --force`,
 which replaces the CA, so re-enroll any existing agents.
 

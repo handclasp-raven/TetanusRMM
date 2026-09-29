@@ -33,6 +33,20 @@ pub struct DevCerts {
     pub agent_key: String,
 }
 
+/// Parameters for a certificate issued by the dev CA. Leaves carry the
+/// extensions strict verifiers expect (e.g. Python 3.13+'s default
+/// `VERIFY_X509_STRICT`): an authority key identifier matching the CA's
+/// subject key identifier, their own subject key identifier, and
+/// `CA:FALSE` basic constraints.
+fn leaf_params(names: Vec<String>, common_name: &str) -> Result<CertificateParams, TlsError> {
+    let mut params = CertificateParams::new(names)?;
+    params.distinguished_name = distinguished_name(common_name);
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.use_authority_key_identifier_extension = true;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    Ok(params)
+}
+
 fn distinguished_name(common_name: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::OrganizationName, "RMM Dev");
@@ -60,16 +74,12 @@ pub fn generate_with_names(agent_id: &str, extra_names: &[String]) -> Result<Dev
 
     let mut server_names: Vec<String> = SERVER_NAMES.iter().map(|s| s.to_string()).collect();
     server_names.extend(extra_names.iter().cloned());
-    let mut server_params = CertificateParams::new(server_names)?;
-    server_params.distinguished_name = distinguished_name("localhost");
-    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let mut server_params = leaf_params(server_names, "localhost")?;
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let server_key = KeyPair::generate()?;
     let server_cert = server_params.signed_by(&server_key, &ca)?;
 
-    let mut agent_params = CertificateParams::new(Vec::<String>::new())?;
-    agent_params.distinguished_name = distinguished_name(agent_id);
-    agent_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let mut agent_params = leaf_params(Vec::new(), agent_id)?;
     agent_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let agent_key = KeyPair::generate()?;
     let agent_cert = agent_params.signed_by(&agent_key, &ca)?;
@@ -159,6 +169,40 @@ mod tests {
                     rustls_pki_types::UnixTime::now(),
                 )
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    /// (subject key id, authority key id, is CA) of a PEM certificate.
+    fn key_ids(pem: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<bool>) {
+        use x509_parser::prelude::*;
+        let (_, pem) = parse_x509_pem(pem.as_bytes()).unwrap();
+        let cert = pem.parse_x509().unwrap();
+        let mut ids = (None, None, None);
+        for ext in cert.extensions() {
+            match ext.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => ids.0 = Some(id.0.to_vec()),
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    ids.1 = aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                }
+                ParsedExtension::BasicConstraints(bc) => ids.2 = Some(bc.ca),
+                _ => {}
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn leaves_chain_to_the_ca_by_key_identifier() {
+        let certs = generate("a").unwrap();
+        let (ca_ski, _, ca_is_ca) = key_ids(&certs.ca_cert);
+        assert!(ca_ski.is_some());
+        assert_eq!(ca_is_ca, Some(true));
+        for leaf in [&certs.server_cert, &certs.agent_cert] {
+            let (ski, aki, is_ca) = key_ids(leaf);
+            assert!(ski.is_some(), "leaf has a subject key identifier");
+            assert_ne!(ski, ca_ski);
+            assert_eq!(aki, ca_ski, "authority key identifier names the CA");
+            assert_eq!(is_ca, Some(false));
         }
     }
 

@@ -83,6 +83,8 @@ impl AgentCa {
         dn.push(DnType::CommonName, agent_id);
         params.distinguished_name = dn;
         params.is_ca = IsCa::ExplicitNoCa;
+        // Names the CA by its key, as strict verifiers require.
+        params.use_authority_key_identifier_extension = true;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.serial_number = Some(random_serial().into());
@@ -301,6 +303,28 @@ mod tests {
         assert!(cert.subject_alternative_name().unwrap().is_none());
         let eku = cert.extended_key_usage().unwrap().unwrap().value;
         assert!(eku.client_auth && !eku.server_auth);
+
+        // The authority key identifier names the issuing CA's key.
+        let ca_der = common::tls::certs_from_pem(ca.ca_pem()).unwrap().remove(0);
+        let (_, ca_cert) = X509Certificate::from_der(&ca_der).unwrap();
+        let ca_ski = ca_cert
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0.to_vec()),
+                _ => None,
+            });
+        let aki = cert
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                }
+                _ => None,
+            });
+        assert!(ca_ski.is_some());
+        assert_eq!(aki, ca_ski);
     }
 
     #[test]
