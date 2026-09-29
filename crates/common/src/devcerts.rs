@@ -1,7 +1,8 @@
-//! Development certificate authority: one CA, one server cert, one agent cert.
+//! Development certificate authority: a CA and a server certificate.
 //!
-//! For local development and tests only. Production agents will receive
-//! per-agent certificates through enrollment (Phase 3).
+//! The server uses the CA key to issue per-agent certificates at enrollment.
+//! [`generate`] also produces one agent certificate, for tests that run
+//! without enrollment; it is not written to disk.
 
 use std::fs;
 use std::path::Path;
@@ -14,10 +15,9 @@ use rcgen::{
 use crate::tls::{certs_from_pem, Identity, TlsError};
 
 pub const CA_CERT: &str = "ca.crt";
+pub const CA_KEY: &str = "ca.key";
 pub const SERVER_CERT: &str = "server.crt";
 pub const SERVER_KEY: &str = "server.key";
-pub const AGENT_CERT: &str = "agent.crt";
-pub const AGENT_KEY: &str = "agent.key";
 
 /// Names the dev server certificate is valid for.
 pub const SERVER_NAMES: &[&str] = &["localhost", "127.0.0.1", "::1"];
@@ -26,6 +26,7 @@ pub const SERVER_NAMES: &[&str] = &["localhost", "127.0.0.1", "::1"];
 #[derive(Debug, Clone)]
 pub struct DevCerts {
     pub ca_cert: String,
+    pub ca_key: String,
     pub server_cert: String,
     pub server_key: String,
     pub agent_cert: String,
@@ -46,7 +47,9 @@ pub fn generate(agent_id: &str) -> Result<DevCerts, TlsError> {
     ca_params.distinguished_name = distinguished_name("RMM Dev CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate()?)?;
+    let ca_key = KeyPair::generate()?;
+    let ca_key_pem = ca_key.serialize_pem();
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key)?;
 
     let server_names: Vec<String> = SERVER_NAMES.iter().map(|s| s.to_string()).collect();
     let mut server_params = CertificateParams::new(server_names)?;
@@ -65,6 +68,7 @@ pub fn generate(agent_id: &str) -> Result<DevCerts, TlsError> {
 
     Ok(DevCerts {
         ca_cert: ca.pem(),
+        ca_key: ca_key_pem,
         server_cert: server_cert.pem(),
         server_key: server_key.serialize_pem(),
         agent_cert: agent_cert.pem(),
@@ -85,8 +89,8 @@ impl DevCerts {
         Identity::from_pem(&self.agent_cert, &self.agent_key)
     }
 
-    /// Write all five files into `dir`, creating it if needed. Private keys
-    /// are written with mode 0600 on Unix.
+    /// Write the CA and server files into `dir`, creating it if needed.
+    /// Private keys are written with mode 0600 on Unix.
     pub fn write_to_dir(&self, dir: &Path) -> Result<(), TlsError> {
         let io_err = |path: &Path| {
             let path = path.to_owned();
@@ -95,38 +99,15 @@ impl DevCerts {
         fs::create_dir_all(dir).map_err(io_err(dir))?;
         for (name, contents, secret) in [
             (CA_CERT, &self.ca_cert, false),
+            (CA_KEY, &self.ca_key, true),
             (SERVER_CERT, &self.server_cert, false),
             (SERVER_KEY, &self.server_key, true),
-            (AGENT_CERT, &self.agent_cert, false),
-            (AGENT_KEY, &self.agent_key, true),
         ] {
             let path = dir.join(name);
-            write_file(&path, contents, secret).map_err(io_err(&path))?;
+            crate::fs::write_file(&path, contents.as_bytes(), secret).map_err(io_err(&path))?;
         }
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn write_file(path: &Path, contents: &str, secret: bool) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mode = if secret { 0o600 } else { 0o644 };
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)?;
-    file.write_all(contents.as_bytes())
-}
-
-// Keys on Windows are only ever dev keys here; production agents protect
-// their credential with DPAPI (Phase 3).
-#[cfg(not(unix))]
-fn write_file(path: &Path, contents: &str, _secret: bool) -> std::io::Result<()> {
-    fs::write(path, contents)
 }
 
 #[cfg(test)]
@@ -162,18 +143,21 @@ mod tests {
         certs.write_to_dir(&out).unwrap();
 
         assert_eq!(load_certs(&out.join(CA_CERT)).unwrap(), certs.ca().unwrap());
-        let agent = Identity::from_files(&out.join(AGENT_CERT), &out.join(AGENT_KEY)).unwrap();
-        assert_eq!(agent.cert_chain, certs.agent_identity().unwrap().cert_chain);
-        Identity::from_files(&out.join(SERVER_CERT), &out.join(SERVER_KEY)).unwrap();
+        let ca = Identity::from_files(&out.join(CA_CERT), &out.join(CA_KEY)).unwrap();
+        assert_eq!(ca.cert_chain, certs.ca().unwrap());
+        let server = Identity::from_files(&out.join(SERVER_CERT), &out.join(SERVER_KEY)).unwrap();
+        assert_eq!(
+            server.cert_chain,
+            certs.server_identity().unwrap().cert_chain
+        );
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(out.join(AGENT_KEY))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
+            for key in [CA_KEY, SERVER_KEY] {
+                let mode = fs::metadata(out.join(key)).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{key}");
+            }
         }
     }
 

@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 tempfile = "3"
 argon2 = "0.6"
 axum = "0.8"
@@ -44,4 +44,9 @@ ring = "0.17"
 serde_json = "1"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "macros", "derive", "migrate", "chrono", "json"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+ed25519-dalek = "3"
+semver = "1"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+time = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 totp-rs = { version = "6", default-features = false, features = ["std", "otpauth"] }

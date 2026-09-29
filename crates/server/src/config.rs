@@ -4,9 +4,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::Args;
 use common::devcerts;
 use common::{Identity, TlsError};
+
+use crate::enroll::AgentCa;
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeConfig {
@@ -42,6 +45,15 @@ pub struct ServeConfig {
     /// Lifetime of a user login session, in seconds.
     #[arg(long, env = "RMM_SESSION_TTL_SECS", default_value_t = 12 * 60 * 60)]
     pub session_ttl_secs: u64,
+
+    /// Base URL agents and users reach the HTTPS API at. Used in download
+    /// links and handed to agents at enrollment.
+    #[arg(long, env = "RMM_PUBLIC_URL", default_value = "https://localhost:8443")]
+    pub public_url: String,
+
+    /// Directory of published agent updates (see `publish-update`).
+    #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
+    pub updates_dir: PathBuf,
 }
 
 impl ServeConfig {
@@ -56,6 +68,24 @@ impl ServeConfig {
     /// CA that agent client certificates must chain to.
     pub fn agent_ca(&self) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
         common::tls::load_certs(&self.certs_dir.join(devcerts::CA_CERT))
+    }
+
+    /// Internal CA that signs agent certificates at enrollment: `ca.crt` and
+    /// `ca.key` in the certs dir.
+    pub fn enrollment_ca(&self) -> anyhow::Result<AgentCa> {
+        let read = |name: &str| {
+            let path = self.certs_dir.join(name);
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+        };
+        Ok(AgentCa::from_pem(
+            &read(devcerts::CA_CERT)?,
+            &read(devcerts::CA_KEY)?,
+        )?)
+    }
+
+    /// Public URL without a trailing slash.
+    pub fn public_url(&self) -> String {
+        self.public_url.trim_end_matches('/').to_owned()
     }
 
     /// Certificate presented to HTTPS clients: the explicit API cert if set,

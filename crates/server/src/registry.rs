@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::audit::{self, Action, NewEntry};
 
@@ -66,32 +66,48 @@ pub enum PolicyError {
     Db(#[from] sqlx::Error),
 }
 
-/// Record an authenticated agent's Hello: create it on first sight (with the
-/// default policy), and refresh its fingerprint and `last_seen`.
-///
-/// Any agent with a certificate from the configured CA is treated as
-/// enrolled. Token enrollment and certificate pinning arrive in Phase 3.
-pub async fn record_hello(
-    pool: &PgPool,
+/// Register a newly enrolled agent, pinned to `cert_fingerprint`, with the
+/// default device policy. Runs inside the enrollment transaction.
+pub async fn insert_enrolled(
+    tx: &mut Transaction<'_, Postgres>,
     agent_id: &str,
     cert_fingerprint: &str,
 ) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
     sqlx::query(
-        "INSERT INTO agents (id, enrollment_state, cert_fingerprint, last_seen)
-         VALUES ($1, 'enrolled', $2, now())
-         ON CONFLICT (id) DO UPDATE
-         SET cert_fingerprint = EXCLUDED.cert_fingerprint, last_seen = now()",
+        "INSERT INTO agents (id, enrollment_state, cert_fingerprint)
+         VALUES ($1, 'enrolled', $2)",
     )
     .bind(agent_id)
     .bind(cert_fingerprint)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    sqlx::query("INSERT INTO device_policies (agent_id) VALUES ($1) ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO device_policies (agent_id) VALUES ($1)")
         .bind(agent_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    tx.commit().await
+    Ok(())
+}
+
+/// Check an agent's Hello against the registry and, if it passes, update
+/// `last_seen`.
+///
+/// Passes only if `agent_id` is enrolled (not pending or revoked) and pinned
+/// to exactly this certificate. A valid certificate from our CA is not
+/// enough on its own: it must be the one issued to this agent.
+pub async fn authenticate_hello(
+    pool: &PgPool,
+    agent_id: &str,
+    cert_fingerprint: &str,
+) -> sqlx::Result<bool> {
+    let updated = sqlx::query(
+        "UPDATE agents SET last_seen = now()
+         WHERE id = $1 AND cert_fingerprint = $2 AND enrollment_state = 'enrolled'",
+    )
+    .bind(agent_id)
+    .bind(cert_fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 /// Update `last_seen` on heartbeat.

@@ -10,13 +10,21 @@
 //! | GET    | /api/agents                 | session         |
 //! | GET    | /api/agents/{id}/policy     | session         |
 //! | PUT    | /api/agents/{id}/policy     | session (admin) |
+//! | POST   | /api/enrollment-links       | session (admin, support_engineer) |
+//! | GET    | /api/download/{platform}?token= | enrollment token |
+//! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
+//! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
+//! | GET    | /api/updates/{platform}/signature| none |
 //!
 //! Sessions are passed as `Authorization: Bearer <token>`.
 
 use std::net::SocketAddr;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{FromRequestParts, Path, State};
+use axum::body::Body;
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -29,13 +37,19 @@ use sqlx::PgPool;
 use tracing::error;
 
 use crate::auth::{self, AuthSettings, LoginError};
+use crate::enroll;
 use crate::registry::{self, Agent, DevicePolicy, PolicyError};
+use crate::updates;
 use crate::users::User;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub auth: AuthSettings,
+    /// Base URL of this API, without a trailing slash, for building links.
+    pub public_url: String,
+    /// Where published agent updates live (see `crate::updates`).
+    pub updates_dir: PathBuf,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -47,6 +61,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(me))
         .route("/api/agents", get(list_agents))
         .route("/api/agents/{id}/policy", get(get_policy).put(put_policy))
+        .route("/api/enrollment-links", post(create_enrollment_link))
+        .route("/api/download/{platform}", get(download_agent))
+        .route("/api/updates/{platform}/manifest", get(update_manifest))
+        .route("/api/updates/{platform}/binary", get(update_binary))
+        .route("/api/updates/{platform}/signature", get(update_signature))
         .with_state(state)
 }
 
@@ -247,4 +266,139 @@ async fn put_policy(
             PolicyError::InvalidTimeout => ApiError::BadRequest(e.to_string()),
             PolicyError::Db(e) => e.into(),
         })
+}
+
+#[derive(Deserialize)]
+struct EnrollmentLinkRequest {
+    /// Token lifetime; defaults to 24 h, capped at 7 days.
+    ttl_secs: Option<u64>,
+    /// Which agent build the link downloads; defaults to `windows-x86_64`.
+    platform: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EnrollmentLinkResponse {
+    token: String,
+    expires_at: DateTime<Utc>,
+    download_url: String,
+}
+
+async fn create_enrollment_link(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<EnrollmentLinkRequest>,
+) -> Result<Json<EnrollmentLinkResponse>, ApiError> {
+    if !session.user.role.can_create_enrollment_links() {
+        return Err(ApiError::Forbidden);
+    }
+    let platform = req.platform.unwrap_or_else(|| "windows-x86_64".to_owned());
+    if !protocol::update::valid_platform(&platform) {
+        return Err(ApiError::BadRequest("invalid platform".into()));
+    }
+    let ttl = match req.ttl_secs {
+        None => enroll::DEFAULT_TOKEN_TTL,
+        Some(secs) if (1..=enroll::MAX_TOKEN_TTL.as_secs()).contains(&secs) => {
+            Duration::from_secs(secs)
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest(format!(
+                "ttl_secs must be between 1 and {}",
+                enroll::MAX_TOKEN_TTL.as_secs()
+            )))
+        }
+    };
+    let minted = enroll::create_token(&state.pool, &session.user.username, ttl).await?;
+    Ok(Json(EnrollmentLinkResponse {
+        download_url: format!(
+            "{}/api/download/{platform}?token={}",
+            state.public_url, minted.token
+        ),
+        token: minted.token,
+        expires_at: minted.expires_at,
+    }))
+}
+
+#[derive(Deserialize)]
+struct DownloadQuery {
+    token: String,
+}
+
+/// Download the latest agent build. Requires a usable (unused, unexpired)
+/// enrollment token, but does not consume it: that happens at enrollment.
+async fn download_agent(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    Query(query): Query<DownloadQuery>,
+) -> Result<Response, ApiError> {
+    if !enroll::token_is_usable(&state.pool, &query.token).await? {
+        return Err(ApiError::Unauthorized(
+            "download link is invalid or expired",
+        ));
+    }
+    let filename = if platform.starts_with("windows") {
+        "rmm-agent.exe"
+    } else {
+        "rmm-agent"
+    };
+    let mut resp = serve_update_file(&state.updates_dir, &platform, updates::BINARY_FILE).await?;
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .expect("valid header"),
+    );
+    Ok(resp)
+}
+
+async fn update_manifest(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+) -> Result<Json<protocol::update::UpdateManifest>, ApiError> {
+    updates::load_manifest(&state.updates_dir, &platform)
+        .map_err(|e| match e {
+            updates::UpdateError::InvalidPlatform(_) => ApiError::NotFound,
+            other => ApiError::Internal(other.to_string()),
+        })?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+async fn update_binary(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+) -> Result<Response, ApiError> {
+    serve_update_file(&state.updates_dir, &platform, updates::BINARY_FILE).await
+}
+
+async fn update_signature(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+) -> Result<Response, ApiError> {
+    serve_update_file(&state.updates_dir, &platform, updates::SIGNATURE_FILE).await
+}
+
+/// Stream a published file without loading it into memory.
+async fn serve_update_file(dir: &FsPath, platform: &str, name: &str) -> Result<Response, ApiError> {
+    if !protocol::update::valid_platform(platform) {
+        return Err(ApiError::NotFound);
+    }
+    let path = dir.join(platform).join(name);
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ApiError::NotFound),
+        Err(e) => return Err(ApiError::Internal(format!("{}: {e}", path.display()))),
+    };
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .len();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response())
 }

@@ -27,6 +27,11 @@ impl Role {
     pub fn can_edit_policies(self) -> bool {
         matches!(self, Role::Admin)
     }
+
+    /// Whether this role may create agent download links.
+    pub fn can_create_enrollment_links(self) -> bool {
+        matches!(self, Role::Admin | Role::SupportEngineer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -136,5 +141,12 @@ mod tests {
         assert!(Role::Admin.can_edit_policies());
         assert!(!Role::SupportEngineer.can_edit_policies());
         assert!(!Role::Auditor.can_edit_policies());
+    }
+
+    #[test]
+    fn admins_and_engineers_create_download_links() {
+        assert!(Role::Admin.can_create_enrollment_links());
+        assert!(Role::SupportEngineer.can_create_enrollment_links());
+        assert!(!Role::Auditor.can_create_enrollment_links());
     }
 }

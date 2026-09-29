@@ -74,7 +74,7 @@ pub struct SessionGrant {
     pub expires_at: DateTime<Utc>,
 }
 
-fn new_token() -> String {
+pub fn new_token() -> String {
     let mut bytes = [0u8; 32];
     SystemRandom::new()
         .fill(&mut bytes)

@@ -1,6 +1,7 @@
 # Local deployment: server + Postgres.
 #
 #   cargo run -p server -- gen-certs     # once, creates ./dev-certs
+#   mkdir -p updates                     # published agent builds (see README)
 #   docker compose up --build
 #
 # Settings can be overridden in a .env file next to this one (see README).
@@ -38,9 +39,12 @@ services:
       RMM_API_LISTEN: 0.0.0.0:8443
       RMM_CERTS_DIR: /certs
       RMM_SESSION_TTL_SECS: ${RMM_SESSION_TTL_SECS:-43200}
+      RMM_PUBLIC_URL: ${RMM_PUBLIC_URL:-https://localhost:8443}
+      RMM_UPDATES_DIR: /updates
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ./dev-certs:/certs:ro
+      - ./updates:/updates:ro
     ports:
       - "${RMM_API_PORT:-8443}:8443/tcp"
       - "${RMM_QUIC_PORT:-4433}:4433/udp"

@@ -2,3 +2,6 @@ target
 dev-certs
 .git
 *.md
+updates
+update-keys
+agent-state

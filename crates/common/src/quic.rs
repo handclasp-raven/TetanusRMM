@@ -48,19 +48,25 @@ fn transport(keep_alive: Option<Duration>) -> quinn::TransportConfig {
     transport
 }
 
-/// Server-side QUIC config: presents `identity`, and requires every client to
-/// present a certificate chaining to one of `client_ca`.
+/// Server-side QUIC config: presents `identity`. A client certificate is
+/// optional, but if one is presented it must chain to one of `client_ca`.
+///
+/// Certificate-less connections are allowed only so unenrolled agents can
+/// enroll. The server's connection handler admits exactly one `Enroll`
+/// message on them and nothing else (see `server::quic`).
 pub fn server_config(
     identity: &Identity,
     client_ca: &[CertificateDer<'static>],
 ) -> Result<quinn::ServerConfig, TlsError> {
     let provider = provider();
-    // WebPkiClientVerifier rejects the handshake if the client sends no
-    // certificate or one that does not chain to `client_ca`.
+    // WebPkiClientVerifier rejects the handshake if the client sends a
+    // certificate that does not chain to `client_ca`. `allow_unauthenticated`
+    // lets clients send none at all.
     let verifier = WebPkiClientVerifier::builder_with_provider(
         Arc::new(root_store(client_ca)?),
         provider.clone(),
     )
+    .allow_unauthenticated()
     .build()?;
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?

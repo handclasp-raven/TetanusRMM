@@ -2,19 +2,15 @@
 
 mod support;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use agent::AgentConfig;
 use serde_json::json;
 use server::audit::{self, Action, BreakReason, Entry, NewEntry, Verification};
 use server::auth::{self, AuthSettings, LoginError, MAX_TOTP_ATTEMPTS};
-use server::registry::{self, ConsentMode, DevicePolicy, EnrollmentState, OnNoUser, PolicyError};
+use server::registry::{self, ConsentMode, DevicePolicy, OnNoUser, PolicyError};
 use server::users::{self, CreateUserError, Role};
-use server::{Server, ServerConfig, ServerEvent};
 use sqlx::PgPool;
-use support::{audit_actions, create_user, current_code, start_db, wrong_code, PASSWORD};
-use tokio::sync::mpsc::unbounded_channel;
+use support::{
+    audit_actions, create_user, current_code, insert_agent, start_db, wrong_code, PASSWORD,
+};
 
 async fn login_code(
     pool: &PgPool,
@@ -276,9 +272,7 @@ async fn populate_chain(pool: &PgPool) {
     let grant = login_code(pool, "alice", &current_code(&user.totp_secret))
         .await
         .unwrap();
-    registry::record_hello(pool, "agent-1", "ab12")
-        .await
-        .unwrap();
+    insert_agent(pool, "agent-1").await;
     registry::update_policy(
         pool,
         "alice",
@@ -441,9 +435,7 @@ async fn mutated_audit_row_is_detected() {
 #[tokio::test]
 async fn policy_update_validates_and_audits_before_and_after() {
     let db = start_db().await;
-    registry::record_hello(&db.pool, "agent-1", "ab12")
-        .await
-        .unwrap();
+    insert_agent(&db.pool, "agent-1").await;
     let default = registry::get_policy(&db.pool, "agent-1")
         .await
         .unwrap()
@@ -493,65 +485,4 @@ async fn policy_update_validates_and_audits_before_and_after() {
     assert_eq!(target, "agent-1");
     assert_eq!(detail["before"]["consent_mode"], "notify");
     assert_eq!(detail["after"]["consent_mode"], "unattended");
-}
-
-#[tokio::test]
-async fn quic_agent_is_recorded_in_the_registry() {
-    let db = start_db().await;
-    let certs = common::devcerts::generate("registry-agent").unwrap();
-    let (tx, mut events) = unbounded_channel();
-    let quic = Server::bind(ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        identity: certs.server_identity().unwrap(),
-        client_ca: certs.ca().unwrap(),
-    })
-    .unwrap()
-    .with_events(tx)
-    .with_registry(db.pool.clone());
-    let addr = quic.local_addr().unwrap();
-    let quic = Arc::new(quic);
-    let runner = quic.clone();
-    tokio::spawn(async move { runner.run().await });
-
-    let config = AgentConfig {
-        server_addr: addr,
-        server_name: "localhost".into(),
-        agent_id: "registry-agent".into(),
-        server_ca: certs.ca().unwrap(),
-        identity: certs.agent_identity().unwrap(),
-        heartbeat_interval: Duration::from_millis(50),
-        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
-    };
-    let session = agent::connect(&config).await.unwrap();
-    tokio::spawn(async move { session.run(None).await });
-
-    // Hello is recorded before the first heartbeat is read, so two
-    // heartbeats means both registry writes have happened.
-    let mut heartbeats = 0;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while heartbeats < 2 {
-            if let Some(ServerEvent::Heartbeat { .. }) = events.recv().await {
-                heartbeats += 1;
-            }
-        }
-    })
-    .await
-    .expect("heartbeats");
-
-    let agents = registry::list_agents(&db.pool).await.unwrap();
-    assert_eq!(agents.len(), 1);
-    let agent = &agents[0];
-    assert_eq!(agent.id, "registry-agent");
-    assert_eq!(agent.enrollment_state, EnrollmentState::Enrolled);
-    let expected = server::quic::cert_fingerprint(&certs.agent_identity().unwrap().cert_chain[0]);
-    assert_eq!(agent.cert_fingerprint.as_deref(), Some(expected.as_str()));
-    assert!(agent.last_seen.is_some());
-    assert_eq!(
-        registry::get_policy(&db.pool, "registry-agent")
-            .await
-            .unwrap()
-            .unwrap()
-            .consent_mode,
-        ConsentMode::Notify
-    );
 }

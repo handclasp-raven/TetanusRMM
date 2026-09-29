@@ -1,5 +1,15 @@
-//! Agent side of the control connection: connect with a client certificate,
-//! send [`Message::Hello`], then heartbeat until the connection drops.
+//! RMM agent.
+//!
+//! - Control connection (this module): connect with the enrolled client
+//!   certificate, send [`Message::Hello`], then heartbeat until it drops.
+//! - [`enroll`]: first-run exchange of a one-time token for a certificate.
+//! - [`credstore`]: the certificate and key, protected at rest.
+//! - [`update`] and [`updater`]: signed self-update.
+
+pub mod credstore;
+pub mod enroll;
+pub mod update;
+pub mod updater;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,6 +61,8 @@ pub enum AgentError {
     StreamClosed,
     #[error("unexpected message from server: {0:?}")]
     Unexpected(Message),
+    #[error("enrollment failed: {0}")]
+    Enroll(String),
 }
 
 /// An established, authenticated connection to the server.
@@ -175,6 +187,11 @@ impl AgentSession {
                 .close(close_code::PROTOCOL_ERROR.into(), b"unexpected message");
         }
         result
+    }
+
+    /// Why the connection closed, if it has.
+    pub fn close_reason(&self) -> Option<quinn::ConnectionError> {
+        self.connection.close_reason()
     }
 
     /// Close the connection cleanly.

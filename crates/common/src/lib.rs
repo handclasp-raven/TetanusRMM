@@ -2,6 +2,7 @@
 //! development certificate generation.
 
 pub mod devcerts;
+pub mod fs;
 pub mod logging;
 pub mod quic;
 pub mod tls;

@@ -4,6 +4,7 @@
 //! prefixed by its length as a big-endian `u32` (see [`framing`]).
 
 pub mod framing;
+pub mod update;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,21 @@ pub enum Message {
     Heartbeat { ts: u64, seq: u64 },
     /// Server acknowledgement of the heartbeat with the same `seq`.
     HeartbeatAck { seq: u64 },
+    /// First (and only) message on a connection made *without* a client
+    /// certificate: exchange a one-time enrollment token for a certificate.
+    /// `csr_der` is a PKCS#10 request signed by the agent's freshly generated
+    /// key; the private key never leaves the agent.
+    Enroll { token: String, csr_der: Vec<u8> },
+    /// Server reply to a successful [`Message::Enroll`]. The agent must
+    /// reconnect using `cert_pem` as its client certificate.
+    Enrolled {
+        agent_id: String,
+        cert_pem: String,
+        /// CA that signed `cert_pem` and the server's certificate.
+        ca_pem: String,
+        /// Base URL of the server's HTTPS API (for updates).
+        api_url: String,
+    },
 }
 
 /// QUIC application close codes shared by both ends.
@@ -35,4 +51,7 @@ pub mod close_code {
     pub const NORMAL: u32 = 0;
     /// The peer sent a message that is not valid at this point in the protocol.
     pub const PROTOCOL_ERROR: u32 = 1;
+    /// Enrollment token rejected, or client certificate not (or no longer)
+    /// registered to the claimed agent.
+    pub const UNAUTHORIZED: u32 = 2;
 }

@@ -2,99 +2,11 @@
 
 mod support;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
-use server::api::{self, AppState};
 use server::audit::{self, Verification};
-use server::auth::AuthSettings;
-use server::registry;
 use server::users::Role;
-use support::{create_user, current_code, start_db, wrong_code, PASSWORD};
-
-struct Api {
-    base: String,
-    client: Client,
-    _handle: ApiHandle,
-}
-
-struct ApiHandle(axum_server::Handle<SocketAddr>);
-
-impl Drop for ApiHandle {
-    fn drop(&mut self) {
-        self.0.shutdown();
-    }
-}
-
-impl Api {
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base)
-    }
-
-    async fn login(&self, username: &str, code: &str) -> reqwest::Response {
-        let challenge: Value = self
-            .client
-            .post(self.url("/api/auth/login"))
-            .json(&json!({ "username": username, "password": PASSWORD }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        self.client
-            .post(self.url("/api/auth/totp"))
-            .json(&json!({ "challenge_token": challenge["challenge_token"], "code": code }))
-            .send()
-            .await
-            .unwrap()
-    }
-
-    async fn session(&self, username: &str, secret: &str) -> String {
-        let resp = self.login(username, &current_code(secret)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body: Value = resp.json().await.unwrap();
-        body["session_token"].as_str().unwrap().to_owned()
-    }
-}
-
-async fn start_api(pool: sqlx::PgPool) -> Api {
-    let certs = common::devcerts::generate("unused").unwrap();
-    let tls = common::tls::https_server_config(&certs.server_identity().unwrap()).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let handle = axum_server::Handle::new();
-    let app = api::router(AppState {
-        pool,
-        auth: AuthSettings::default(),
-    });
-    tokio::spawn(api::serve(listener, tls, app, handle.clone()));
-
-    // Client trusts only the dev CA, so this also proves the cert chain is right.
-    let mut roots = rustls::RootCertStore::empty();
-    for ca in certs.ca().unwrap() {
-        roots.add(ca).unwrap();
-    }
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let client = Client::builder()
-        .tls_backend_preconfigured(tls)
-        .build()
-        .unwrap();
-
-    Api {
-        base: format!("https://localhost:{port}"),
-        client,
-        _handle: ApiHandle(handle),
-    }
-}
+use support::{create_user, current_code, insert_agent, start_api, start_db, wrong_code};
 
 #[tokio::test]
 async fn health_responds_over_https() {
@@ -202,9 +114,7 @@ async fn policies_are_admin_only_and_audited() {
     let db = start_db().await;
     let admin = create_user(&db.pool, "root", Role::Admin).await;
     let auditor = create_user(&db.pool, "carol", Role::Auditor).await;
-    registry::record_hello(&db.pool, "agent-1", "ab12")
-        .await
-        .unwrap();
+    insert_agent(&db.pool, "agent-1").await;
     let api = start_api(db.pool.clone()).await;
     let admin_token = api.session("root", &admin.totp_secret).await;
     let auditor_token = api.session("carol", &auditor.totp_secret).await;

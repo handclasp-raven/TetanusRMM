@@ -7,8 +7,9 @@ use common::devcerts;
 use server::api::{self, AppState};
 use server::auth::AuthSettings;
 use server::config::ServeConfig;
+use server::updates;
 use server::users::{self, Role};
-use server::{Server, ServerConfig};
+use server::{Registry, Server, ServerConfig};
 use tracing::info;
 
 #[derive(Parser)]
@@ -22,11 +23,59 @@ struct Cli {
 enum Command {
     /// Run the QUIC agent listener and the HTTPS API.
     Serve(ServeConfig),
-    /// Generate a development CA, server certificate and agent certificate.
+    /// Generate a development CA (which also signs agent certificates at
+    /// enrollment) and a server certificate.
     GenCerts(GenCertsArgs),
     /// Create a user. Reads the password from the first line of stdin and
     /// prints the TOTP secret to enrol in an authenticator app.
     CreateUser(CreateUserArgs),
+    /// Generate an ed25519 key pair for signing agent updates.
+    GenUpdateKey(GenUpdateKeyArgs),
+    /// Write a detached signature `<file>.sig` for an agent build.
+    SignUpdate(SignUpdateArgs),
+    /// Copy a signed agent build into the updates directory and publish it.
+    PublishUpdate(PublishUpdateArgs),
+}
+
+#[derive(Args)]
+struct GenUpdateKeyArgs {
+    /// Output directory for update.key (secret) and update.pub.
+    #[arg(long, default_value = "update-keys")]
+    out: PathBuf,
+    /// Replace an existing key.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct Release {
+    /// Target platform, e.g. windows-x86_64 or linux-x86_64.
+    #[arg(long)]
+    platform: String,
+    /// Semantic version of this build, e.g. 0.2.0.
+    #[arg(long)]
+    version: String,
+}
+
+#[derive(Args)]
+struct SignUpdateArgs {
+    /// Agent binary to sign.
+    file: PathBuf,
+    #[command(flatten)]
+    release: Release,
+    /// Signing key from `gen-update-key`.
+    #[arg(long, default_value = "update-keys/update.key")]
+    key: PathBuf,
+}
+
+#[derive(Args)]
+struct PublishUpdateArgs {
+    /// Signed agent binary; `<file>.sig` must exist.
+    file: PathBuf,
+    #[command(flatten)]
+    release: Release,
+    #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
+    updates_dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -34,9 +83,6 @@ struct GenCertsArgs {
     /// Output directory.
     #[arg(long, default_value = "dev-certs")]
     out: PathBuf,
-    /// Common name for the generated agent certificate.
-    #[arg(long, default_value = "dev-agent-1")]
-    agent_id: String,
     /// Replace existing certificates in the output directory.
     #[arg(long)]
     force: bool,
@@ -60,6 +106,27 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(config) => serve(config).await,
         Command::GenCerts(args) => gen_certs(args),
         Command::CreateUser(args) => create_user(args).await,
+        Command::GenUpdateKey(args) => gen_update_key(args),
+        Command::SignUpdate(args) => {
+            let sig = updates::sign_file(
+                &args.key,
+                &args.file,
+                &args.release.platform,
+                &args.release.version,
+            )?;
+            info!(signature = %sig.display(), "signed");
+            Ok(())
+        }
+        Command::PublishUpdate(args) => {
+            let manifest = updates::publish(
+                &args.updates_dir,
+                &args.file,
+                &args.release.platform,
+                &args.release.version,
+            )?;
+            info!(platform = %manifest.platform, version = %manifest.version, sha256 = %manifest.sha256, "published");
+            Ok(())
+        }
     }
 }
 
@@ -74,7 +141,13 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             .context("loading server certificate (run `gen-certs` first?)")?,
         client_ca: config.agent_ca().context("loading agent CA")?,
     })?
-    .with_registry(pool.clone());
+    .with_registry(Registry {
+        pool: pool.clone(),
+        ca: config
+            .enrollment_ca()
+            .context("loading CA key for enrollment (re-run `gen-certs --force`?)")?,
+        api_url: config.public_url(),
+    });
 
     let tls = common::tls::https_server_config(
         &config.api_identity().context("loading API certificate")?,
@@ -84,6 +157,8 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         auth: AuthSettings {
             session_ttl: config.session_ttl(),
         },
+        public_url: config.public_url(),
+        updates_dir: config.updates_dir.clone(),
     });
     let listener = std::net::TcpListener::bind(config.api_listen)
         .with_context(|| format!("binding API listener on {}", config.api_listen))?;
@@ -113,9 +188,29 @@ fn gen_certs(args: GenCertsArgs) -> anyhow::Result<()> {
             args.out.display()
         );
     }
-    let certs = devcerts::generate(&args.agent_id)?;
+    let certs = devcerts::generate("unused")?;
     certs.write_to_dir(&args.out)?;
-    info!(dir = %args.out.display(), agent_id = %args.agent_id, "wrote dev certificates");
+    info!(dir = %args.out.display(), "wrote dev CA and server certificate");
+    Ok(())
+}
+
+fn gen_update_key(args: GenUpdateKeyArgs) -> anyhow::Result<()> {
+    if args.out.join(updates::SIGNING_KEY_FILE).exists() && !args.force {
+        bail!(
+            "{} already contains an update key; pass --force to replace it \
+             (agents built with the old public key will reject updates signed by the new one)",
+            args.out.display()
+        );
+    }
+    let key = updates::generate_key();
+    updates::write_key_pair(&args.out, &key)?;
+    info!(dir = %args.out.display(), "wrote update signing key");
+    // Command output, not logging: the operator needs this to build agents.
+    writeln!(
+        std::io::stdout().lock(),
+        "RMM_UPDATE_PUBKEY={}",
+        updates::public_key_hex(&key.verifying_key())
+    )?;
     Ok(())
 }
 

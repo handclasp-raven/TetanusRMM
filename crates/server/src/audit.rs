@@ -33,6 +33,8 @@ pub enum Action {
     LoginBadTotp,
     Logout,
     PolicyUpdate,
+    EnrollmentCreate,
+    AgentEnroll,
 }
 
 impl Action {
@@ -44,6 +46,8 @@ impl Action {
             Action::LoginBadTotp => "login.bad_totp",
             Action::Logout => "logout",
             Action::PolicyUpdate => "policy.update",
+            Action::EnrollmentCreate => "enrollment.create",
+            Action::AgentEnroll => "agent.enroll",
         }
     }
 }

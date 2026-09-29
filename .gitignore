@@ -1,2 +1,5 @@
 /target
 /dev-certs
+/updates
+/update-keys
+/agent-state
