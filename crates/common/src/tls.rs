@@ -92,3 +92,15 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError>
     }
     Ok(certs)
 }
+
+/// rustls config for an HTTPS server presenting `identity` (no client certs).
+pub fn https_server_config(identity: &Identity) -> Result<rustls::ServerConfig, TlsError> {
+    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}

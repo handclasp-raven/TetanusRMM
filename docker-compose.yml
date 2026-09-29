@@ -1,0 +1,49 @@
+# Local deployment: server + Postgres.
+#
+#   cargo run -p server -- gen-certs     # once, creates ./dev-certs
+#   docker compose up --build
+#
+# Settings can be overridden in a .env file next to this one (see README).
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rmm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rmm-dev-password}
+      POSTGRES_DB: ${POSTGRES_DB:-rmm}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  server:
+    build: .
+    image: rmm-server:dev
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    # Run as the host user so the server can read the 0600 dev keys in the
+    # bind-mounted ./dev-certs. Set RMM_UID/RMM_GID in .env if yours differ.
+    user: "${RMM_UID:-1000}:${RMM_GID:-1000}"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-rmm}:${POSTGRES_PASSWORD:-rmm-dev-password}@db:5432/${POSTGRES_DB:-rmm}
+      RMM_DB_MAX_CONNECTIONS: ${RMM_DB_MAX_CONNECTIONS:-10}
+      RMM_QUIC_LISTEN: 0.0.0.0:4433
+      RMM_API_LISTEN: 0.0.0.0:8443
+      RMM_CERTS_DIR: /certs
+      RMM_SESSION_TTL_SECS: ${RMM_SESSION_TTL_SECS:-43200}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./dev-certs:/certs:ro
+    ports:
+      - "${RMM_API_PORT:-8443}:8443/tcp"
+      - "${RMM_QUIC_PORT:-4433}:4433/udp"
+
+volumes:
+  pgdata:

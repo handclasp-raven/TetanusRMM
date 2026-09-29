@@ -1,0 +1,162 @@
+//! Agent registry and per-device consent policies.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::PgPool;
+
+use crate::audit::{self, Action, NewEntry};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "enrollment_state", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentState {
+    Pending,
+    Enrolled,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "consent_mode", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentMode {
+    Require,
+    Notify,
+    Unattended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "on_no_user", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum OnNoUser {
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct Agent {
+    pub id: String,
+    pub enrollment_state: EnrollmentState,
+    pub cert_fingerprint: Option<String>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub cpu_percent: Option<f32>,
+    pub mem_used_bytes: Option<i64>,
+    pub mem_total_bytes: Option<i64>,
+    pub disk_used_bytes: Option<i64>,
+    pub disk_total_bytes: Option<i64>,
+    pub uptime_secs: Option<i64>,
+    pub telemetry_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DevicePolicy {
+    pub consent_mode: ConsentMode,
+    pub on_no_user: OnNoUser,
+    pub consent_timeout_secs: i32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyError {
+    #[error("no such agent")]
+    NotFound,
+    #[error("consent_timeout_secs must be between 1 and 3600")]
+    InvalidTimeout,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Record an authenticated agent's Hello: create it on first sight (with the
+/// default policy), and refresh its fingerprint and `last_seen`.
+///
+/// Any agent with a certificate from the configured CA is treated as
+/// enrolled. Token enrollment and certificate pinning arrive in Phase 3.
+pub async fn record_hello(
+    pool: &PgPool,
+    agent_id: &str,
+    cert_fingerprint: &str,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO agents (id, enrollment_state, cert_fingerprint, last_seen)
+         VALUES ($1, 'enrolled', $2, now())
+         ON CONFLICT (id) DO UPDATE
+         SET cert_fingerprint = EXCLUDED.cert_fingerprint, last_seen = now()",
+    )
+    .bind(agent_id)
+    .bind(cert_fingerprint)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO device_policies (agent_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// Update `last_seen` on heartbeat.
+pub async fn touch(pool: &PgPool, agent_id: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE agents SET last_seen = now() WHERE id = $1")
+        .bind(agent_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_agents(pool: &PgPool) -> sqlx::Result<Vec<Agent>> {
+    sqlx::query_as("SELECT * FROM agents ORDER BY id")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn get_policy(pool: &PgPool, agent_id: &str) -> sqlx::Result<Option<DevicePolicy>> {
+    sqlx::query_as(
+        "SELECT consent_mode, on_no_user, consent_timeout_secs
+         FROM device_policies WHERE agent_id = $1",
+    )
+    .bind(agent_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Replace an agent's policy. Audited as `policy.update` with before and after.
+pub async fn update_policy(
+    pool: &PgPool,
+    actor: &str,
+    agent_id: &str,
+    policy: DevicePolicy,
+) -> Result<DevicePolicy, PolicyError> {
+    if !(1..=3600).contains(&policy.consent_timeout_secs) {
+        return Err(PolicyError::InvalidTimeout);
+    }
+    let mut tx = pool.begin().await?;
+    let before: Option<DevicePolicy> = sqlx::query_as(
+        "SELECT consent_mode, on_no_user, consent_timeout_secs
+         FROM device_policies WHERE agent_id = $1 FOR UPDATE",
+    )
+    .bind(agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let before = before.ok_or(PolicyError::NotFound)?;
+
+    sqlx::query(
+        "UPDATE device_policies
+         SET consent_mode = $2, on_no_user = $3, consent_timeout_secs = $4, updated_at = now()
+         WHERE agent_id = $1",
+    )
+    .bind(agent_id)
+    .bind(policy.consent_mode)
+    .bind(policy.on_no_user)
+    .bind(policy.consent_timeout_secs)
+    .execute(&mut *tx)
+    .await?;
+    audit::append(
+        &mut tx,
+        NewEntry::new(actor, Action::PolicyUpdate)
+            .target(agent_id)
+            .detail(json!({ "before": before, "after": policy })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(policy)
+}

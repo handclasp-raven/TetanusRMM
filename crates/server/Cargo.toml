@@ -1,6 +1,6 @@
 [package]
 name = "server"
-description = "Central RMM server: QUIC listener for agents."
+description = "Central RMM server: QUIC listener for agents, HTTPS API for users."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,27 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+chrono.workspace = true
 clap.workspace = true
 common.workspace = true
+futures-util.workspace = true
+hex.workspace = true
 protocol.workspace = true
 quinn.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+totp-rs.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 agent.workspace = true
+reqwest.workspace = true
+testcontainers-modules.workspace = true

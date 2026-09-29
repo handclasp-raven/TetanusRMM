@@ -33,3 +33,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1.9", features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
+argon2 = "0.6"
+axum = "0.8"
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+ring = "0.17"
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "macros", "derive", "migrate", "chrono", "json"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+totp-rs = { version = "6", default-features = false, features = ["std", "otpauth"] }
