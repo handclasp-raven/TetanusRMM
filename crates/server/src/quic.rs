@@ -22,11 +22,23 @@
 //! A viewer's session starts only after consent: the server sends the
 //! agent a `SessionRequest` with the device's policy, waits for its
 //! `SessionDecision`, and audits the mode and outcome (`session.start`).
-//! A refused viewer is closed with `CONSENT_REFUSED` and the reason. Once
-//! started, the viewer's input and clipboard are relayed to the agent
-//! tagged with the session id, and the agent's clipboard goes to every
-//! viewer. The user's Ctrl+F12 (`UserTerminatedSessions`) closes every
-//! viewer of that agent with `USER_TERMINATED`, audited per session.
+//! A refused viewer is closed with `CONSENT_REFUSED` and the reason. The
+//! user's Ctrl+F12 (`UserTerminatedSessions`) closes every viewer of that
+//! agent with `USER_TERMINATED`, audited per session.
+//!
+//! Sessions are end-to-end encrypted between agent and viewer (see
+//! `protocol::e2e`). The viewer sends its session key right after
+//! `ViewerHello`; the server hands it to the agent with the session request
+//! (`SessionViewerKey`), which is how the agent knows who it is talking
+//! to. After that the server only relays: `Sealed` records between the
+//! agent and that session's viewer, and sealed video. It never sees input,
+//! clipboard, screen content, or the signaling for a direct path. Both
+//! ends must speak protocol 8; older viewers and agents are refused
+//! (`OUTDATED`) rather than served in the clear.
+//!
+//! When a session moves to a direct path, the viewer says so
+//! (`PathReport`): the relay stops sending it video, and the move is
+//! counted in metrics and the audit log (`session.path`).
 //!
 //! Without a registry (tests only), any certificate from the CA may say
 //! `Hello` and enrollment is unavailable.
@@ -36,21 +48,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::Identity;
-use protocol::clipboard::MAX_CLIPBOARD_BYTES;
 use protocol::consent::{ConsentMode, OnNoUser, Outcome, SessionRequest};
+use protocol::e2e::{Path, KEY_LEN, MAX_SEALED_LEN};
 use protocol::media::MediaFrame;
 use protocol::{close_code, read_frame, write_frame, FrameError, Message};
 use quinn::rustls::pki_types::CertificateDer;
 use ring::digest::{digest, SHA256};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use transport::{Connection, ConnectionError, TransportKind};
 
 use crate::enroll::{self, AgentCa, EnrollError};
-use crate::metrics::{self, ConnectedGuard, ReasonLabels, ResultLabels, SessionLabels};
+use crate::metrics::{self, ConnectedGuard, PathGauge, ReasonLabels, ResultLabels, SessionLabels};
 use crate::registry;
 use crate::relay::Hub;
 use crate::viewers::{self, ViewerError, ViewerGrant};
@@ -62,8 +73,21 @@ const ENROLL_LINGER: Duration = Duration::from_secs(10);
 /// timeout, before the server gives up (`consent_unavailable`).
 const DECISION_GRACE: Duration = Duration::from_secs(15);
 
-/// Oldest agent protocol that enforces consent. Older agents cannot be viewed.
-const MIN_CONSENT_VERSION: u32 = 4;
+/// What agents and viewers are told about direct paths (`PeerConfig`).
+#[derive(Debug, Clone, Copy)]
+struct PeerPolicy {
+    direct: bool,
+    stun_port: Option<u16>,
+}
+
+impl PeerPolicy {
+    fn message(self) -> Message {
+        Message::PeerConfig {
+            direct: self.direct,
+            stun_port: self.stun_port,
+        }
+    }
+}
 
 pub struct ServerConfig {
     /// UDP address for QUIC.
@@ -142,6 +166,8 @@ enum ConnError {
     ConsentRefused(Outcome),
     #[error("the user ended the session")]
     UserTerminated,
+    #[error("outdated: {0}")]
+    Outdated(&'static str),
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -153,6 +179,7 @@ pub struct Server {
     events: Option<UnboundedSender<ServerEvent>>,
     registry: Option<Arc<Registry>>,
     hub: Arc<Hub>,
+    peer: PeerPolicy,
 }
 
 /// Per-connection context shared with the connection task.
@@ -161,6 +188,7 @@ struct Hooks {
     events: Option<UnboundedSender<ServerEvent>>,
     registry: Option<Arc<Registry>>,
     hub: Arc<Hub>,
+    peer: PeerPolicy,
 }
 
 impl Hooks {
@@ -196,7 +224,19 @@ impl Server {
             events: None,
             registry: None,
             hub: Hub::new(),
+            peer: PeerPolicy {
+                direct: true,
+                stun_port: None,
+            },
         })
+    }
+
+    /// Whether sessions may try direct paths (default: yes), and the port
+    /// of the STUN responder on this server's address, if one runs
+    /// (default: none, so peers offer only their local addresses).
+    pub fn with_direct_paths(mut self, direct: bool, stun_port: Option<u16>) -> Self {
+        self.peer = PeerPolicy { direct, stun_port };
+        self
     }
 
     /// The media relay (shared with the HTTPS API).
@@ -231,6 +271,7 @@ impl Server {
             events: self.events.clone(),
             registry: self.registry.clone(),
             hub: self.hub.clone(),
+            peer: self.peer,
         }
     }
 
@@ -344,6 +385,7 @@ async fn handle_connection(
         Err(ConnError::AgentOffline) => Some("agent_offline"),
         Err(ConnError::ConsentRefused(_)) => Some("consent_refused"),
         Err(ConnError::UserTerminated) => Some("user_terminated"),
+        Err(ConnError::Outdated(_)) => Some("outdated"),
         Err(ConnError::Db(_)) => Some("server_error"),
         _ => None,
     };
@@ -375,6 +417,9 @@ async fn handle_connection(
                 close_code::USER_TERMINATED,
                 Outcome::UserTerminatedSession.refusal_reason().as_bytes(),
             );
+        }
+        Err(ConnError::Outdated(reason)) => {
+            conn.close(close_code::OUTDATED, reason.as_bytes());
         }
         Err(ConnError::Db(e)) => {
             error!(conn_id, "database error: {e}");
@@ -416,6 +461,17 @@ async fn dispatch(
                 .registry
                 .as_ref()
                 .ok_or(ConnError::Unauthorized("viewing is not available"))?;
+            // Checked before the token is spent, so an updated viewer can
+            // still use it.
+            if version < protocol::MIN_E2E_VERSION {
+                return Err(ConnError::Outdated(
+                    "this viewer is too old: sessions are end-to-end encrypted; update it",
+                ));
+            }
+            let key = match read_frame(&mut recv).await? {
+                Some(Message::ViewerKey { public }) => public,
+                _ => return Err(ConnError::Protocol("expected ViewerKey after ViewerHello")),
+            };
             let grant = match viewers::connect(&registry.pool, &token).await {
                 Ok(grant) => grant,
                 Err(ViewerError::Db(e)) => return Err(e.into()),
@@ -430,19 +486,24 @@ async fn dispatch(
                 agent_id: grant.agent_id.clone(),
                 username: grant.username.clone(),
             });
-            let mut frames_sent = 0;
+            let mut ended = Ended {
+                frames_sent: 0,
+                path: Path::Relayed,
+            };
             let viewer = ViewerConn {
                 conn,
                 version,
+                key,
                 send,
                 recv,
             };
-            let result =
-                serve_viewer(viewer, &registry.pool, &grant, hooks, &mut frames_sent).await;
-            if let Err(e) = viewers::end(&registry.pool, &grant, frames_sent).await {
+            let result = serve_viewer(viewer, &registry.pool, &grant, hooks, &mut ended).await;
+            if let Err(e) =
+                viewers::end(&registry.pool, &grant, ended.frames_sent, ended.path).await
+            {
                 warn!(conn_id, "recording viewer disconnect failed: {e}");
             }
-            info!(conn_id, frames_sent, "viewer disconnected");
+            info!(conn_id, frames_sent = ended.frames_sent, path = %ended.path, "viewer disconnected");
             result
         }
         (Some(Message::Hello { .. }), None) => {
@@ -516,6 +577,9 @@ async fn serve_agent(
     if version >= 3 {
         let _ = to_agent.send(Message::ListMonitors);
     }
+    if version >= protocol::MIN_E2E_VERSION {
+        let _ = to_agent.send(hooks.peer.message());
+    }
 
     let writer = async {
         while let Some(msg) = outbox.recv().await {
@@ -570,10 +634,12 @@ async fn serve_agent(
                     info!(%agent_id, session_id, %outcome, "consent decided");
                     link.on_decision(session_id, outcome);
                 }
-                Message::Clipboard(data) => {
-                    if data.size() <= MAX_CLIPBOARD_BYTES {
-                        link.on_clipboard(data);
+                Message::Sealed { session_id, data } => {
+                    if data.len() > MAX_SEALED_LEN {
+                        return Err(ConnError::Protocol("oversized sealed record"));
                     }
+                    metrics::get().sealed_records.inc();
+                    link.on_sealed(session_id, data);
                 }
                 Message::UserTerminatedSessions => {
                     metrics::get().user_terminations.inc();
@@ -620,27 +686,37 @@ async fn serve_agent(
     result
 }
 
-/// A viewer session with `grant.agent_id`, through the relay: consent
-/// first, then video out and input/clipboard in.
 /// A viewer's connection and control stream.
 struct ViewerConn<'a> {
     conn: &'a Connection,
     /// Protocol version from its `ViewerHello`.
     version: u32,
+    /// Its Noise static key for this session.
+    key: [u8; KEY_LEN],
     send: transport::SendStream,
     recv: transport::RecvStream,
 }
 
+/// How a viewer session went, for its `viewer.disconnect` record.
+struct Ended {
+    frames_sent: u64,
+    /// The path it was on at the end.
+    path: Path,
+}
+
+/// A viewer session with `grant.agent_id`: consent first, then video out
+/// through the relay and sealed records both ways, until the session ends.
 async fn serve_viewer(
     viewer: ViewerConn<'_>,
     pool: &PgPool,
     grant: &ViewerGrant,
     hooks: &Hooks,
-    frames_sent: &mut u64,
+    ended: &mut Ended,
 ) -> Result<(), ConnError> {
     let ViewerConn {
         conn,
         version,
+        key,
         mut send,
         mut recv,
     } = viewer;
@@ -663,11 +739,14 @@ async fn serve_viewer(
         ),
         None => (ConsentMode::Notify, OnNoUser::Deny, 30),
     };
-    if link.version < MIN_CONSENT_VERSION {
-        // It would ignore the request: refuse rather than skip consent.
-        warn!(agent_id = %grant.agent_id, version = link.version, "agent too old to enforce consent");
+    if link.version < protocol::MIN_E2E_VERSION {
+        // It would send the session in the clear (and, before protocol 4,
+        // ignore consent): refuse. It updates itself.
+        warn!(agent_id = %grant.agent_id, version = link.version, "agent too old for end-to-end encryption");
         viewers::record_consent(pool, grant, mode, Outcome::ConsentUnavailable).await?;
-        return Err(ConnError::ConsentRefused(Outcome::ConsentUnavailable));
+        return Err(ConnError::Outdated(
+            "the agent is too old for end-to-end encrypted sessions; it will update itself",
+        ));
     }
     // From here on, however this ends, the agent hears that it did.
     let _ended = EndSession {
@@ -677,6 +756,11 @@ async fn serve_viewer(
     if mode == ConsentMode::Require {
         write_frame(&mut send, &Message::ConsentPending { timeout_secs }).await?;
     }
+    // Which viewer the agent may complete the session's handshake with.
+    link.send(Message::SessionViewerKey {
+        session_id,
+        public: key,
+    });
     let decision = link.request_session(SessionRequest {
         session_id,
         technician: grant.username.clone(),
@@ -722,7 +806,7 @@ async fn serve_viewer(
     let viewer_id = hooks.hub.next_viewer_id();
     let mut monitors = link.monitors();
     let mut stream_monitor = link.stream_monitor();
-    let mut clipboard = link.clipboard();
+    let mut sealed = link.route_sealed(session_id);
 
     let (to_viewer, mut outbox) = mpsc::unbounded_channel::<Message>();
     let _ = to_viewer.send(Message::ViewerWelcome {
@@ -735,9 +819,12 @@ async fn serve_viewer(
         let _ = to_viewer.send(Message::EnableFrameAcks);
         link.track_viewer(viewer_id)
     });
+    let _ = to_viewer.send(hooks.peer.message());
     let mut subscription = link.subscribe(viewer_id);
     let mut video = conn.open_uni().await?;
     let _connected = ConnectedGuard::viewer(conn.kind());
+    let mut path = PathGauge::relayed();
+    let frames_sent = &mut ended.frames_sent;
 
     let writer = async {
         while let Some(msg) = outbox.recv().await {
@@ -772,11 +859,9 @@ async fn serve_viewer(
                         let _ = to_viewer.send(Message::StreamMonitor { monitor });
                     }
                 }
-                data = clipboard.recv() => match data {
-                    Ok(data) => { let _ = to_viewer.send(Message::Clipboard(data)); }
-                    // Missed some: only the latest matters, and it comes next.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
+                data = sealed.records.recv() => match data {
+                    Some(data) => { let _ = to_viewer.send(Message::Sealed { session_id, data }); }
+                    None => break,
                 },
                 _ = terminations.changed() => {
                     viewers::record_user_terminated(pool, grant).await?;
@@ -797,15 +882,21 @@ async fn serve_viewer(
                         tracked.acked(seq);
                     }
                 }
-                Message::Input(event) => link.send(Message::SessionInput { session_id, event }),
-                Message::Clipboard(data) if data.size() <= MAX_CLIPBOARD_BYTES => {
-                    link.send(Message::SessionClipboard { session_id, data })
+                Message::Sealed { data, .. } => {
+                    if data.len() > MAX_SEALED_LEN {
+                        return Err(ConnError::Protocol("oversized sealed record"));
+                    }
+                    metrics::get().sealed_records.inc();
+                    link.to_agent_sealed(session_id, data);
                 }
-                Message::Clipboard(data) => {
-                    warn!(
-                        bytes = data.size(),
-                        "oversized clipboard from viewer dropped"
-                    )
+                Message::PathReport(reported) => {
+                    let before = path.current();
+                    path.report(reported);
+                    info!(session_id, from = %before, path = %reported, "session path");
+                    if reported != Path::DirectFailed {
+                        link.set_direct(viewer_id, reported == Path::Direct, tracked.as_ref());
+                    }
+                    viewers::record_path(pool, grant, reported).await?;
                 }
                 other => {
                     warn!(?other, "unexpected message from viewer");
@@ -816,12 +907,14 @@ async fn serve_viewer(
         Ok(())
     };
 
-    tokio::select! {
+    let result = tokio::select! {
         r = writer => r,
         r = forward => r,
         r = notify => r,
         r = reader => r,
-    }
+    };
+    ended.path = path.current();
+    result
 }
 
 fn enrollment_result(result: &'static str) {

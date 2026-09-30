@@ -10,7 +10,10 @@
 //! - [`registry`]: agents and per-device policies.
 //! - [`enroll`]: enrollment tokens and the internal CA for agent certificates.
 //! - [`updates`]: signing and publishing agent updates.
-//! - [`relay`]: fan-out of agent video to viewers.
+//! - [`relay`]: fan-out of agent video to viewers, and routing of each
+//!   session's end-to-end sealed records (the server cannot read either).
+//! - [`stun`]: STUN responder, for agents and viewers gathering public
+//!   addresses to connect directly.
 //! - [`viewers`]: short-lived viewer-session tokens.
 //! - [`remote`]: remote shell, script runner and file transfer, relayed to
 //!   agents for API clients (no viewer needed).
@@ -28,6 +31,7 @@ pub mod quic;
 pub mod registry;
 pub mod relay;
 pub mod remote;
+pub mod stun;
 pub mod updates;
 pub mod users;
 pub mod viewers;

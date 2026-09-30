@@ -44,6 +44,9 @@ pub enum Action {
     SessionStart,
     /// The user ended a session with the Ctrl+F12 kill switch.
     SessionUserTerminated,
+    /// A session moved between the relay and a direct path, or a direct
+    /// attempt failed; detail has the path, never content.
+    SessionPath,
     /// A remote operation was refused because of the user's role.
     PermissionDenied,
     /// An interactive shell was requested; detail says whether it started.
@@ -87,6 +90,7 @@ impl Action {
             Action::PolicyDefault => "policy.default",
             Action::SessionStart => "session.start",
             Action::SessionUserTerminated => "session.user_terminated",
+            Action::SessionPath => "session.path",
             Action::PermissionDenied => "permission.denied",
             Action::ShellOpen => "shell.open",
             Action::ShellClose => "shell.close",

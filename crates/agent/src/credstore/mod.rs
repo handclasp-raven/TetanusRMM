@@ -68,6 +68,7 @@ impl Credential {
             desktop: None,
             device_kind: crate::device::kind(),
             hostname: crate::device::hostname(),
+            direct: peer::DirectSettings::default(),
         })
     }
 }

@@ -2,6 +2,8 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
+pub mod source;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +27,8 @@ pub const PASSWORD: &str = "correct horse battery staple";
 /// A throwaway Postgres with the schema migrated. The container is removed on drop.
 pub struct TestDb {
     pub pool: PgPool,
+    /// Host TCP port of the Postgres container.
+    pub port: u16,
     _container: ContainerAsync<Postgres>,
 }
 
@@ -53,6 +57,7 @@ pub async fn start_db_unmigrated() -> TestDb {
         .expect("connect");
     TestDb {
         pool,
+        port,
         _container: container,
     }
 }
@@ -208,6 +213,30 @@ pub fn start_quic(
     pool: PgPool,
     certs: &DevCerts,
 ) -> (Arc<Server>, SocketAddr, UnboundedReceiver<ServerEvent>) {
+    start_quic_with(pool, certs, |server| server)
+}
+
+/// [`start_quic`] with a STUN responder, announced to agents and viewers
+/// as `serve` does, so sessions can try direct paths.
+pub async fn start_quic_direct(
+    pool: PgPool,
+    certs: &DevCerts,
+) -> (Arc<Server>, SocketAddr, UnboundedReceiver<ServerEvent>) {
+    let stun = server::stun::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let port = stun.local_addr().unwrap().port();
+    tokio::spawn(server::stun::serve(stun));
+    start_quic_with(pool, certs, |server| {
+        server.with_direct_paths(true, Some(port))
+    })
+}
+
+fn start_quic_with(
+    pool: PgPool,
+    certs: &DevCerts,
+    configure: impl FnOnce(Server) -> Server,
+) -> (Arc<Server>, SocketAddr, UnboundedReceiver<ServerEvent>) {
     let (tx, rx) = unbounded_channel();
     let quic = Server::bind(ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -222,6 +251,7 @@ pub fn start_quic(
         ca: AgentCa::from_pem(&certs.ca_cert, &certs.ca_key).unwrap(),
         api_url: "https://localhost:8443".into(),
     });
+    let quic = configure(quic);
     let addr = quic.local_addr().unwrap();
     let quic = Arc::new(quic);
     let runner = quic.clone();

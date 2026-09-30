@@ -13,11 +13,22 @@
 //! agent must start/stop streaming or send a keyframe.
 //!
 //! Frames are relayed as opaque [`MediaFrame`]s: the server reads only the
-//! `seq`/`keyframe` header, never the payload (see `protocol::media`).
+//! `seq`/`keyframe` header, never the payload, which the agent seals end to
+//! end (see `protocol::e2e`).
 //!
 //! The link also carries interactive sessions: consent requests and the
-//! agent's decisions, the agent's clipboard (to every viewer), and the
-//! user's Ctrl+F12 kill switch (every viewer is dropped).
+//! agent's decisions, each session's sealed records (input, clipboard and
+//! direct-path signaling, which only agent and viewer can read) routed
+//! between the agent and that session's viewer, and the user's Ctrl+F12
+//! kill switch (every viewer is dropped).
+//!
+//! A session that moves to a direct path stays subscribed (it still
+//! counts as watching, and still selects monitors and asks for keyframes
+//! through the server) but the relay stops sending it video; if it falls
+//! back, video resumes from a keyframe.
+//!
+//! [`Hub::observe`] shows everything the relay handles for sessions, as it
+//! handles it, so tests can check that it is all ciphertext.
 //!
 //! And it closes the adaptive-bitrate loop (see `agent::media::rate`): it
 //! notes when each frame arrived, times viewers' acknowledgements against
@@ -32,7 +43,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use protocol::clipboard::ClipboardData;
 use protocol::consent::{Outcome, SessionRequest};
 use protocol::media::{MediaFrame, MonitorInfo, SendLog, StreamReport};
 use protocol::{Message, MIN_ADAPTIVE_VERSION};
@@ -72,8 +82,9 @@ pub struct AgentLink {
     closed: watch::Sender<bool>,
     /// Session requests awaiting the agent's consent decision.
     decisions: Mutex<HashMap<u64, oneshot::Sender<Outcome>>>,
-    /// The remote user's clipboard, to every viewer.
-    clipboard: broadcast::Sender<ClipboardData>,
+    /// Where the agent's sealed records for each session go (its viewer).
+    sealed: Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
+    observer: broadcast::Sender<Observed>,
     /// Bumped each time the user presses Ctrl+F12.
     terminations: watch::Sender<u64>,
     /// The agent's connection, for opening remote-operation streams
@@ -94,8 +105,34 @@ impl Drop for ActiveShell {
     }
 }
 
-/// Clipboard updates buffered per viewer.
-const CLIPBOARD_QUEUE: usize = 4;
+/// What [`Hub::observe`] reports.
+#[derive(Debug, Clone)]
+pub enum Observed {
+    /// A video frame from an agent, as relayed.
+    Frame(Arc<MediaFrame>),
+    /// A sealed record's bytes, either way, as relayed.
+    Sealed(Vec<u8>),
+}
+
+/// Observations buffered for a slow observer.
+const OBSERVER_QUEUE: usize = 4096;
+
+/// A session's sealed records from the agent, until dropped.
+pub struct SealedRoute {
+    pub records: mpsc::UnboundedReceiver<Vec<u8>>,
+    session_id: u64,
+    link: Arc<AgentLink>,
+}
+
+impl Drop for SealedRoute {
+    fn drop(&mut self) {
+        lock(&self.link.sealed).remove(&self.session_id);
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A viewer's subscription. Unsubscribes on drop.
 pub struct Subscription {
@@ -186,9 +223,39 @@ impl AgentLink {
         self.send(Message::SessionEnded { session_id });
     }
 
-    /// The user's clipboard changes, for one viewer.
-    pub fn clipboard(&self) -> broadcast::Receiver<ClipboardData> {
-        self.clipboard.subscribe()
+    /// Receive the agent's sealed records for `session_id`.
+    pub fn route_sealed(self: &Arc<Self>, session_id: u64) -> SealedRoute {
+        let (tx, records) = mpsc::unbounded_channel();
+        lock(&self.sealed).insert(session_id, tx);
+        SealedRoute {
+            records,
+            session_id,
+            link: self.clone(),
+        }
+    }
+
+    /// A sealed record from session `session_id`'s viewer, for the agent.
+    pub fn to_agent_sealed(&self, session_id: u64, data: Vec<u8>) {
+        self.observe(|| Observed::Sealed(data.clone()));
+        self.send(Message::Sealed { session_id, data });
+    }
+
+    fn observe(&self, what: impl FnOnce() -> Observed) {
+        if self.observer.receiver_count() > 0 {
+            let _ = self.observer.send(what());
+        }
+    }
+
+    /// Viewer `id`'s session moved to a direct path (`true`) or back to the
+    /// relay. While direct it gets no video from the relay and, having no
+    /// relayed frames to acknowledge, does not count towards the agent's
+    /// bitrate here (the agent tracks it itself).
+    pub fn set_direct(&self, id: ViewerId, direct: bool, tracked: Option<&TrackedViewer>) {
+        let actions = self.fanout().set_direct(id, direct, Instant::now());
+        self.apply(actions);
+        if let Some(tracked) = tracked {
+            tracked.set_counted(!direct);
+        }
     }
 
     /// Changes when the user presses Ctrl+F12.
@@ -257,9 +324,13 @@ impl AgentLink {
         }
     }
 
-    /// The agent's user copied something.
-    pub fn on_clipboard(&self, data: ClipboardData) {
-        let _ = self.clipboard.send(data);
+    /// A sealed record from the agent for session `session_id`'s viewer.
+    /// Dropped if that session has no viewer (any more).
+    pub fn on_sealed(&self, session_id: u64, data: Vec<u8>) {
+        self.observe(|| Observed::Sealed(data.clone()));
+        if let Some(route) = lock(&self.sealed).get(&session_id) {
+            let _ = route.send(data);
+        }
     }
 
     /// The agent's user pressed Ctrl+F12: every viewer must go.
@@ -270,7 +341,9 @@ impl AgentLink {
     pub fn on_frame(&self, frame: MediaFrame) {
         let now = Instant::now();
         let report = self.record_arrival(&frame, now);
-        let actions = self.fanout().on_frame(Arc::new(frame), now);
+        let frame = Arc::new(frame);
+        self.observe(|| Observed::Frame(frame.clone()));
+        let actions = self.fanout().on_frame(frame, now);
         self.apply(actions);
         if let Some(report) = report {
             self.send(Message::StreamReport(report));
@@ -373,6 +446,19 @@ impl TrackedViewer {
     pub fn acked(&self, seq: u64) {
         self.tracker().acked(seq, Instant::now());
     }
+
+    /// Count this viewer's delay (on the relay) or not (on a direct path).
+    /// Counting again starts afresh: frames it missed meanwhile must not
+    /// read as a stall.
+    fn set_counted(&self, counted: bool) {
+        let mut delivery = self.link.delivery();
+        if counted {
+            *self.tracker() = ViewerDelay::default();
+            delivery.viewers.insert(self.id, self.tracker.clone());
+        } else {
+            delivery.viewers.remove(&self.id);
+        }
+    }
 }
 
 impl Drop for TrackedViewer {
@@ -382,15 +468,32 @@ impl Drop for TrackedViewer {
 }
 
 /// All connected agents.
-#[derive(Default)]
 pub struct Hub {
     agents: Mutex<HashMap<String, Arc<AgentLink>>>,
     next_viewer: AtomicU64,
+    observer: broadcast::Sender<Observed>,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            agents: Mutex::default(),
+            next_viewer: AtomicU64::default(),
+            observer: broadcast::channel(OBSERVER_QUEUE).0,
+        }
+    }
 }
 
 impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Everything relayed for sessions from now on: video frames and
+    /// sealed records, exactly as the relay handles them. For tests and
+    /// debugging; costs nothing while nobody observes.
+    pub fn observe(&self) -> broadcast::Receiver<Observed> {
+        self.observer.subscribe()
     }
 
     fn agents(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AgentLink>>> {
@@ -416,7 +519,8 @@ impl Hub {
             stream_monitor: watch::channel(None).0,
             closed: watch::channel(false).0,
             decisions: Mutex::new(HashMap::new()),
-            clipboard: broadcast::channel(CLIPBOARD_QUEUE).0,
+            sealed: Mutex::new(HashMap::new()),
+            observer: self.observer.clone(),
             terminations: watch::channel(0).0,
             connection,
             shells: AtomicUsize::new(0),
@@ -546,15 +650,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clipboard_and_kill_switch_reach_every_viewer() {
+    async fn sealed_records_reach_only_their_session_and_are_observable() {
+        let hub = Hub::new();
+        let mut observed = hub.observe();
+        let (tx, mut to_agent) = mpsc::unbounded_channel();
+        let link = hub.register("agt-1", 8, tx, None);
+        let mut one = link.route_sealed(1);
+        let mut two = link.route_sealed(2);
+        link.on_sealed(2, vec![7]);
+        link.on_sealed(3, vec![8]); // no such session: dropped
+        assert_eq!(two.records.try_recv().unwrap(), [7]);
+        assert!(one.records.try_recv().is_err());
+        link.to_agent_sealed(1, vec![9]);
+        assert_eq!(
+            drain(&mut to_agent),
+            [Message::Sealed {
+                session_id: 1,
+                data: vec![9]
+            }]
+        );
+        let seen: Vec<Vec<u8>> = std::iter::from_fn(|| observed.try_recv().ok())
+            .map(|o| match o {
+                Observed::Sealed(d) => d,
+                Observed::Frame(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(seen, [vec![7], vec![8], vec![9]]);
+        drop(two);
+        link.on_sealed(2, vec![1]);
+        assert!(lock(&link.sealed).get(&2).is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_switch_reaches_every_viewer() {
         let hub = Hub::new();
         let link = hub.register("agt-1", 4, mpsc::unbounded_channel().0, None);
-        let (mut a, mut b) = (link.clipboard(), link.clipboard());
         let (mut ka, mut kb) = (link.terminations(), link.terminations());
-        link.on_clipboard(ClipboardData::Text("hi".into()));
-        for rx in [&mut a, &mut b] {
-            assert_eq!(rx.recv().await.unwrap(), ClipboardData::Text("hi".into()));
-        }
         link.user_terminated();
         for rx in [&mut ka, &mut kb] {
             rx.changed().await.unwrap();

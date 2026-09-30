@@ -22,7 +22,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the QUIC agent listener and the HTTPS API.
-    Serve(ServeConfig),
+    Serve(Box<ServeConfig>),
     /// Generate a development CA (which also signs agent certificates at
     /// enrollment) and a server certificate.
     GenCerts(GenCertsArgs),
@@ -107,7 +107,7 @@ struct CreateUserArgs {
 async fn main() -> anyhow::Result<()> {
     common::logging::init();
     match Cli::parse().command {
-        Command::Serve(config) => serve(config).await,
+        Command::Serve(config) => serve(*config).await,
         Command::GenCerts(args) => gen_certs(args),
         Command::CreateUser(args) => create_user(args).await,
         Command::GenUpdateKey(args) => gen_update_key(args),
@@ -154,6 +154,29 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         api_url: config.public_url(),
     });
 
+    let stun = if config.no_direct {
+        info!("direct paths disabled: every session stays on the relay");
+        None
+    } else {
+        let socket = server::stun::bind(config.stun_listen)
+            .await
+            .with_context(|| format!("binding STUN responder on {}", config.stun_listen))?;
+        Some(socket)
+    };
+    let stun_port = stun.as_ref().map(|socket| {
+        config
+            .stun_announce_port
+            .or_else(|| socket.local_addr().ok().map(|a| a.port()))
+            .unwrap_or(config.stun_listen.port())
+    });
+    let quic = quic.with_direct_paths(!config.no_direct, stun_port);
+    let stun = async {
+        match stun {
+            Some(socket) => server::stun::serve(socket).await,
+            None => std::future::pending().await,
+        }
+    };
+
     let tls = common::tls::https_server_config(
         &config.api_identity().context("loading API certificate")?,
     )?;
@@ -189,6 +212,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
     tokio::select! {
         () = quic.run() => bail!("QUIC listener stopped"),
+        () = stun => bail!("STUN responder stopped"),
         res = metrics => {
             res.context("metrics listener stopped")?;
             bail!("metrics listener stopped");

@@ -10,9 +10,10 @@ for the architecture and phase plan.
 | `crates/protocol` | lib | Wire `Message` enum, framing, close codes, update manifest and signed-message format |
 | `crates/common` | lib | Logging init, PEM loading, quinn/rustls TLS configs, dev cert generation |
 | `crates/transport` | lib | Connections to the server: QUIC, or the WebSocket-over-TLS fallback (a small stream multiplexer), and dialing with fallback |
+| `crates/peer` | lib | End-to-end encrypted sessions between agent and viewer (Noise), and direct peer-to-peer paths: candidate gathering (host + STUN), hole punching, pinned QUIC, merging video from two paths |
 | `crates/server` | bin + lib | QUIC listener for agents, HTTPS API, Postgres, auth, audit log, enrollment CA, update publishing |
 | `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray, remote shell / scripts / file transfer |
-| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC (or the WebSocket fallback) to the server, OpenH264 decode, winit + softbuffer window |
+| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC (or the WebSocket fallback) to the server, straight to the agent when NAT allows, end-to-end encrypted, OpenH264 decode, winit + softbuffer window |
 | `tui/` | Python project | Support TUI (Textual): sign in, live agent table, launch the viewer, shell console and script runner through the server ([tui/README.md](tui/README.md)) |
 
 Server modules: `quic` (agent and viewer listeners: QUIC and the WebSocket
@@ -20,9 +21,11 @@ fallback), `api` (HTTPS routes; `api::rbac` for users, grants and groups),
 `auth` (Argon2id, TOTP, sessions), `users`, `access` (RBAC: roles and
 per-agent grants), `groups` (agent groups), `audit` (hash chain), `registry`
 (agents, policies), `enroll` (tokens, internal CA), `updates` (signing,
-publishing), `relay` (video fan-out to viewers, adaptive-bitrate feedback),
-`viewers` (viewer-session tokens), `remote` (shell, script and file-transfer
-relay to agents), `metrics` (Prometheus), `db` (pool, migrations), `config`.
+publishing), `relay` (video fan-out to viewers, adaptive-bitrate feedback,
+routing of sealed session records), `stun` (STUN responder for direct
+paths), `viewers` (viewer-session tokens), `remote` (shell, script and
+file-transfer relay to agents), `metrics` (Prometheus), `db` (pool,
+migrations), `config`.
 
 Agent modules:
 - `core`: the connect/heartbeat/update loop, shared by console and service mode.
@@ -35,6 +38,8 @@ Agent modules:
   streaming, and the adaptive-bitrate controller (`rate`).
 - `remote`: the agent's end of the remote shell (`pty`, `shell`), the script
   runner (`script`) and file transfer (`transfer`).
+- `peers`: end-to-end encrypted sessions with viewers (handshake, sealed
+  records, the media key) and their direct paths.
 - `paths`
 - `win` (Windows only): `service`, `process` (spawn into a session), `pipe`,
   `helper` (tray), `indicator` (on-screen session banner), `input_helper`
@@ -95,6 +100,7 @@ Put overrides in a `.env` file next to `docker-compose.yml`:
 | `RMM_API_PORT` | `8443` | Host TCP port for the HTTPS API |
 | `RMM_QUIC_PORT` | `4433` | Host UDP port for agents and viewers (QUIC) |
 | `RMM_WS_PORT` | `4433` | Host TCP port for the WebSocket fallback. Publish it as `443` where firewalls only allow HTTPS out, and give clients `--ws-server host:443`. |
+| `RMM_STUN_PORT` | `3478` | Host UDP port for the STUN responder (direct paths); also the port announced to clients |
 | `RMM_METRICS_PORT` | `9464` | Prometheus `/metrics`, published on `127.0.0.1` only |
 | `RMM_UID` / `RMM_GID` | `1000` / `1000` | User the server runs as. Must be able to read the `0600` keys in `./dev-certs` (use `id -u` / `id -g`). |
 | `RMM_DB_MAX_CONNECTIONS`, `RMM_SESSION_TTL_SECS`, `RUST_LOG` | see below | Passed through to the server |
@@ -307,13 +313,18 @@ allowed.
 
 ## Remote desktop viewing
 
-Agents sit behind NAT and only connect *out*, so viewers never connect to an
-agent. They connect to the **server**, which relays:
+Agents sit behind NAT and only connect *out*, so a session starts on the
+**server's relay**: viewers connect to the server, which relays. Everything
+in the session is **end-to-end encrypted** between agent and viewer, so the
+relay forwards only ciphertext. When the network allows, the session then
+moves to a **direct** connection between the two (see
+[Direct connections](#direct-connections-nat-traversal)).
 
 ```text
  helper (user session)          service              server                viewers
- DXGI capture ─▶ MF H.264 ─pipe─▶ QUIC video ─────────▶ relay ──┬─▶ viewer A (Linux)
- (dirty rects)   encode once      stream (agent → server)        └─▶ viewer B (Windows)
+ DXGI capture ─▶ MF H.264 ─pipe─▶ seal once ─ QUIC ──▶ relay ──┬─▶ viewer A (Linux)
+ (dirty rects)   encode once      (media key)                   └─▶ viewer B (Windows)
+                                     └──────── direct QUIC (hole-punched) ──▶ viewer C
 ```
 
 The agent **encodes once**, whatever the number of viewers, and the server
@@ -323,9 +334,97 @@ fans the one stream out. Other points:
 - **Joining mid-stream:** a viewer that joins late starts at a keyframe the
   server asks the agent for.
 - **Slow viewers:** a viewer that falls behind skips to the next keyframe
-  rather than slowing anyone else.
+  rather than slowing anyone else (on the relay, and on a direct path).
 - **Monitor choice is shared:** picking a monitor changes it for everyone
   watching that agent, because there is only one stream.
+
+### End-to-end encryption
+
+The server authorises sessions but cannot read or alter them
+(`peer::noise`, `protocol::e2e`):
+
+- **Handshake.** `Noise_XX_25519_ChaChaPoly_BLAKE2s` (the `snow` crate),
+  relayed by the server right after consent. The **viewer** makes a new
+  X25519 key per connection and sends it with its viewer token; the server
+  tells the agent which key belongs to the session it asked consent for
+  (`SessionViewerKey`), and the agent completes the handshake with no
+  other. The **agent** sends its enrolled certificate and a signature by the
+  certificate's key over its agent id and Noise key; the viewer checks the
+  chain against the CA it trusts, that the certificate names the agent it
+  asked for, and the signature. `viewer::client::connect` only returns once
+  this has succeeded.
+- **Records.** Input, clipboard and direct-path signaling are sealed
+  records (ChaCha20-Poly1305 under the handshake's per-direction keys, with
+  explicit 64-bit counter nonces), relayed as opaque `Sealed` messages. The
+  agent no longer accepts plaintext input or clipboard at all, so not even
+  the server can inject keystrokes. Consent, the kill switch and "only
+  granted sessions get input" are still enforced on the agent.
+- **Video** is sealed **once** under a media key that the agent gives each
+  viewer over its own session, so the relay can still fan one encode out.
+  The relay reads only each frame's sequence number and keyframe flag (to
+  start viewers on a keyframe), which the seal authenticates. The key
+  changes whenever a viewer leaves.
+- **Same keys on every path.** Nothing re-keys when the session moves
+  between the relay and a direct path; records carry their own nonces, and
+  the receiver restores their order across the two paths.
+
+What the server still sees: who is in a session with which agent, when,
+frame sizes and sequence numbers, and whether the session is relayed or
+direct. Server-side session recording is therefore impossible by design.
+
+Trade-off: the server runs the CA that issues agent certificates and
+decides who may view, so it remains trusted for *authorisation*: a
+malicious operator could mint a certificate for an agent id and route a
+viewer to an impostor. What E2E removes is everything short of that: a
+compromised relay process, a tapped network path or a leaked traffic
+capture reveals nothing. Both ends must speak protocol 8: the server refuses
+older viewers ("update it") and refuses to connect viewers to older agents
+(which update themselves) rather than fall back to plaintext.
+
+### Direct connections (NAT traversal)
+
+Once the session is up on the relay, the viewer tries to reach the agent
+directly (`peer::gather`, `peer::direct`):
+
+1. **Candidates.** Each side binds a fresh UDP socket and gathers *host*
+   candidates (its interface addresses) and a *server-reflexive* one: its
+   public address as the server's STUN responder (`--stun-listen`, default
+   `0.0.0.0:3478/udp`) sees it. No TURN: the relay is the fallback.
+2. **Signaling** goes over the sealed session: the viewer's `DirectOffer`
+   (candidates, and the SHA-256 of a self-signed certificate made for this
+   attempt), then the agent's `DirectAnswer`.
+3. **Hole punch.** Before answering, the agent sends a few packets to each
+   viewer candidate with a **TTL of 2**: enough to open its own NAT, not
+   enough to reach the viewer's NAT (which, if it tracks unsolicited
+   packets as Linux does, would otherwise reserve the port pair and remap
+   the viewer's traffic). The viewer's QUIC handshake then opens its own
+   NAT and passes through the agent's.
+4. **Direct QUIC**, mutually authenticated: each side pins the other's
+   certificate hash from the sealed signaling. The viewer tries every agent
+   candidate at once; the first to connect wins.
+5. **Seamless switch.** The agent sends video down both paths; the viewer
+   merges them by sequence number (`peer::merge`), so no frame is lost or
+   repeated and no keyframe is needed. It then tells the agent (which stops
+   sending through the relay once every viewer is direct) and the server
+   (which stops forwarding to it, and records the path).
+6. **Fallback.** If the direct path drops (6 s without packets, keep-alives
+   every second), both sides return to the relay, which restarts the viewer
+   on a keyframe; the session is unchanged. The viewer tries again after
+   10 s, up to three times. A failed attempt is not retried.
+
+This works through ordinary home and office NATs (which keep a socket's
+public port the same whoever it sends to). Behind a symmetric NAT, or with
+UDP blocked, the attempt fails and the session stays on the relay, which is
+a permanent fallback rather than a scaffold. Adaptive bitrate keeps
+working: viewers on a direct path acknowledge frames to the agent, which
+judges their delay itself.
+
+Turn it off for everyone with `--no-direct` on the server (no STUN
+responder either), or per viewer with `viewer --no-direct`. The viewer's
+title shows `encrypted, relayed` or `encrypted, direct`. The server records
+only the path, never content: `session.path` audit entries (`direct`,
+`relayed`, `direct_failed`), the final path in `viewer.disconnect`, and the
+`rmm_viewers_by_path` / `rmm_session_path_changes_total` metrics.
 
 ### Adaptive bitrate
 
@@ -387,10 +486,12 @@ it reports as `rmm_stream_viewer_delay_seconds`.
 
    `--monitor N` picks a monitor at startup. `--snapshot out.ppm --frames N`
    is headless: it decodes N frames, writes the last one, and exits. Use it
-   for checks and on machines without a display.
+   for checks and on machines without a display. `--no-direct` keeps the
+   session on the relay.
 
 The server audits `viewer.session_create`, `viewer.connect` and
-`viewer.disconnect` (the last with duration and frames sent). A token that
+`viewer.disconnect` (the last with duration, frames the relay sent, and the
+final path), and `session.path` whenever the session changes path. A token that
 has expired or already been used is refused, as is a token for an agent that
 isn't connected ("agent is not connected").
 
@@ -437,14 +538,16 @@ reported kind no longer changes it. `on_no_user` defaults to `deny`,
 Every session's consent is audited as `session.start` with `mode`,
 `outcome` and `started`. Refused viewers see the reason ("the user declined
 the session", "the user did not respond to the consent prompt", "nobody is
-available to approve the session"). An agent older than protocol 4 cannot
-enforce consent, so viewing it is refused.
+available to approve the session"). An agent older than protocol 8 cannot
+be viewed (it could not encrypt the session; before protocol 4 it could not
+enforce consent either).
 
 The agent enforces this itself too: it only injects input, applies
 clipboard or streams for sessions it granted, and it releases any keys or
 buttons a technician was holding when their session ends.
 
-**Clipboard** syncs both ways while a session is active: text, and a file
+**Clipboard** syncs both ways while a session is active, sealed end to end
+like input: text, and a file
 list copied on the remote machine (sent as its paths, pasted as text on the
 viewer; the files themselves are not transferred). Content over 1 MiB is not
 synced, what was on either clipboard before connecting is never sent, and a
@@ -724,6 +827,9 @@ never updates itself.
 | `RMM_QUIC_LISTEN` | `--quic-listen` | `0.0.0.0:4433` | UDP address for agents and viewers (QUIC) |
 | `RMM_WS_LISTEN` | `--ws-listen` | `0.0.0.0:4433` | TCP address for the [WebSocket fallback](#connectivity-quic-and-the-websocket-fallback) |
 | `RMM_NO_WEBSOCKET` | `--no-websocket` | off | Disable the WebSocket fallback |
+| `RMM_STUN_LISTEN` | `--stun-listen` | `0.0.0.0:3478` | UDP address of the STUN responder for [direct paths](#direct-connections-nat-traversal). Clients use the server's address at this port. |
+| `RMM_STUN_ANNOUNCE_PORT` | `--stun-announce-port` | *(the listen port)* | STUN port to tell clients, if it is published on another port |
+| `RMM_NO_DIRECT` | `--no-direct` | off | Keep every session on the relay; no STUN responder |
 | `RMM_METRICS_LISTEN` | `--metrics-listen` | *(unset: off)* | Plain-HTTP address for Prometheus [metrics](#metrics) at `/metrics` |
 | `RMM_API_LISTEN` | `--api-listen` | `0.0.0.0:8443` | TCP address for the HTTPS API |
 | `RMM_CERTS_DIR` | `--certs-dir` | `dev-certs` | Holds `ca.crt` + `ca.key` (CA that signs agent certs), `server.crt`, `server.key` |
@@ -872,6 +978,10 @@ come from small fixed sets so the number of series stays bounded.
 | `rmm_relay_frames_sent_total`, `rmm_relay_sent_bytes_total` | counter | |
 | `rmm_relay_frames_dropped_total` | counter | (frames skipped for a lagging viewer) |
 | `rmm_stream_viewer_delay_seconds` | histogram | (worst viewer delay reported to agents) |
+| `rmm_viewers_by_path` | gauge | `path` (`relayed`, `direct`) |
+| `rmm_session_path_changes_total` | counter | `path` (`relayed`, `direct`, `direct_failed`), as viewers report |
+| `rmm_relay_sealed_records_total` | counter | (end-to-end sealed records relayed; never readable by the server) |
+| `rmm_stun_requests_total` | counter | |
 | `rmm_sessions_total` | counter | `mode`, `outcome` (consent) |
 | `rmm_user_terminations_total` | counter | (Ctrl+F12) |
 | `rmm_shells_open` | gauge | |
@@ -937,8 +1047,8 @@ cargo test --workspace        # needs a running Docker daemon
 ```
 
 The database tests (`crates/server/tests/db.rs`, `api.rs`, `enrollment.rs`,
-`telemetry.rs`, `streaming.rs`, `consent.rs`, `remote.rs`, `rbac.rs` and
-`metrics.rs`)
+`telemetry.rs`, `streaming.rs`, `consent.rs`, `remote.rs`, `rbac.rs`,
+`metrics.rs`, `direct.rs` and `nat.rs`)
 each start a throwaway `postgres:17-alpine` container with testcontainers. The
 container is removed when the test ends. `heartbeat.rs` (QUIC and the
 WebSocket fallback over loopback, including falling back from a UDP port
@@ -967,6 +1077,30 @@ WebSocket fallback. No viewer is used. It checks:
 `rbac.rs` covers roles, agent/group/all-agents grants, groups, user
 administration and group-assigning enrollment links; `metrics.rs` scrapes
 `/metrics` after real traffic.
+
+`direct.rs` runs end-to-end encryption and direct paths on loopback (a real
+agent, server with STUN, and viewers). It checks:
+- a session starts on the relay and moves to a direct path with every frame
+  delivered once and in order, no decode error and no keyframe; the same
+  handshake throughout (no re-key); metrics and the audit log record
+  `direct`; the relay stops receiving video; input and clipboard still arrive;
+- the relay handles only ciphertext: no plaintext H.264, clipboard text or
+  keystroke appears in anything it relayed;
+- when punching fails (the agent advertises a black hole) the session stays
+  on the relay and everything still works; `direct_failed` is recorded;
+- a dropped direct path falls back to the relay without a new handshake;
+- `--no-direct` on the server keeps sessions relayed.
+
+`nat.rs` (Linux) puts the agent and the viewer behind **two real NATs**:
+it re-runs itself in an unprivileged user + network namespace, builds two
+LANs (both `192.168.1.0/24`) behind nftables masquerade NATs, runs the
+server on the "internet" between them, and runs agent and viewer on threads
+inside their LANs' namespaces. Behind ordinary NATs the session must go
+direct to NAT A's public address, confirmed by the server's metrics, and
+video must leave the relay; behind symmetric NATs (`masquerade
+random,fully-random`) it must stay on the relay and keep streaming. It needs
+unprivileged user namespaces, `ip`, `nft` and `nsenter`, and prints
+`SKIPPED` without them.
 
 It runs the agents' development fallbacks (`/bin/sh`), so it runs on Linux
 and macOS only.

@@ -53,6 +53,10 @@ struct Cli {
     /// Viewer-session token (from POST /api/agents/{id}/viewer-sessions).
     #[arg(long, env = "RMM_VIEWER_TOKEN", hide_env_values = true)]
     token: String,
+    /// Never connect straight to the agent: keep the session on the server's
+    /// relay. (Sessions are end-to-end encrypted either way.)
+    #[arg(long, env = "RMM_NO_DIRECT")]
+    no_direct: bool,
     /// Switch to this monitor id after connecting.
     #[arg(long)]
     monitor: Option<u32>,
@@ -78,6 +82,10 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("reading {}", cli.ca.display()))?,
         token: cli.token.clone(),
         bind: None,
+        direct: peer::DirectSettings {
+            enabled: !cli.no_direct,
+            ..Default::default()
+        },
     };
     match &cli.snapshot {
         Some(path) => snapshot(options, cli.monitor, cli.frames, path),
@@ -171,6 +179,7 @@ enum UserEvent {
     Picture,
     Monitors(Vec<MonitorInfo>),
     StreamMonitor(u32),
+    Path(protocol::e2e::Path),
     Closed(String),
 }
 
@@ -200,6 +209,7 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>) -> anyhow::Result<()> 
         held_buttons: Vec::new(),
         last_move: None,
         status: Some("Connecting...".into()),
+        path: protocol::e2e::Path::Relayed,
         frames: 0,
         fps: 0.0,
         fps_since: Instant::now(),
@@ -286,6 +296,7 @@ fn network(
                 }
                 ViewerEvent::Monitors(m) => UserEvent::Monitors(m),
                 ViewerEvent::StreamMonitor(m) => UserEvent::StreamMonitor(m),
+                ViewerEvent::Path(path) => UserEvent::Path(path),
                 ViewerEvent::Closed(reason) => UserEvent::Closed(reason),
             };
             if proxy.send_event(user_event).is_err() {
@@ -316,6 +327,8 @@ struct App {
     /// Last pointer position sent, to skip duplicates.
     last_move: Option<(u32, u16, u16)>,
     status: Option<String>,
+    /// Relayed or direct.
+    path: protocol::e2e::Path,
     frames: u32,
     fps: f64,
     fps_since: Instant,
@@ -329,9 +342,10 @@ impl App {
             .and_then(|a| self.monitors.iter().find(|m| m.id == a))
             .map(|m| format!("{} {}x{}", m.name, m.width, m.height))
             .unwrap_or_else(|| "-".into());
+        // Sessions are end-to-end encrypted on either path.
         format!(
-            "RMM Viewer - {agent} - {monitor} - {:.0} fps - Ctrl+Alt+Shift+M: monitors",
-            self.fps
+            "RMM Viewer - {agent} - {monitor} - {:.0} fps - encrypted, {} - Ctrl+Alt+Shift+M: monitors",
+            self.fps, self.path
         )
     }
 
@@ -589,6 +603,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Monitors(monitors) => self.monitors = monitors,
             UserEvent::StreamMonitor(monitor) => self.active = Some(monitor),
+            // A failed attempt leaves the session where it was: relayed.
+            UserEvent::Path(protocol::e2e::Path::DirectFailed) => {}
+            UserEvent::Path(path) => self.path = path,
             UserEvent::Closed(reason) => self.status = Some(format!("Disconnected: {reason}")),
         }
         if let Some(w) = &self.window {

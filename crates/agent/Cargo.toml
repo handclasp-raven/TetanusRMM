@@ -17,6 +17,8 @@ tokio = { workspace = true, features = ["fs", "process"] }
 tracing.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+peer.workspace = true
+postcard.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
 ring.workspace = true

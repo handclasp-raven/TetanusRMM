@@ -230,6 +230,11 @@ impl Rig {
             ca_pem: self.certs.ca_cert.clone(),
             token,
             bind: Some("127.0.0.1:0".parse().unwrap()),
+            // These tests are about the relay; see direct.rs for direct paths.
+            direct: peer::DirectSettings {
+                enabled: false,
+                ..Default::default()
+            },
         }
     }
 

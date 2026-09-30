@@ -630,6 +630,11 @@ async fn a_grant_revoked_after_the_viewer_token_was_minted_still_stops_the_sessi
         ca_pem: certs.ca_cert.clone(),
         token: token["token"].as_str().unwrap().to_owned(),
         bind: Some("127.0.0.1:0".parse().unwrap()),
+        // These tests are about the relay; see direct.rs for direct paths.
+        direct: peer::DirectSettings {
+            enabled: false,
+            ..Default::default()
+        },
     };
     let result = tokio::time::timeout(Duration::from_secs(20), viewer::client::connect(&options))
         .await

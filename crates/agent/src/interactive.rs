@@ -98,6 +98,11 @@ impl Sessions {
         !self.active.is_empty()
     }
 
+    /// The sessions consent has granted, in connection order.
+    pub fn active_ids(&self) -> Vec<u64> {
+        self.active.keys().copied().collect()
+    }
+
     /// Input from session `id`: `Some` to inject, `None` to drop (not an
     /// active session, or the kill-switch chord, which only the local user
     /// may press).

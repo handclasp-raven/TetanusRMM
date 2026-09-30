@@ -5,12 +5,14 @@
 
 pub mod clipboard;
 pub mod consent;
+pub mod e2e;
 pub mod framing;
 pub mod input;
 pub mod ipc;
 pub mod media;
 pub mod script;
 pub mod shell;
+pub mod stun;
 pub mod transfer;
 pub mod update;
 
@@ -35,7 +37,15 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   `EnableFrameAcks` to viewers and `FrameAck` from them. Each is only
 ///   sent to a peer that said it speaks version 7, so older agents and
 ///   viewers keep working at a fixed bitrate.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// - 8: end-to-end encrypted sessions and direct paths (appended variants,
+///   see [`e2e`]). Session content is sealed between agent and viewer, so
+///   a session needs both ends at version 8: the server refuses older
+///   viewers, and refuses to connect viewers to older agents.
+pub const PROTOCOL_VERSION: u32 = 8;
+
+/// Oldest agent and viewer protocol with end-to-end encrypted sessions;
+/// the oldest that may take part in a remote-desktop session at all.
+pub const MIN_E2E_VERSION: u32 = 8;
 
 /// Oldest agent and viewer protocol that takes part in adaptive bitrate.
 pub const MIN_ADAPTIVE_VERSION: u32 = 7;
@@ -179,6 +189,38 @@ pub enum Message {
     /// Viewer to server, periodically once enabled: the newest frame
     /// received.
     FrameAck { seq: u64 },
+
+    // --- End-to-end encryption and direct paths (Phase 10) ---------------
+    //
+    // See `e2e`. Input and clipboard no longer travel as `Input` /
+    // `Clipboard` / `SessionInput` / `SessionClipboard` (those remain for
+    // the wire format only): they are sealed records inside `Sealed`, as
+    // is the signaling for a direct path.
+    /// Viewer to server, right after `ViewerHello`: the X25519 static key
+    /// the viewer will use in this session's Noise handshake.
+    ViewerKey { public: [u8; e2e::KEY_LEN] },
+    /// Server to agent, just before `SessionRequest`: the static key of the
+    /// viewer in `session_id`. The agent completes a handshake only with
+    /// that key, so nobody else can take over the session.
+    SessionViewerKey {
+        session_id: u64,
+        public: [u8; e2e::KEY_LEN],
+    },
+    /// Between agent and server (tagged with the session) and viewer and
+    /// server (`session_id` is ignored and set by the server): an opaque
+    /// `e2e::Envelope`, relayed unread. At most `e2e::MAX_SEALED_LEN`.
+    Sealed { session_id: u64, data: Vec<u8> },
+    /// Server to agent (after `Hello`) and viewer (after `ViewerWelcome`):
+    /// whether to try direct paths, and the UDP port of the server's STUN
+    /// responder (on the server's address) for gathering public addresses.
+    PeerConfig {
+        direct: bool,
+        stun_port: Option<u16>,
+    },
+    /// Viewer to server: how this session's traffic now flows. Recorded in
+    /// metrics and the audit log; `Direct` also stops the relay forwarding
+    /// video to this viewer, and `Relayed` restarts it (from a keyframe).
+    PathReport(e2e::Path),
 }
 
 /// Longest hostname the server stores, in bytes (the DNS limit).
@@ -245,6 +287,9 @@ pub mod close_code {
     pub const CONSENT_REFUSED: u32 = 4;
     /// The user ended the session with the Ctrl+F12 kill switch.
     pub const USER_TERMINATED: u32 = 5;
+    /// The peer (or the agent it asked for) speaks a protocol too old for
+    /// what it asked. The close reason says which.
+    pub const OUTDATED: u32 = 6;
 }
 
 #[cfg(test)]
@@ -324,6 +369,36 @@ mod tests {
             assert_eq!(usize::from(bytes[0]), 25 + i);
             assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn end_to_end_messages_are_appended_after_frame_ack() {
+        let msgs = [
+            Message::ViewerKey { public: [1; 32] },
+            Message::SessionViewerKey {
+                session_id: 4,
+                public: [2; 32],
+            },
+            Message::Sealed {
+                session_id: 4,
+                data: vec![9; 100],
+            },
+            Message::PeerConfig {
+                direct: true,
+                stun_port: Some(3478),
+            },
+            Message::PathReport(e2e::Path::Direct),
+        ];
+        for (i, msg) in msgs.into_iter().enumerate() {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            assert_eq!(usize::from(bytes[0]), 28 + i);
+            assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn a_full_clipboard_fits_in_a_sealed_message_and_a_frame() {
+        assert!(e2e::MAX_SEALED_LEN < MAX_FRAME_LEN as usize);
     }
 
     #[test]

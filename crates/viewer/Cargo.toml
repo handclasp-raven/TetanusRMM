@@ -13,6 +13,7 @@ clap.workspace = true
 common.workspace = true
 font8x8.workspace = true
 openh264.workspace = true
+peer.workspace = true
 postcard.workspace = true
 protocol.workspace = true
 quinn.workspace = true

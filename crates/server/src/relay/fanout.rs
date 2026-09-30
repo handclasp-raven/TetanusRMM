@@ -13,6 +13,9 @@
 //!   requested, rather than blocking the agent or the other viewers.
 //! - Selecting a monitor applies to everyone watching the agent, because
 //!   there is one stream.
+//! - A viewer whose session moved to a direct path gets its video from the
+//!   agent, so it is skipped (but still counts as watching). If it falls
+//!   back to the relay, it waits for a keyframe, which is requested at once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +44,8 @@ pub enum AgentAction {
 struct Subscriber {
     tx: mpsc::Sender<Arc<MediaFrame>>,
     waiting_for_keyframe: bool,
+    /// On a direct path: the relay sends it nothing.
+    direct: bool,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +78,7 @@ impl Fanout {
             Subscriber {
                 tx,
                 waiting_for_keyframe: true,
+                direct: false,
             },
         );
         match self.monitor {
@@ -116,6 +122,26 @@ impl Fanout {
         vec![AgentAction::Start { monitor }]
     }
 
+    /// Viewer `id`'s session moved to a direct path (`true`) or back to the
+    /// relay (`false`).
+    pub fn set_direct(&mut self, id: ViewerId, direct: bool, now: Instant) -> Vec<AgentAction> {
+        let Some(sub) = self.subscribers.get_mut(&id) else {
+            return vec![];
+        };
+        if sub.direct == direct {
+            return vec![];
+        }
+        sub.direct = direct;
+        if direct || self.monitor.is_none() {
+            return vec![];
+        }
+        // Frames went past while it was direct: restart it on a keyframe,
+        // without waiting out the throttle.
+        sub.waiting_for_keyframe = true;
+        self.last_keyframe_request = Some(now);
+        vec![AgentAction::RequestKeyframe]
+    }
+
     /// A viewer's decoder lost sync and wants a fresh keyframe.
     pub fn viewer_requests_keyframe(&mut self, id: ViewerId, now: Instant) -> Vec<AgentAction> {
         if let Some(sub) = self.subscribers.get_mut(&id) {
@@ -129,7 +155,7 @@ impl Fanout {
         let mut need_keyframe = false;
         let mut closed = Vec::new();
         for (id, sub) in &mut self.subscribers {
-            if sub.waiting_for_keyframe && !frame.keyframe {
+            if sub.direct || sub.waiting_for_keyframe && !frame.keyframe {
                 continue;
             }
             match sub.tx.try_send(frame.clone()) {
@@ -327,5 +353,36 @@ mod tests {
         f.on_frame(frame(1, false), t);
         f.on_frame(frame(2, true), t);
         assert_eq!(drain(&mut ra), [0, 2]);
+    }
+
+    #[test]
+    fn direct_viewers_are_skipped_and_resume_on_a_keyframe() {
+        let mut f = Fanout::default();
+        let t = Instant::now();
+        let (a, mut ra) = mpsc::channel(8);
+        let (b, mut rb) = mpsc::channel(8);
+        f.subscribe(1, a, 0, t);
+        f.subscribe(2, b, 0, t);
+        f.on_frame(frame(0, true), t);
+        assert_eq!((drain(&mut ra), drain(&mut rb)), (vec![0], vec![0]));
+
+        assert_eq!(f.set_direct(2, true, t), []);
+        f.on_frame(frame(1, false), t);
+        assert_eq!((drain(&mut ra), drain(&mut rb)), (vec![1], vec![]));
+        assert_eq!(f.viewers(), 2, "a direct viewer still counts");
+
+        // Back on the relay: a keyframe is requested straight away, and
+        // nothing reaches it until one comes.
+        assert_eq!(f.set_direct(2, false, t), [AgentAction::RequestKeyframe]);
+        assert_eq!(f.set_direct(2, false, t), [], "no change, no request");
+        f.on_frame(frame(2, false), t);
+        f.on_frame(frame(3, true), t);
+        assert_eq!(drain(&mut rb), [3]);
+        assert_eq!(drain(&mut ra), [2, 3]);
+
+        // The last viewer leaving still stops the stream, direct or not.
+        f.set_direct(1, true, t);
+        f.unsubscribe(2);
+        assert_eq!(f.unsubscribe(1), [AgentAction::Stop]);
     }
 }

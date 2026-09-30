@@ -5,8 +5,10 @@
 //! The viewer (launched by the TUI) presents it in `ViewerHello` on its QUIC
 //! connection; [`connect`] consumes it. Tokens live [`TOKEN_TTL`], work once,
 //! and only their SHA-256 is stored. Create, connect and disconnect are all
-//! audited, as are the consent outcome (`session.start`) and a Ctrl+F12
-//! termination (`session.user_terminated`).
+//! audited, as are the consent outcome (`session.start`), a Ctrl+F12
+//! termination (`session.user_terminated`), and each move between the relay
+//! and a direct path (`session.path`). Sessions are end-to-end encrypted,
+//! so none of these can (or do) record anything of their content.
 //!
 //! Access (the `desktop` capability, see `crate::access`) is checked when
 //! the token is minted and again when it is used, so a grant revoked in
@@ -17,6 +19,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use protocol::consent::{ConsentMode, Outcome};
+use protocol::e2e::Path;
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -160,8 +163,14 @@ pub async fn connect(pool: &PgPool, token: &str) -> Result<ViewerGrant, ViewerEr
     Ok(grant)
 }
 
-/// Record the end of a viewer session. Audited as `viewer.disconnect`.
-pub async fn end(pool: &PgPool, grant: &ViewerGrant, frames_sent: u64) -> sqlx::Result<()> {
+/// Record the end of a viewer session. Audited as `viewer.disconnect`,
+/// with the frames the relay sent it and the path it was on at the end.
+pub async fn end(
+    pool: &PgPool,
+    grant: &ViewerGrant,
+    frames_sent: u64,
+    path: Path,
+) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     let seconds: Option<f64> = sqlx::query_scalar(
         "UPDATE viewer_sessions SET ended_at = now() WHERE id = $1
@@ -178,6 +187,7 @@ pub async fn end(pool: &PgPool, grant: &ViewerGrant, frames_sent: u64) -> sqlx::
                 "viewer_session_id": grant.session_id,
                 "duration_secs": seconds,
                 "frames_sent": frames_sent,
+                "path": path,
             })),
     )
     .await?;
@@ -202,6 +212,22 @@ pub async fn record_consent(
                 "mode": mode,
                 "outcome": outcome,
                 "started": outcome.allows_session(),
+            })),
+    )
+    .await
+    .map(drop)
+}
+
+/// Record that the session moved to `path` (or that a direct attempt
+/// failed). Audited as `session.path`.
+pub async fn record_path(pool: &PgPool, grant: &ViewerGrant, path: Path) -> sqlx::Result<()> {
+    audit::append_now(
+        pool,
+        NewEntry::new(&grant.username, Action::SessionPath)
+            .target(&grant.agent_id)
+            .detail(json!({
+                "viewer_session_id": grant.session_id,
+                "path": path,
             })),
     )
     .await

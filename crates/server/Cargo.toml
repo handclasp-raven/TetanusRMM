@@ -21,6 +21,8 @@ hex.workspace = true
 prometheus-client.workspace = true
 protocol.workspace = true
 quinn.workspace = true
+# Replies from the address each STUN request was sent to (see `stun`).
+quinn-udp = "0.5"
 ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -43,8 +45,13 @@ rcgen.workspace = true
 x509-parser = "0.18"
 tempfile.workspace = true
 agent.workspace = true
+peer.workspace = true
+postcard.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 testcontainers-modules.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

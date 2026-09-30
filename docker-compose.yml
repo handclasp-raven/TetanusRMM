@@ -39,6 +39,11 @@ services:
       # WebSocket-over-TLS fallback for UDP-blocked networks: TCP, same port.
       RMM_WS_LISTEN: 0.0.0.0:4433
       RMM_API_LISTEN: 0.0.0.0:8443
+      # STUN responder: agents and viewers learn their public addresses from
+      # it to connect to each other directly (sessions are end-to-end
+      # encrypted either way). The announced port must be the published one.
+      RMM_STUN_LISTEN: 0.0.0.0:3478
+      RMM_STUN_ANNOUNCE_PORT: ${RMM_STUN_PORT:-3478}
       # Prometheus metrics (plain HTTP, no auth): published on loopback only.
       RMM_METRICS_LISTEN: 0.0.0.0:9464
       RMM_CERTS_DIR: /certs
@@ -53,6 +58,7 @@ services:
       - "${RMM_API_PORT:-8443}:8443/tcp"
       - "${RMM_QUIC_PORT:-4433}:4433/udp"
       - "${RMM_WS_PORT:-4433}:4433/tcp"
+      - "${RMM_STUN_PORT:-3478}:3478/udp"
       - "127.0.0.1:${RMM_METRICS_PORT:-9464}:9464/tcp"
 
 volumes:

@@ -83,6 +83,12 @@ pub struct RouteLabels {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PathLabels {
+    /// `relayed`, `direct` or (for changes only) `direct_failed`.
+    pub path: &'static str,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct VersionLabels {
     pub version: &'static str,
 }
@@ -102,6 +108,12 @@ pub struct Metrics {
     pub relay_bytes_out: Counter,
     pub relay_frames_dropped: Counter,
     pub viewer_delay: Histogram,
+    // Paths (Phase 10): whether sessions are relayed or direct. Never
+    // anything about their content, which the server cannot read.
+    pub session_paths: Family<PathLabels, Counter>,
+    pub viewers_by_path: Family<PathLabels, Gauge>,
+    pub sealed_records: Counter,
+    pub stun_requests: Counter,
     // Sessions and remote operations.
     pub sessions: Family<SessionLabels, Counter>,
     pub user_terminations: Counter,
@@ -143,6 +155,10 @@ impl Metrics {
             relay_frames_dropped: Counter::default(),
             // 10 ms .. ~20 s.
             viewer_delay: Histogram::new(exponential_buckets(0.01, 2.0, 12)),
+            session_paths: Family::default(),
+            viewers_by_path: Family::default(),
+            sealed_records: Counter::default(),
+            stun_requests: Counter::default(),
             sessions: Family::default(),
             user_terminations: Counter::default(),
             shells_open: Gauge::default(),
@@ -214,6 +230,26 @@ impl Metrics {
             "stream_viewer_delay_seconds",
             "Worst viewer queueing delay reported to agents (adaptive bitrate)",
             m.viewer_delay.clone(),
+        );
+        r.register(
+            "session_path_changes",
+            "Sessions reaching a path (relayed, direct) or failing a direct attempt (direct_failed), as viewers report",
+            m.session_paths.clone(),
+        );
+        r.register(
+            "viewers_by_path",
+            "Remote-desktop viewers in a session now, by path (relayed, direct)",
+            m.viewers_by_path.clone(),
+        );
+        r.register(
+            "relay_sealed_records",
+            "End-to-end sealed session records relayed between agents and viewers",
+            m.sealed_records.clone(),
+        );
+        r.register(
+            "stun_requests",
+            "STUN binding requests answered",
+            m.stun_requests.clone(),
         );
         r.register(
             "sessions",
@@ -349,6 +385,52 @@ impl ConnectedGuard {
 impl Drop for ConnectedGuard {
     fn drop(&mut self) {
         self.0.get_or_create(&self.1).dec();
+    }
+}
+
+/// Counts a viewer under its current path until dropped.
+pub struct PathGauge(protocol::e2e::Path);
+
+impl PathGauge {
+    /// A new session starts on the relay.
+    pub fn relayed() -> Self {
+        Self::count(protocol::e2e::Path::Relayed, 1);
+        Self(protocol::e2e::Path::Relayed)
+    }
+
+    /// The viewer reported `path`. `DirectFailed` leaves it where it was
+    /// (on the relay); every report is counted as a change.
+    pub fn report(&mut self, path: protocol::e2e::Path) {
+        get()
+            .session_paths
+            .get_or_create(&PathLabels {
+                path: path.as_str(),
+            })
+            .inc();
+        if path != protocol::e2e::Path::DirectFailed && path != self.0 {
+            Self::count(self.0, -1);
+            Self::count(path, 1);
+            self.0 = path;
+        }
+    }
+
+    pub fn current(&self) -> protocol::e2e::Path {
+        self.0
+    }
+
+    fn count(path: protocol::e2e::Path, by: i64) {
+        get()
+            .viewers_by_path
+            .get_or_create(&PathLabels {
+                path: path.as_str(),
+            })
+            .inc_by(by);
+    }
+}
+
+impl Drop for PathGauge {
+    fn drop(&mut self) {
+        Self::count(self.0, -1);
     }
 }
 

@@ -8,6 +8,8 @@
 //! - [`telemetry`]: health samples sent on each heartbeat.
 //! - [`core`]: the connect/heartbeat/update loop shared by console and service mode.
 //! - [`interactive`]: consent, remote input, clipboard and the kill switch.
+//! - [`peers`]: end-to-end encrypted sessions with viewers, and direct
+//!   paths to them.
 //! - [`input`]: mouse-coordinate mapping and held-key tracking.
 //! - [`device`]: workstation or server (picks the default consent mode).
 //! - [`remote`]: remote shell, script runner and file transfer, on streams
@@ -24,6 +26,7 @@ pub mod input;
 pub mod interactive;
 pub mod media;
 pub mod paths;
+pub mod peers;
 pub mod remote;
 pub mod session;
 pub mod telemetry;
@@ -37,8 +40,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::Identity;
+use protocol::clipboard::MAX_CLIPBOARD_BYTES;
 use protocol::consent::{decide, Decision, DeviceKind, Outcome, SessionRequest};
-use protocol::media::VideoPayload;
+use protocol::e2e::{AgentProof, Control};
+use protocol::media::{StreamReport, VideoPayload};
 use protocol::{close_code, read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -49,9 +54,17 @@ use transport::{Connection, ConnectionError, Preference, TransportKind, Transpor
 use crate::interactive::{DesktopCommand, DesktopEvent, DesktopLink, Sessions};
 use crate::media::rate::RateController;
 use crate::media::source::{MediaCommand, MediaEvent, MediaLink};
+use crate::peers::{Inbound, PeerSetup, Peers};
 use crate::telemetry::TelemetrySource;
 
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the agent judges its bitrate itself while every viewer takes
+/// video over a direct path (the server's reports stop then).
+const DIRECT_REPORT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How often records waiting on a reordering gap are checked.
+const REORDER_TICK: Duration = Duration::from_millis(100);
 
 pub struct AgentConfig {
     /// Server QUIC (UDP) address.
@@ -82,6 +95,8 @@ pub struct AgentConfig {
     pub device_kind: DeviceKind,
     /// Reported to the server for display, if known.
     pub hostname: Option<String>,
+    /// Direct paths to viewers (the server can also turn them off).
+    pub direct: peer::DirectSettings,
 }
 
 /// What the agent observed, for tests.
@@ -124,6 +139,12 @@ pub struct AgentSession {
     desktop: Option<Arc<DesktopLink>>,
     device_kind: DeviceKind,
     hostname: Option<String>,
+    server_addr: SocketAddr,
+    direct: peer::DirectSettings,
+    /// This connection's Noise static key, and the proof (signed with the
+    /// enrolled certificate's key) that it is this agent's.
+    peer_key: Arc<peer::StaticKey>,
+    proof: Option<AgentProof>,
 }
 
 /// Connect to the server and complete the mutual-TLS handshake, on the
@@ -157,6 +178,15 @@ pub async fn connect_with(
         transport = %dialed.connection.kind(),
         "connected"
     );
+    let peer_key = Arc::new(peer::StaticKey::generate());
+    let proof =
+        match peer::noise::sign_proof(&config.identity, &config.agent_id, &peer_key.public()) {
+            Ok(proof) => Some(proof),
+            Err(e) => {
+                warn!("cannot sign this agent's session key; remote sessions will fail: {e}");
+                None
+            }
+        };
     Ok(AgentSession {
         endpoint: dialed.endpoint,
         connection: dialed.connection,
@@ -167,6 +197,10 @@ pub async fn connect_with(
         desktop: config.desktop.clone(),
         device_kind: config.device_kind,
         hostname: config.hostname.clone(),
+        server_addr: config.server_addr,
+        direct: config.direct.clone(),
+        peer_key,
+        proof,
     })
 }
 
@@ -248,6 +282,22 @@ impl AgentSession {
             let _ = media.commands.send(MediaCommand::Stop);
         }
         let sessions = Arc::new(std::sync::Mutex::new(Sessions::default()));
+        // End-to-end sessions with viewers, and their direct paths.
+        let (inbound_tx, mut inbound) = mpsc::unbounded_channel::<Inbound>();
+        let peers = Peers::new(
+            PeerSetup {
+                agent_id: self.agent_id.clone(),
+                key: self.peer_key.clone(),
+                proof: self.proof.clone(),
+                settings: self.direct.clone(),
+                server: self.server_addr,
+            },
+            outbox_tx.clone(),
+            inbound_tx,
+        );
+        // Payload bytes the server last said it received (for the reports
+        // the agent makes itself while no video goes through it).
+        let relay_bytes = std::sync::atomic::AtomicU64::new(0);
         // Adaptive bitrate: fed by the video pump and the server's reports.
         let rate = std::sync::Mutex::new(RateController::new());
         let set_bitrate = |change: Option<crate::media::rate::Change>| {
@@ -337,7 +387,32 @@ impl AgentSession {
                         ));
                         continue;
                     }
+                    Message::SessionViewerKey { session_id, public } => {
+                        peers.expect(session_id, public);
+                        continue;
+                    }
+                    Message::Sealed { session_id, data } => {
+                        peers.on_sealed(session_id, &data);
+                        continue;
+                    }
+                    Message::PeerConfig { direct, stun_port } => {
+                        info!(direct, ?stun_port, "direct-path policy from server");
+                        peers.set_policy(direct, stun_port);
+                        continue;
+                    }
+                    // Plaintext input and clipboard would have to come from
+                    // the server itself: sessions are end-to-end encrypted,
+                    // so these are never accepted.
+                    Message::SessionInput { session_id, .. }
+                    | Message::SessionClipboard { session_id, .. } => {
+                        warn!(
+                            session_id,
+                            "unsealed input or clipboard from the server ignored"
+                        );
+                        continue;
+                    }
                     Message::SessionEnded { session_id } => {
+                        peers.end(session_id);
                         let ended = lock(&sessions).ended(session_id);
                         info!(session_id, "session ended");
                         if let Some(desktop) = &self.desktop {
@@ -353,29 +428,16 @@ impl AgentSession {
                         publish_technicians(self.desktop.as_deref(), &sessions);
                         continue;
                     }
-                    Message::SessionInput { session_id, event } => {
-                        let event = lock(&sessions).input(session_id, event);
-                        match (event, &self.desktop) {
-                            (Some(event), Some(desktop)) => {
-                                let _ = desktop.commands.send(DesktopCommand::Input(event));
-                            }
-                            (None, _) => {
-                                debug!(session_id, "input for an inactive session dropped")
-                            }
-                            (Some(_), None) => {}
-                        }
-                        continue;
-                    }
-                    Message::SessionClipboard { session_id, data } => {
-                        let active = lock(&sessions).is_active(session_id);
-                        if let (true, Some(desktop)) = (active, &self.desktop) {
-                            let _ = desktop.commands.send(DesktopCommand::SetClipboard(data));
-                        }
-                        continue;
-                    }
-                    Message::StreamReport(report) => {
+                    Message::StreamReport(mut report) => {
                         debug!(?report, "stream report");
-                        let change = lock(&rate).on_report(&report, std::time::Instant::now());
+                        let now = std::time::Instant::now();
+                        relay_bytes.store(report.bytes, std::sync::atomic::Ordering::Relaxed);
+                        // Viewers on a direct path count too.
+                        if let Some(direct) = peers.direct_delay(now) {
+                            let ms = u32::try_from(direct.as_millis()).unwrap_or(u32::MAX);
+                            report.viewer_delay_ms = report.viewer_delay_ms.max(ms);
+                        }
+                        let change = lock(&rate).on_report(&report, now);
                         set_bitrate(change);
                         continue;
                     }
@@ -410,8 +472,10 @@ impl AgentSession {
             }
         };
 
-        // Monitor lists go on the control stream; frames on a video stream,
-        // opened on the first frame and reused for the connection.
+        // Monitor lists go on the control stream. Frames are sealed once,
+        // then go to each viewer on a direct path, and through the relay on
+        // a video stream (opened on the first frame and reused for the
+        // connection) unless every viewer is direct.
         let pump = async {
             let Some(media) = &self.media else {
                 return std::future::pending::<Result<(), AgentError>>().await;
@@ -419,19 +483,13 @@ impl AgentSession {
             let mut source = media.events.lock().await;
             let mut video: Option<transport::SendStream> = None;
             let mut seq = 0u64;
+            let mut last_direct_report: Option<std::time::Instant> = None;
             while let Some(event) = source.recv().await {
                 match event {
                     MediaEvent::Monitors(monitors) => {
                         let _ = outbox_tx.send(Message::MonitorList { monitors });
                     }
                     MediaEvent::Frame(frame) => {
-                        let stream = match &mut video {
-                            Some(stream) => stream,
-                            None => {
-                                info!(monitor = frame.monitor, "opening video stream to server");
-                                video.insert(self.connection.open_uni().await?)
-                            }
-                        };
                         let payload = VideoPayload {
                             monitor: frame.monitor,
                             pts_us: frame.pts_us,
@@ -441,14 +499,40 @@ impl AgentSession {
                         };
                         // Timed from before the write: time blocked on a
                         // saturated transport is queueing too.
-                        let change = lock(&rate).on_sent(
-                            seq,
-                            payload.width,
-                            payload.height,
-                            std::time::Instant::now(),
-                        );
+                        let now = std::time::Instant::now();
+                        let change = lock(&rate).on_sent(seq, payload.width, payload.height, now);
                         set_bitrate(change);
-                        write_frame(stream, &payload.to_frame(seq, frame.keyframe)).await?;
+                        let sealed = peers.seal_frame(payload.to_frame(seq, frame.keyframe));
+                        peers.feed_direct(&sealed, now);
+                        if peers.relay_needed() {
+                            let stream = match &mut video {
+                                Some(stream) => stream,
+                                None => {
+                                    info!(
+                                        monitor = frame.monitor,
+                                        "opening video stream to server"
+                                    );
+                                    video.insert(self.connection.open_uni().await?)
+                                }
+                            };
+                            write_frame(stream, sealed.as_ref()).await?;
+                        } else if let Some(delay) = peers.direct_delay(now) {
+                            // No server reports now: judge the direct
+                            // viewers' delay here.
+                            if last_direct_report
+                                .is_none_or(|t| now.duration_since(t) >= DIRECT_REPORT_INTERVAL)
+                            {
+                                last_direct_report = Some(now);
+                                let report = StreamReport {
+                                    seq: u64::MAX,
+                                    bytes: relay_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                    viewer_delay_ms: u32::try_from(delay.as_millis())
+                                        .unwrap_or(u32::MAX),
+                                };
+                                let change = lock(&rate).on_report(&report, now);
+                                set_bitrate(change);
+                            }
+                        }
                         seq += 1;
                     }
                 }
@@ -466,12 +550,13 @@ impl AgentSession {
             while let Some(event) = source.recv().await {
                 match event {
                     DesktopEvent::Clipboard(data) => {
-                        // Never leak the user's clipboard when nobody is connected.
-                        if lock(&sessions).any_active() {
-                            let _ = outbox_tx.send(Message::Clipboard(data));
-                        }
+                        // Only to granted sessions: never leak the user's
+                        // clipboard when nobody is connected.
+                        let active = lock(&sessions).active_ids();
+                        peers.send_each(&active, &Control::Clipboard(data));
                     }
                     DesktopEvent::KillSwitch => {
+                        peers.end_all();
                         let ended = self.end_all_sessions(&sessions);
                         lock(&rate).stream_restarted();
                         warn!(sessions = ?ended, "user pressed Ctrl+F12: all sessions terminated");
@@ -482,6 +567,65 @@ impl AgentSession {
                 }
             }
             std::future::pending().await
+        };
+
+        // Records from viewers (over the relay or a direct path), opened and
+        // in order. Consent still decides whether they reach the desktop.
+        let records = async {
+            let mut tick = tokio::time::interval(REORDER_TICK);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                let item = tokio::select! {
+                    item = inbound.recv() => item,
+                    _ = tick.tick() => {
+                        peers.expire();
+                        continue;
+                    }
+                };
+                let Some(item) = item else {
+                    return std::future::pending::<Result<(), AgentError>>().await;
+                };
+                match item {
+                    Inbound::Keyframe => {
+                        if let Some(media) = &self.media {
+                            let _ = media.commands.send(MediaCommand::ForceKeyframe);
+                        }
+                    }
+                    Inbound::Record {
+                        session_id,
+                        record: Control::Input(event),
+                    } => {
+                        let event = lock(&sessions).input(session_id, event);
+                        match (event, &self.desktop) {
+                            (Some(event), Some(desktop)) => {
+                                let _ = desktop.commands.send(DesktopCommand::Input(event));
+                            }
+                            (None, _) => {
+                                debug!(session_id, "input for an inactive session dropped")
+                            }
+                            (Some(_), None) => {}
+                        }
+                    }
+                    Inbound::Record {
+                        session_id,
+                        record: Control::Clipboard(data),
+                    } => {
+                        let active = lock(&sessions).is_active(session_id);
+                        if data.size() > MAX_CLIPBOARD_BYTES {
+                            warn!(
+                                session_id,
+                                bytes = data.size(),
+                                "oversized clipboard dropped"
+                            );
+                        } else if let (true, Some(desktop)) = (active, &self.desktop) {
+                            let _ = desktop.commands.send(DesktopCommand::SetClipboard(data));
+                        }
+                    }
+                    Inbound::Record { session_id, record } => {
+                        debug!(session_id, ?record, "record ignored");
+                    }
+                }
+            }
         };
 
         // Shell, script and file-transfer streams opened by the server. The
@@ -508,9 +652,11 @@ impl AgentSession {
             res = reader => res,
             res = pump => res,
             res = desktop_events => res,
+            res = records => res,
             res = remote_ops => res,
         };
         // Sessions do not survive the connection.
+        peers.end_all();
         self.end_all_sessions(&sessions);
         if let Err(AgentError::Unexpected(msg)) = &result {
             warn!(?msg, "closing connection after protocol violation");

@@ -27,6 +27,22 @@ pub struct ServeConfig {
     #[arg(long, env = "RMM_NO_WEBSOCKET")]
     pub no_websocket: bool,
 
+    /// UDP address of the STUN responder that agents and viewers use to
+    /// learn their public addresses for direct connections. Clients reach it
+    /// on the server's own address, at this port.
+    #[arg(long, env = "RMM_STUN_LISTEN", default_value = "0.0.0.0:3478")]
+    pub stun_listen: SocketAddr,
+
+    /// The STUN port to announce, if clients reach the responder on a
+    /// different port than it listens on (e.g. published elsewhere by Docker).
+    #[arg(long, env = "RMM_STUN_ANNOUNCE_PORT")]
+    pub stun_announce_port: Option<u16>,
+
+    /// Keep every session on the relay: tell agents and viewers not to try
+    /// direct paths (and do not run the STUN responder).
+    #[arg(long, env = "RMM_NO_DIRECT")]
+    pub no_direct: bool,
+
     /// Serve Prometheus metrics over plain HTTP at /metrics on this address
     /// (e.g. 127.0.0.1:9464). Off unless set. Reachable only by the
     /// monitoring system: it needs no credentials.

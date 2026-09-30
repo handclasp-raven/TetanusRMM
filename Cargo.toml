@@ -7,6 +7,7 @@ members = [
     "crates/server",
     "crates/agent",
     "crates/viewer",
+    "crates/peer",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ common = { path = "crates/common" }
 transport = { path = "crates/transport" }
 server = { path = "crates/server" }
 agent = { path = "crates/agent" }
+peer = { path = "crates/peer" }
 
 anyhow = "1"
 thiserror = "2"

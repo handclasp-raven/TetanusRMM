@@ -14,7 +14,7 @@ RUN cargo build --release --locked -p server \
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /server /usr/local/bin/server
 
-# 4433/udp: agents (QUIC). 8443/tcp: HTTPS API.
-EXPOSE 4433/udp 8443/tcp
+# 4433/udp: agents (QUIC). 8443/tcp: HTTPS API. 3478/udp: STUN (direct paths).
+EXPOSE 4433/udp 8443/tcp 3478/udp
 ENTRYPOINT ["/usr/local/bin/server"]
 CMD ["serve"]
