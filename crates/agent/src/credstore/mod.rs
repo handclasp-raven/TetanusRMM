@@ -135,6 +135,15 @@ impl CredentialStore {
         let plaintext = unprotect(&self.dir, &blob)?;
         Ok(serde_json::from_slice(&plaintext)?)
     }
+
+    /// Delete the stored credential, if there is one.
+    pub fn remove(&self) -> Result<(), StoreError> {
+        let path = self.credential_path();
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -187,6 +196,16 @@ mod tests {
         assert_eq!(loaded, cred);
         let config = loaded.agent_config(Duration::from_secs(5)).unwrap();
         assert_eq!(config.agent_id, "agt-test");
+    }
+
+    #[test]
+    fn remove_deletes_the_credential_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path());
+        store.save(&sample()).unwrap();
+        store.remove().unwrap();
+        assert!(!store.exists());
+        store.remove().unwrap();
     }
 
     #[test]

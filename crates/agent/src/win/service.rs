@@ -82,6 +82,12 @@ pub fn install(opts: InstallOptions) -> anyhow::Result<()> {
             }
             .save(&state_dir)
             .context("saving enrollment request")?;
+            // A credential left by an earlier install (uninstalling keeps the
+            // state directory) would win over the request, and the service
+            // would go back to the server it was enrolled with before.
+            CredentialStore::new(&state_dir)
+                .remove()
+                .context("removing the previous credential")?;
         }
         (Some(_), None) => bail!("--server-ca is required with --token"),
         (None, _) if !CredentialStore::new(&state_dir).exists() => {
