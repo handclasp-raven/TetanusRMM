@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Install the RMM server on a Linux host, from nothing to a running server
+# Install the TetanusRMM server on a Linux host, from nothing to a running server
 # with published agent and viewer builds.
 #
-#   curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/RMMTool/main/scripts/install.sh -o install.sh
+#   curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/TetanusRMM/main/scripts/install.sh -o install.sh
 #   bash install.sh --host rmm.example.com
 #
 # or, from a checkout: scripts/install.sh --host rmm.example.com
@@ -23,8 +23,8 @@
 # Options (or the environment variable in brackets):
 #   --host NAME       name or IP that agents and staff reach this server at
 #                     [RMM_HOST]; default: asks, suggesting this host's address
-#   --dir PATH        where to clone to [RMM_DIR]; default /opt/rmmtool as
-#                     root, ~/rmmtool otherwise
+#   --dir PATH        where to clone to [RMM_DIR]; default /opt/tetanusrmm as
+#                     root, ~/tetanusrmm otherwise
 #   --repo URL        git repository to clone [RMM_REPO]
 #   --branch NAME     branch or tag to check out [RMM_BRANCH]
 #   --admin NAME      first admin's username [RMM_ADMIN]; default admin
@@ -36,7 +36,7 @@
 # RMM_ADMIN_PASSWORD sets the admin password without a prompt.
 set -euo pipefail
 
-REPO=${RMM_REPO:-https://github.com/CHANGE-ME/RMMTool.git}
+REPO=${RMM_REPO:-https://github.com/CHANGE-ME/TetanusRMM.git}
 BRANCH=${RMM_BRANCH:-}
 DIR=${RMM_DIR:-}
 HOST=${RMM_HOST:-}
@@ -132,7 +132,7 @@ fetch_source() {
         say "Using the checkout in $DIR"
     else
         if [ -z "$DIR" ]; then
-            if [ "$(id -u)" = 0 ]; then DIR=/opt/rmmtool; else DIR=$HOME/rmmtool; fi
+            if [ "$(id -u)" = 0 ]; then DIR=/opt/tetanusrmm; else DIR=$HOME/tetanusrmm; fi
         fi
         if [ -d "$DIR/.git" ]; then
             say "Updating $DIR"

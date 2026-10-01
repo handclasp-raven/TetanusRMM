@@ -1,4 +1,4 @@
-# RMMTool
+# TetanusRMM
 
 Remote monitoring and management tool.
 
@@ -77,15 +77,15 @@ they are missing (asking first), and needs no Rust or Python: everything is
 built in containers.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/RMMTool/main/scripts/install.sh -o install.sh
-bash install.sh --repo https://github.com/CHANGE-ME/RMMTool.git --host rmm.example.com
+curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/TetanusRMM/main/scripts/install.sh -o install.sh
+bash install.sh --repo https://github.com/CHANGE-ME/TetanusRMM.git --host rmm.example.com
 ```
 
 Run it as root, or as a user in the `docker` group. From a checkout, run
 `scripts/install.sh --host rmm.example.com` instead; it then installs in
 place. It:
 
-1. clones the repository to `/opt/rmmtool` (as root) or `~/rmmtool`;
+1. clones the repository to `/opt/tetanusrmm` (as root) or `~/tetanusrmm`;
 2. writes `.env` with a random database password, the public URL and your
    uid/gid (see [Compose settings](#compose-settings));
 3. builds the server image;
@@ -130,7 +130,7 @@ These are the script's steps. They need Docker (with the Compose plugin)
 and git on the host, and nothing else. `HOST` is the name or IP from above.
 
 ```sh
-git clone https://github.com/CHANGE-ME/RMMTool.git rmmtool && cd rmmtool
+git clone https://github.com/CHANGE-ME/TetanusRMM.git tetanusrmm && cd tetanusrmm
 HOST=rmm.example.com
 ```
 
