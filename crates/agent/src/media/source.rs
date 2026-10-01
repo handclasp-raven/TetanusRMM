@@ -22,6 +22,9 @@ pub enum MediaCommand {
     /// Encode at most this many bits per second (adaptive bitrate, see
     /// `media::rate`), for this stream and later ones until `Stop`.
     SetBitrate(u32),
+    /// Capture at most this many frames a second, for this stream and
+    /// later ones.
+    SetFrameRate(u32),
 }
 
 #[derive(Debug, Clone)]

@@ -37,6 +37,9 @@ tokio-rustls.workspace = true
 transport.workspace = true
 totp-rs.workspace = true
 tracing.workspace = true
+msi = "0.10"
+cab = "0.6"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 openh264.workspace = true

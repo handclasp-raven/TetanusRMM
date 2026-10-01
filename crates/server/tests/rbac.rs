@@ -491,6 +491,129 @@ async fn admins_manage_users_but_never_lose_the_last_admin() {
 }
 
 #[tokio::test]
+async fn admins_reset_passwords_and_totp_which_ends_the_users_sessions() {
+    let rig = rig().await;
+    let eng = rig.eng_user.user.id;
+    let login = |password: &'static str| {
+        let (client, url) = (rig.api.client.clone(), rig.api.url("/api/auth/login"));
+        async move {
+            client
+                .post(url)
+                .json(&json!({ "username": "eng", "password": password }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Only admins, and only acceptable passwords.
+    let path = format!("/api/users/{eng}/password");
+    let body = json!({ "password": "a brand new password" });
+    let (status, _) = rig
+        .call(Method::PUT, &rig.eng, &path, Some(body.clone()))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = rig
+        .call(
+            Method::PUT,
+            &rig.admin,
+            &path,
+            Some(json!({ "password": "short" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = rig
+        .call(
+            Method::PUT,
+            &rig.admin,
+            "/api/users/999999/password",
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        rig.get(&rig.eng, "/api/me").await.0,
+        StatusCode::OK,
+        "refused changes end nothing"
+    );
+
+    let (status, user) = rig.call(Method::PUT, &rig.admin, &path, Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(user["username"], "eng");
+    // The old session and the old password are gone; the new one works.
+    assert_eq!(
+        rig.get(&rig.eng, "/api/me").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(support::PASSWORD).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let challenge: Value = login("a brand new password").await.json().await.unwrap();
+
+    // A TOTP reset invalidates the old secret, and the pending login.
+    let (status, reset) = rig
+        .call(
+            Method::POST,
+            &rig.admin,
+            &format!("/api/users/{eng}/totp"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let secret = reset["totp_secret"].as_str().unwrap();
+    assert_ne!(secret, rig.eng_user.totp_secret);
+    assert!(reset["otpauth_url"].as_str().unwrap().contains(secret));
+    let totp = |challenge: Value, code: String| {
+        let (client, url) = (rig.api.client.clone(), rig.api.url("/api/auth/totp"));
+        async move {
+            client
+                .post(url)
+                .json(&json!({ "challenge_token": challenge["challenge_token"], "code": code }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(
+        totp(challenge, support::current_code(secret)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let challenge: Value = login("a brand new password").await.json().await.unwrap();
+    assert_eq!(
+        totp(challenge, support::current_code(secret)).await,
+        StatusCode::OK
+    );
+
+    // An admin changing their own credentials keeps the session in use.
+    let (_, users) = rig.get(&rig.admin, "/api/users").await;
+    let root = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "root")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (status, _) = rig
+        .call(
+            Method::PUT,
+            &rig.admin,
+            &format!("/api/users/{root}/password"),
+            Some(json!({ "password": "root's next password" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rig.get(&rig.admin, "/api/me").await.0, StatusCode::OK);
+
+    let actions = audit_actions(&rig.db.pool).await;
+    for expected in ["user.password_change", "user.totp_reset"] {
+        assert!(actions.iter().any(|a| a == expected), "{expected}");
+    }
+}
+
+#[tokio::test]
 async fn groups_are_validated_and_editable() {
     let rig = rig().await;
     let (status, g) = rig
@@ -705,4 +828,109 @@ async fn enrollment_links_can_put_new_agents_into_groups_but_only_for_admins() {
         .unwrap();
     assert_eq!(group.agent_ids, [credential.agent_id]);
     std::mem::forget(quic);
+}
+
+#[tokio::test]
+async fn admins_classify_agents_and_the_device_kind_is_the_default() {
+    let rig = rig().await;
+    sqlx::query("UPDATE agents SET device_kind = 'server' WHERE id = 'a2'")
+        .execute(&rig.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agents SET device_kind = 'workstation' WHERE id = 'a3'")
+        .execute(&rig.db.pool)
+        .await
+        .unwrap();
+    let classes = |list: Value| -> Vec<(String, Value, Value)> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["id"].as_str().unwrap().to_owned(),
+                    a["classification"].clone(),
+                    a["classification_override"].clone(),
+                )
+            })
+            .collect()
+    };
+    let (_, list) = rig.get(&rig.admin, "/api/agents").await;
+    assert_eq!(
+        classes(list),
+        [
+            ("a1".into(), json!("other"), Value::Null),
+            ("a2".into(), json!("server"), Value::Null),
+            ("a3".into(), json!("desktop"), Value::Null),
+            ("a4".into(), json!("other"), Value::Null),
+        ]
+    );
+
+    // Only admins classify; attempts are audited.
+    async fn put(rig: &Rig, token: &str, id: &str, body: Value) -> (StatusCode, Value) {
+        let path = format!("/api/agents/{id}/classification");
+        rig.call(Method::PUT, token, &path, Some(body)).await
+    }
+    for token in [&rig.eng, &rig.auditor] {
+        let (status, _) = put(&rig, token, "a1", json!({ "classification": "server" })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(rig.denials().await[0]["action"], "agent_classify");
+
+    let (status, body) = put(
+        &rig,
+        &rig.admin,
+        "a2",
+        json!({ "classification": "desktop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({ "classification": "desktop", "classification_override": "desktop" })
+    );
+    let (status, _) = put(
+        &rig,
+        &rig.admin,
+        "a1",
+        json!({ "classification": "tablet" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = put(
+        &rig,
+        &rig.admin,
+        "nope",
+        json!({ "classification": "other" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (_, list) = rig.get(&rig.admin, "/api/agents").await;
+    assert_eq!(
+        classes(list)[1],
+        ("a2".into(), json!("desktop"), json!("desktop"))
+    );
+
+    // Cleared: back to what the device kind says.
+    let (status, body) = put(&rig, &rig.admin, "a2", json!({ "classification": null })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({ "classification": "server", "classification_override": null })
+    );
+    // Setting what is already set is not audited again.
+    put(&rig, &rig.admin, "a2", json!({ "classification": null })).await;
+    let audited: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT target, detail FROM audit_log WHERE action = 'agent.classify' ORDER BY id",
+    )
+    .fetch_all(&rig.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audited,
+        [
+            ("a2".into(), json!({ "before": null, "after": "desktop" })),
+            ("a2".into(), json!({ "before": "desktop", "after": null })),
+        ]
+    );
 }

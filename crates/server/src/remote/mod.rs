@@ -5,6 +5,8 @@
 //!   stream to the agent
 //! - [`script`]: run a script on one or many agents and collect each result
 //! - [`files`]: upload and download files, streamed through in chunks
+//! - [`launch`]: start a program on the agent's desktop, as the signed-in
+//!   user (the viewer's command buttons)
 //!
 //! The server opens one bidirectional QUIC stream per operation on the
 //! agent's existing connection (agents are behind NAT; they never accept
@@ -14,6 +16,7 @@
 //! audited too, with who, which agent(s) and what happened.
 
 pub mod files;
+pub mod launch;
 pub mod script;
 pub mod shell;
 
@@ -37,6 +40,9 @@ pub enum RemoteError {
     Unsupported,
     #[error("{0}")]
     BadRequest(String),
+    /// Nobody is signed in at the agent's console.
+    #[error("nobody is signed in at the console")]
+    NoUser,
     /// The agent refused or failed the operation.
     #[error("{message}")]
     Agent { kind: ErrorKind, message: String },

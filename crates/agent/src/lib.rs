@@ -43,7 +43,7 @@ use common::Identity;
 use protocol::clipboard::MAX_CLIPBOARD_BYTES;
 use protocol::consent::{decide, Decision, DeviceKind, Outcome, SessionRequest};
 use protocol::e2e::{AgentProof, Control};
-use protocol::media::{StreamReport, VideoPayload};
+use protocol::media::{FrameRate, StreamReport, StreamStatus, VideoPayload};
 use protocol::{close_code, read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -52,7 +52,7 @@ use tracing::{debug, info, warn};
 use transport::{Connection, ConnectionError, Preference, TransportKind, TransportSettings};
 
 use crate::interactive::{DesktopCommand, DesktopEvent, DesktopLink, Sessions};
-use crate::media::rate::RateController;
+use crate::media::rate::{RateController, DEFAULT_FPS};
 use crate::media::source::{MediaCommand, MediaEvent, MediaLink};
 use crate::peers::{Inbound, PeerSetup, Peers};
 use crate::telemetry::TelemetrySource;
@@ -65,6 +65,26 @@ const DIRECT_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How often records waiting on a reordering gap are checked.
 const REORDER_TICK: Duration = Duration::from_millis(100);
+
+/// The technicians' frame-rate choices, and what the stream runs at.
+struct FrameRates {
+    /// By session; only sessions whose viewer sent `StreamSettings`.
+    wanted: std::collections::HashMap<u64, FrameRate>,
+    /// Frames a second the source was last told.
+    fps: u32,
+    /// Last `StreamStatus` sent.
+    reported: Option<StreamStatus>,
+}
+
+impl Default for FrameRates {
+    fn default() -> Self {
+        Self {
+            wanted: Default::default(),
+            fps: DEFAULT_FPS,
+            reported: None,
+        }
+    }
+}
 
 pub struct AgentConfig {
     /// Server QUIC (UDP) address.
@@ -280,6 +300,7 @@ impl AgentSession {
             // Fresh connection, fresh start: any stream from a previous
             // connection has no viewers any more.
             let _ = media.commands.send(MediaCommand::Stop);
+            let _ = media.commands.send(MediaCommand::SetFrameRate(DEFAULT_FPS));
         }
         let sessions = Arc::new(std::sync::Mutex::new(Sessions::default()));
         // End-to-end sessions with viewers, and their direct paths.
@@ -317,7 +338,49 @@ impl AgentSession {
             }
             let _ = media.commands.send(command);
         };
+        // Each technician's frame rate; the stream runs at the fastest.
+        let frame_rates = std::sync::Mutex::new(FrameRates::default());
+        // Apply the frame rate the technicians' choices (and, for Auto, the
+        // controller) now call for, and tell those who asked how the video
+        // is streamed. Call after anything that may change either.
+        let update_stream = || {
+            let mut rates = lock(&frame_rates);
+            let (chosen, fps, change) = {
+                let mut rate = lock(&rate);
+                let auto = rate.auto_fps();
+                let chosen =
+                    FrameRate::fastest(rates.wanted.values().copied(), auto).unwrap_or_default();
+                let fps = chosen.cap(auto);
+                let mut change = None;
+                if fps != rates.fps {
+                    info!(fps, frame_rate = %chosen, "frame rate changed");
+                    rates.fps = fps;
+                    if let Some(media) = &self.media {
+                        let command = MediaCommand::SetFrameRate(fps);
+                        if let Some(tx) = &events {
+                            let _ = tx.send(AgentEvent::Media(command.clone()));
+                        }
+                        let _ = media.commands.send(command);
+                    }
+                    change = rate.set_frame_rate(fps);
+                }
+                (chosen, fps, change)
+            };
+            set_bitrate(change);
+            let status = StreamStatus {
+                frame_rate: chosen,
+                fps,
+                bitrate: lock(&rate).target().unwrap_or(0),
+            };
+            if rates.reported != Some(status) {
+                rates.reported = Some(status);
+                let ids: Vec<u64> = rates.wanted.keys().copied().collect();
+                peers.send_each(&ids, &Control::StreamStatus(status));
+            }
+        };
         publish_technicians(self.desktop.as_deref(), &sessions);
+        // Set when the server asks for status reports (protocol 9).
+        let status_wanted = tokio::sync::Notify::new();
         // Consent prompts run concurrently; dropped (aborted) with the session.
         let mut consent_tasks = tokio::task::JoinSet::new();
 
@@ -395,6 +458,11 @@ impl AgentSession {
                         peers.on_sealed(session_id, &data);
                         continue;
                     }
+                    Message::EnableStatusReports => {
+                        info!("server asked for status reports");
+                        status_wanted.notify_one();
+                        continue;
+                    }
                     Message::PeerConfig { direct, stun_port } => {
                         info!(direct, ?stun_port, "direct-path policy from server");
                         peers.set_policy(direct, stun_port);
@@ -412,6 +480,9 @@ impl AgentSession {
                         continue;
                     }
                     Message::SessionEnded { session_id } => {
+                        if lock(&frame_rates).wanted.remove(&session_id).is_some() {
+                            update_stream();
+                        }
                         peers.end(session_id);
                         let ended = lock(&sessions).ended(session_id);
                         info!(session_id, "session ended");
@@ -439,6 +510,7 @@ impl AgentSession {
                         }
                         let change = lock(&rate).on_report(&report, now);
                         set_bitrate(change);
+                        update_stream();
                         continue;
                     }
                     Message::ListMonitors => MediaCommand::ListMonitors,
@@ -501,7 +573,10 @@ impl AgentSession {
                         // saturated transport is queueing too.
                         let now = std::time::Instant::now();
                         let change = lock(&rate).on_sent(seq, payload.width, payload.height, now);
-                        set_bitrate(change);
+                        if change.is_some() {
+                            set_bitrate(change);
+                            update_stream();
+                        }
                         let sealed = peers.seal_frame(payload.to_frame(seq, frame.keyframe));
                         peers.feed_direct(&sealed, now);
                         if peers.relay_needed() {
@@ -531,6 +606,7 @@ impl AgentSession {
                                 };
                                 let change = lock(&rate).on_report(&report, now);
                                 set_bitrate(change);
+                                update_stream();
                             }
                         }
                         seq += 1;
@@ -539,6 +615,31 @@ impl AgentSession {
             }
             // The source went away; keep the control connection up anyway.
             std::future::pending().await
+        };
+
+        // Signed-in users and local address: once the server asks (an older
+        // server would reject the message), then on each change, checked
+        // every heartbeat interval.
+        let status = async {
+            status_wanted.notified().await;
+            let mut ticker = tokio::time::interval(self.heartbeat_interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut last: Option<protocol::AgentStatus> = None;
+            loop {
+                ticker.tick().await;
+                let status = self.status().await;
+                if last.as_ref() == Some(&status) {
+                    continue;
+                }
+                debug!(?status, "status changed");
+                if outbox_tx
+                    .send(Message::AgentStatus(status.clone()))
+                    .is_err()
+                {
+                    return Ok::<(), AgentError>(());
+                }
+                last = Some(status);
+            }
         };
 
         // The user's clipboard, and the Ctrl+F12 kill switch.
@@ -557,6 +658,8 @@ impl AgentSession {
                     }
                     DesktopEvent::KillSwitch => {
                         peers.end_all();
+                        lock(&frame_rates).wanted.clear();
+                        update_stream();
                         let ended = self.end_all_sessions(&sessions);
                         lock(&rate).stream_restarted();
                         warn!(sessions = ?ended, "user pressed Ctrl+F12: all sessions terminated");
@@ -621,6 +724,18 @@ impl AgentSession {
                             let _ = desktop.commands.send(DesktopCommand::SetClipboard(data));
                         }
                     }
+                    Inbound::Record {
+                        session_id,
+                        record: Control::StreamSettings(settings),
+                    } => {
+                        info!(session_id, frame_rate = %settings.frame_rate, "technician's frame rate");
+                        lock(&frame_rates)
+                            .wanted
+                            .insert(session_id, settings.frame_rate);
+                        // They learn how it is streamed even if nothing changed.
+                        lock(&frame_rates).reported = None;
+                        update_stream();
+                    }
                     Inbound::Record { session_id, record } => {
                         debug!(session_id, ?record, "record ignored");
                     }
@@ -649,6 +764,7 @@ impl AgentSession {
         let result: Result<(), AgentError> = tokio::select! {
             res = writer => res,
             res = heartbeats => res,
+            res = status => res,
             res = reader => res,
             res = pump => res,
             res = desktop_events => res,
@@ -664,6 +780,31 @@ impl AgentSession {
                 .close(close_code::PROTOCOL_ERROR, b"unexpected message");
         }
         result
+    }
+
+    /// Who is signed in, the local address on the route to the server, the
+    /// OS (which changes on an upgrade), DNS servers and disks.
+    async fn status(&self) -> protocol::AgentStatus {
+        let (users, disks) = match &self.telemetry {
+            Some(source) => {
+                let source = source.clone();
+                tokio::task::spawn_blocking(move || (source.signed_in_users(), source.disks()))
+                    .await
+                    .unwrap_or_default()
+            }
+            None => Default::default(),
+        };
+        let (os, dns_servers) =
+            tokio::task::spawn_blocking(|| (crate::device::os(), crate::device::dns_servers()))
+                .await
+                .unwrap_or_default();
+        protocol::AgentStatus {
+            users,
+            local_ip: route_source(self.server_addr),
+            os,
+            dns_servers,
+            disks,
+        }
     }
 
     /// End every session locally: release held input, withdraw prompts,
@@ -699,6 +840,20 @@ impl AgentSession {
         self.connection
             .close(close_code::NORMAL, b"agent shutting down");
     }
+}
+
+/// The local address the OS would send from to reach `server`. Connecting
+/// a UDP socket only picks a route: nothing is sent.
+fn route_source(server: SocketAddr) -> Option<std::net::IpAddr> {
+    let bind: SocketAddr = if server.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(server).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

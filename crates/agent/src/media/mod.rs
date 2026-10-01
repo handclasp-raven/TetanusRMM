@@ -8,5 +8,6 @@
 
 pub mod h264;
 pub mod nv12;
+pub mod pace;
 pub mod rate;
 pub mod source;

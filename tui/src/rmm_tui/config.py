@@ -7,6 +7,7 @@ Example ``config.toml``::
     viewer_path = "/opt/rmm/viewer"      # the native remote-desktop viewer
     quic_addr = "rmm.example.com:4433"   # optional; default: API host, port 4433
     poll_interval = 5
+    viewer_font_size = 9                 # optional; the viewer's default is 10
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from urllib.parse import urlsplit
 
 APP_NAME = "rmm-tui"
 DEFAULT_QUIC_PORT = 4433
+#: Text sizes the viewer accepts (``--font-size``).
+VIEWER_FONT_SIZES = range(6, 33)
 
 
 class ConfigError(Exception):
@@ -44,6 +47,29 @@ def data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / APP_NAME
 
 
+def check_server_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ConfigError(f"server_url must be an https:// URL, got {url!r}")
+
+
+def normalize_server_url(value: str) -> str:
+    """A server URL as typed on the login screen: ``https://`` is assumed
+    without a scheme, and a trailing slash is dropped. Raises
+    :class:`ConfigError` if it is not an ``https://`` URL."""
+    url = value.strip()
+    if not url:
+        raise ConfigError("enter the server URL")
+    if "://" not in url:
+        url = f"https://{url}"
+    url = url.rstrip("/")
+    try:
+        check_server_url(url)
+    except ValueError as e:  # e.g. a malformed IPv6 host
+        raise ConfigError(f"invalid server URL {value!r}: {e}") from e
+    return url
+
+
 def default_config_path() -> Path:
     return Path(os.environ.get("RMM_TUI_CONFIG") or config_dir() / "config.toml")
 
@@ -64,17 +90,32 @@ class Config:
     poll_interval: float = 5.0
     #: Saved-script library.
     scripts_path: Path = field(default_factory=lambda: data_dir() / "scripts.json")
+    #: Text size of the viewer's toolbar and panel, in pixels. ``None``: the
+    #: viewer's own default.
+    viewer_font_size: int | None = None
 
     def __post_init__(self) -> None:
-        parts = urlsplit(self.server_url)
-        if parts.scheme != "https" or not parts.hostname:
-            raise ConfigError(f"server_url must be an https:// URL, got {self.server_url!r}")
+        check_server_url(self.server_url)
         if self.poll_interval < 1:
             raise ConfigError("poll_interval must be at least 1 second")
+        size = self.viewer_font_size
+        if size is not None and (
+            isinstance(size, bool) or not isinstance(size, int) or size not in VIEWER_FONT_SIZES
+        ):
+            raise ConfigError(
+                f"viewer_font_size must be a whole number of pixels from "
+                f"{VIEWER_FONT_SIZES.start} to {VIEWER_FONT_SIZES.stop - 1}, got {size!r}"
+            )
 
     @property
     def api_host(self) -> str:
         return urlsplit(self.server_url).hostname or ""
+
+    def for_server(self, server_url: str) -> Config:
+        """A copy for another server. ``quic_addr`` is kept only if the
+        host is the same: it named the old server's QUIC listener."""
+        same_host = urlsplit(server_url).hostname == self.api_host
+        return replace(self, server_url=server_url, quic_addr=self.quic_addr if same_host else None)
 
     def with_overrides(self, **overrides: object) -> Config:
         """A copy with every non-``None`` override applied."""

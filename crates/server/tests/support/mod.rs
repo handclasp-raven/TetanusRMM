@@ -181,6 +181,7 @@ pub async fn start_api_full(
         public_url: base.clone(),
         updates_dir,
         hub,
+        server_ca_pem: certs.ca_cert.clone(),
     });
     tokio::spawn(api::serve(listener, tls, app, handle.clone()));
 

@@ -10,7 +10,7 @@ from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     DataTable,
@@ -32,11 +32,71 @@ if TYPE_CHECKING:
     from .app import RmmApp
 
 
+class NewScriptScreen(ModalScreen[SavedScript | None]):
+    """Name, timeout and body for a new library entry. Dismissed with the
+    script (not yet saved), or ``None`` if cancelled."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, taken: set[str]) -> None:
+        super().__init__()
+        self.taken = taken
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="new-script-box"):
+            yield Static("[b]New script[/b]", id="new-script-title")
+            yield Input(placeholder="Name", id="new-name")
+            yield Input(
+                placeholder="Timeout in seconds (blank: server default)",
+                id="new-timeout",
+                restrict=r"[0-9]*",
+                max_length=4,
+            )
+            yield TextArea(id="new-body", show_line_numbers=True)
+            yield Static("", id="new-status")
+            with Horizontal(id="new-buttons"):
+                yield Button("Cancel", id="new-cancel")
+                yield Button("Create", variant="primary", id="new-create")
+
+    def on_mount(self) -> None:
+        self.query_one("#new-name", Input).focus()
+
+    @on(Input.Submitted, "#new-name")
+    def name_entered(self) -> None:
+        self.query_one("#new-timeout", Input).focus()
+
+    @on(Input.Submitted, "#new-timeout")
+    def timeout_entered(self) -> None:
+        self.query_one("#new-body", TextArea).focus()
+
+    @on(Button.Pressed, "#new-create")
+    def create(self) -> None:
+        name = self.query_one("#new-name", Input).value.strip()
+        body = self.query_one("#new-body", TextArea).text
+        try:
+            if not name:
+                raise ScriptError("a saved script needs a name")
+            if name in self.taken:
+                raise ScriptError(f"a script named {name!r} already exists")
+            if not body.strip():
+                raise ScriptError("the script is empty")
+            timeout = validate_timeout(self.query_one("#new-timeout", Input).value)
+        except ScriptError as e:
+            self.query_one("#new-status", Static).update(f"[red]{e}[/red]")
+            return
+        self.dismiss(SavedScript(name, body, timeout))
+
+    @on(Button.Pressed, "#new-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ScriptScreen(Screen):
     app: RmmApp
 
     BINDINGS = [
         Binding("ctrl+r", "run", "Run", priority=True),
+        Binding("ctrl+n", "new_script", "New script", priority=True),
         Binding("escape", "app.pop_screen", "Back"),
     ]
 
@@ -77,6 +137,7 @@ class ScriptScreen(Screen):
                 yield Label("Saved scripts (Enter loads)")
                 yield OptionList(id="library")
                 with Horizontal(id="library-controls"):
+                    yield Button("New", id="new-script", tooltip="New script (Ctrl+N)")
                     yield Input(placeholder="Name to save as", id="save-name")
                     yield Button("Save", id="save")
                     yield Button("Delete", id="delete", variant="error")
@@ -130,8 +191,11 @@ class ScriptScreen(Screen):
     @on(OptionList.OptionSelected, "#library")
     def load_script(self, event: OptionList.OptionSelected) -> None:
         script = next((s for s in self.scripts if s.name == event.option.id), None)
-        if script is None:
-            return
+        if script is not None:
+            self.show_script(script)
+
+    def show_script(self, script: SavedScript) -> None:
+        """Load ``script`` into the editor."""
         self.query_one("#script-body", TextArea).text = script.body
         self.query_one("#timeout", Input).value = str(script.timeout_secs or "")
         self.query_one("#save-name", Input).value = script.name
@@ -150,6 +214,25 @@ class ScriptScreen(Screen):
             return
         self.app.notify(f"Saved {script.name.strip()!r}.")
         self.reload_library()
+
+    @on(Button.Pressed, "#new-script")
+    def action_new_script(self) -> None:
+        def created(script: SavedScript | None) -> None:
+            if script is None:
+                return
+            try:
+                self.library.save(script)
+            except (ScriptError, OSError) as e:
+                self.app.notify(str(e), severity="error")
+                return
+            self.app.notify(f"Created {script.name!r}.")
+            self.reload_library()
+            options = self.query_one("#library", OptionList)
+            options.highlighted = options.get_option_index(script.name)
+            self.show_script(script)
+            self.query_one("#script-body", TextArea).focus()
+
+        self.app.push_screen(NewScriptScreen({s.name for s in self.scripts}), created)
 
     @on(Button.Pressed, "#delete")
     def delete_script(self) -> None:

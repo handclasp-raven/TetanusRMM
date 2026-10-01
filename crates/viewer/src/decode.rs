@@ -43,7 +43,6 @@ pub struct VideoDecoder {
     decoder: Decoder,
     /// Until a keyframe arrives there is nothing to decode against.
     waiting_for_keyframe: bool,
-    rgb: Vec<u8>,
 }
 
 impl VideoDecoder {
@@ -51,7 +50,6 @@ impl VideoDecoder {
         Ok(Self {
             decoder: Decoder::new()?,
             waiting_for_keyframe: true,
-            rgb: Vec::new(),
         })
     }
 
@@ -59,6 +57,18 @@ impl VideoDecoder {
     /// keyframe, or the decoder is buffering). On `Err`, the caller should
     /// request a keyframe; frames are skipped until one arrives.
     pub fn decode(&mut self, frame: &MediaFrame) -> Result<Option<Picture>, DecodeError> {
+        self.decode_as(frame, true)
+    }
+
+    /// [`VideoDecoder::decode`], but with `show` false the picture is only
+    /// decoded (later frames build on it), not converted for display: for
+    /// a frame a newer one will replace before it could be shown. That
+    /// conversion is most of the work.
+    pub fn decode_as(
+        &mut self,
+        frame: &MediaFrame,
+        show: bool,
+    ) -> Result<Option<Picture>, DecodeError> {
         if self.waiting_for_keyframe && !frame.keyframe {
             return Ok(None);
         }
@@ -72,16 +82,19 @@ impl VideoDecoder {
             }
         };
         self.waiting_for_keyframe = false;
+        if !show {
+            return Ok(None);
+        }
         let (w, h) = yuv.dimensions();
-        self.rgb.resize(w * h * 3, 0);
-        yuv.write_rgb8(&mut self.rgb);
-        let pixels = self
-            .rgb
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|[r, g, b]| (u32::from(*r) << 16) | (u32::from(*g) << 8) | u32::from(*b))
-            .collect();
+        let mut pixels = vec![0u32; w * h];
+        // SAFETY: a u32 slice viewed as its bytes: same memory, u8 has no
+        // alignment requirement, and every byte pattern is a valid u32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(pixels.as_mut_ptr().cast::<u8>(), w * h * 4) };
+        yuv.write_rgba8(bytes);
+        for p in &mut pixels {
+            *p = rgba_to_xrgb(*p);
+        }
         Ok(Some(Picture {
             monitor: video.monitor,
             width: w as u32,
@@ -89,5 +102,23 @@ impl VideoDecoder {
             pixels,
             seq: frame.seq,
         }))
+    }
+}
+
+/// Bytes R, G, B, A read as a native `u32` to `0x00RRGGBB`.
+#[inline]
+fn rgba_to_xrgb(p: u32) -> u32 {
+    let [r, g, b, _] = p.to_ne_bytes();
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_bytes_become_window_pixels() {
+        let p = u32::from_ne_bytes([0x12, 0x34, 0x56, 0xff]);
+        assert_eq!(rgba_to_xrgb(p), 0x0012_3456);
     }
 }

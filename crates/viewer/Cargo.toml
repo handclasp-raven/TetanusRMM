@@ -12,14 +12,22 @@ arboard.workspace = true
 clap.workspace = true
 common.workspace = true
 font8x8.workspace = true
+futures-util.workspace = true
+hex.workspace = true
 openh264.workspace = true
 peer.workspace = true
 postcard.workspace = true
 protocol.workspace = true
 quinn.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+rfd.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 softbuffer.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 transport.workspace = true
 winit.workspace = true

@@ -27,6 +27,7 @@ pub mod db;
 pub mod enroll;
 pub mod groups;
 pub mod metrics;
+pub mod msi;
 pub mod quic;
 pub mod registry;
 pub mod relay;

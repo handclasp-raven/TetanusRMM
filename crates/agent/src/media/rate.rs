@@ -18,18 +18,34 @@
 //! [`CLEAR`] for a while, probe upwards by a few percent. The target stays
 //! between [`MIN_BITRATE`] and the resolution's [`max_bitrate`].
 //!
+//! The ceiling also depends on the frame rate: more frames a second need
+//! more bits, though not proportionally (consecutive frames differ less).
+//!
+//! **Automatic frame rate** (`FrameRate::Auto`) rides on the same signal.
+//! The controller keeps a choice among [`AUTO_FRAME_RATES`], starting at
+//! 30: once the stream has sat at full quality for that rate with the
+//! links clear for a while, it tries the next faster rate; when the target
+//! falls to under half of that rate's full quality (the link cannot carry
+//! it), it drops to the next slower one. Trying faster again after a drop
+//! waits longer each time, so a borderline link does not flap.
+//!
 //! Pure logic: the connection feeds it events and passes the targets it
-//! returns to the encoder (`MediaCommand::SetBitrate`).
+//! returns to the encoder (`MediaCommand::SetBitrate`), and the frame rate
+//! it streams at back in ([`RateController::set_frame_rate`]).
 
 use std::time::{Duration, Instant};
 
-use protocol::media::{QueueDelay, SendLog, StreamReport};
+use protocol::media::{QueueDelay, SendLog, StreamReport, AUTO_FRAME_RATES};
 
 /// Never ask for less than this: below it the picture is not usable.
 pub const MIN_BITRATE: u32 = 300_000;
 
-/// Full-quality bitrate for a 1080p stream; scaled by area.
+/// Full-quality bitrate for a 1080p stream at [`DEFAULT_FPS`]; scaled by
+/// area.
 const BITS_PER_1080P: u32 = 4_000_000;
+
+/// The frame rate streams start at, and the one [`max_bitrate`] is for.
+pub const DEFAULT_FPS: u32 = 30;
 
 /// Queueing above this means a link is saturated.
 pub const CONGESTED: Duration = Duration::from_millis(250);
@@ -50,11 +66,32 @@ const MIN_CHANGE: f64 = 0.05;
 /// Weight of the newest sample in the delivered-rate average.
 const RATE_SMOOTHING: f64 = 0.3;
 
-/// The full-quality bitrate for a `width` x `height` stream: 4 Mbit/s at
-/// 1080p, scaled by area, within 1-20 Mbit/s.
+/// Automatic frame rate: below this share of a rate's full quality, the
+/// link cannot carry it.
+const AUTO_DOWN_SHARE: f64 = 0.5;
+/// Keep an automatic rate at least this long before dropping it.
+const AUTO_HOLD: Duration = Duration::from_secs(3);
+/// Full quality and clear links this long before trying a faster rate...
+const AUTO_UP_AFTER: Duration = Duration::from_secs(3);
+/// ...doubling after each drop, up to this...
+const AUTO_UP_AFTER_MAX: Duration = Duration::from_secs(60);
+/// ...and back to the start once a rate has held this long.
+const AUTO_STABLE: Duration = Duration::from_secs(60);
+
+/// The full-quality bitrate for a `width` x `height` stream at
+/// [`DEFAULT_FPS`]: 4 Mbit/s at 1080p, scaled by area, within 1-20 Mbit/s.
 pub fn max_bitrate(width: u32, height: u32) -> u32 {
     let area = u64::from(width) * u64::from(height);
     ((u64::from(BITS_PER_1080P) * area) / (1920 * 1080)).clamp(1_000_000, 20_000_000) as u32
+}
+
+/// [`max_bitrate`] for `fps` frames a second: scaled by (fps / 30)^0.6
+/// (0.5-2.5x), within 1-40 Mbit/s.
+pub fn max_bitrate_at(width: u32, height: u32, fps: u32) -> u32 {
+    let factor = (f64::from(fps.max(1)) / f64::from(DEFAULT_FPS))
+        .powf(0.6)
+        .clamp(0.5, 2.5);
+    (f64::from(max_bitrate(width, height)) * factor).clamp(1_000_000.0, 40_000_000.0) as u32
 }
 
 /// Why the target moved, for logging.
@@ -63,7 +100,7 @@ pub enum Reason {
     Congested,
     Severe,
     Probe,
-    /// The resolution changed and its ceiling is lower.
+    /// The resolution or frame rate changed, and with it the ceiling.
     Ceiling,
     /// A new stream started while the target was below the ceiling.
     Restart,
@@ -97,6 +134,22 @@ pub struct RateController {
     /// Smoothed bits per second the server received.
     delivered: Option<f64>,
     last_delays: (Duration, Duration),
+    /// Frame rate streamed at (the ceiling depends on it).
+    fps: u32,
+    /// Size of the last frame sent.
+    size: Option<(u32, u32)>,
+    auto: AutoRate,
+}
+
+/// The automatic frame-rate choice (see the module docs).
+#[derive(Debug)]
+struct AutoRate {
+    fps: u32,
+    changed: Option<Instant>,
+    /// Since when the target has been at this rate's full quality with
+    /// clear links.
+    full_since: Option<Instant>,
+    up_after: Duration,
 }
 
 impl Default for RateController {
@@ -119,7 +172,39 @@ impl RateController {
             last_report: None,
             delivered: None,
             last_delays: (Duration::ZERO, Duration::ZERO),
+            fps: DEFAULT_FPS,
+            size: None,
+            auto: AutoRate {
+                fps: DEFAULT_FPS,
+                changed: None,
+                full_since: None,
+                up_after: AUTO_UP_AFTER,
+            },
         }
+    }
+
+    /// What `FrameRate::Auto` means right now.
+    pub fn auto_fps(&self) -> u32 {
+        self.auto.fps
+    }
+
+    /// The stream now runs at `fps` frames a second: move the ceiling. A
+    /// target at full quality stays at full quality.
+    pub fn set_frame_rate(&mut self, fps: u32) -> Option<Change> {
+        if fps == self.fps {
+            return None;
+        }
+        self.fps = fps;
+        let (w, h) = self.size?;
+        let old = self.ceiling;
+        self.ceiling = max_bitrate_at(w, h, fps);
+        if self.target == 0 {
+            return None;
+        }
+        if self.target >= old || self.target > self.ceiling {
+            self.target = self.ceiling;
+        }
+        self.announce(Reason::Ceiling)
     }
 
     /// The current target, once a frame has been seen.
@@ -138,7 +223,8 @@ impl RateController {
     /// A frame of `width` x `height` went out as `seq`.
     pub fn on_sent(&mut self, seq: u64, width: u32, height: u32, now: Instant) -> Option<Change> {
         self.log.record(seq, now);
-        let ceiling = max_bitrate(width, height);
+        self.size = Some((width, height));
+        let ceiling = max_bitrate_at(width, height, self.fps);
         let mut reason = Reason::Restart;
         if ceiling != self.ceiling {
             self.ceiling = ceiling;
@@ -159,6 +245,56 @@ impl RateController {
 
     /// The server reported delivery.
     pub fn on_report(&mut self, report: &StreamReport, now: Instant) -> Option<Change> {
+        let change = self.adjust(report, now);
+        if self.target > 0 {
+            let (uplink, viewers) = self.last_delays;
+            self.update_auto(uplink.max(viewers), now);
+        }
+        change
+    }
+
+    /// Pick the automatic frame rate from how the target sits against each
+    /// rate's full quality.
+    fn update_auto(&mut self, delay: Duration, now: Instant) {
+        let Some((w, h)) = self.size else { return };
+        let auto = &mut self.auto;
+        let full = max_bitrate_at(w, h, auto.fps);
+        let held = auto
+            .changed
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        let position = AUTO_FRAME_RATES.iter().position(|&r| r == auto.fps);
+        if f64::from(self.target) < f64::from(full) * AUTO_DOWN_SHARE {
+            auto.full_since = None;
+            let slower = position.and_then(|i| AUTO_FRAME_RATES.get(i + 1));
+            if let (Some(&slower), true) = (slower, held >= AUTO_HOLD) {
+                auto.up_after = if held >= AUTO_STABLE {
+                    AUTO_UP_AFTER
+                } else {
+                    (auto.up_after * 2).min(AUTO_UP_AFTER_MAX)
+                };
+                auto.fps = slower;
+                auto.changed = Some(now);
+            }
+            return;
+        }
+        if self.target < full || delay >= CLEAR {
+            auto.full_since = None;
+            return;
+        }
+        let since = *auto.full_since.get_or_insert(now);
+        let faster = position
+            .and_then(|i| i.checked_sub(1))
+            .map(|i| AUTO_FRAME_RATES[i]);
+        if let Some(faster) = faster {
+            if now.saturating_duration_since(since) >= auto.up_after && held >= auto.up_after {
+                auto.fps = faster;
+                auto.changed = Some(now);
+                auto.full_since = None;
+            }
+        }
+    }
+
+    fn adjust(&mut self, report: &StreamReport, now: Instant) -> Option<Change> {
         if self.target == 0 {
             return None;
         }
@@ -263,6 +399,9 @@ mod tests {
         seq: u64,
         bytes: u64,
         changes: Vec<Change>,
+        /// Stream at the automatic frame rate, as the agent does for
+        /// `FrameRate::Auto`.
+        follow_auto: bool,
     }
 
     impl Sim {
@@ -273,6 +412,7 @@ mod tests {
                 seq: 0,
                 bytes: 0,
                 changes: Vec::new(),
+                follow_auto: false,
             }
         }
 
@@ -295,6 +435,10 @@ mod tests {
                         viewer_delay_ms: viewer_ms,
                     };
                     self.changes.extend(self.rate.on_report(&report, self.now));
+                    if self.follow_auto {
+                        let fps = self.rate.auto_fps();
+                        self.changes.extend(self.rate.set_frame_rate(fps));
+                    }
                 }
             }
         }
@@ -398,5 +542,77 @@ mod tests {
         assert_eq!(rate.target(), None);
         assert_eq!(rate.on_sent(1, W, H, Instant::now()), None);
         assert_eq!(rate.on_report(&report, Instant::now()), None);
+    }
+
+    #[test]
+    fn the_ceiling_grows_with_the_frame_rate_but_less_than_proportionally() {
+        assert_eq!(max_bitrate_at(1920, 1080, 30), 4_000_000);
+        let at60 = max_bitrate_at(1920, 1080, 60);
+        assert!((6_000_000..6_100_000).contains(&at60), "{at60}");
+        assert_eq!(max_bitrate_at(1920, 1080, 240), 10_000_000);
+        assert_eq!(max_bitrate_at(640, 480, 15), 1_000_000);
+        assert_eq!(max_bitrate_at(7680, 4320, 120), 40_000_000);
+    }
+
+    #[test]
+    fn a_new_frame_rate_moves_the_ceiling_and_keeps_full_quality_full() {
+        let mut sim = Sim::new();
+        sim.run(Duration::from_secs(1), 20 * MS, 0, 3000);
+        let change = sim.rate.set_frame_rate(60).unwrap();
+        assert_eq!(change.reason, Reason::Ceiling);
+        assert_eq!(change.bps, max_bitrate_at(W, H, 60));
+
+        // Congested at 60: then slowing down only caps the lower target.
+        sim.run(Duration::from_secs(1), 20 * MS, 600, 3000);
+        let learned = sim.target();
+        assert!(learned < max_bitrate_at(W, H, 60));
+        sim.changes.clear();
+        let change = sim.rate.set_frame_rate(15);
+        assert_eq!(
+            sim.target(),
+            learned.min(max_bitrate_at(W, H, 15)),
+            "{change:?}"
+        );
+        assert_eq!(
+            sim.rate.set_frame_rate(15),
+            None,
+            "no change, no announcement"
+        );
+    }
+
+    #[test]
+    fn auto_speeds_up_on_a_clear_link_and_stays_there() {
+        let mut sim = Sim::new();
+        sim.follow_auto = true;
+        assert_eq!(sim.rate.auto_fps(), 30);
+        sim.run(Duration::from_secs(2), 20 * MS, 10, 3000);
+        assert_eq!(sim.rate.auto_fps(), 30, "not straight away");
+        sim.run(Duration::from_secs(3), 20 * MS, 10, 3000);
+        assert_eq!(sim.rate.auto_fps(), 60);
+        assert_eq!(sim.target(), max_bitrate_at(W, H, 60));
+        sim.run(Duration::from_secs(30), 20 * MS, 10, 3000);
+        assert_eq!(sim.rate.auto_fps(), 60, "60 is the fastest automatic rate");
+    }
+
+    #[test]
+    fn auto_slows_down_when_the_link_cannot_carry_it_and_backs_off_retrying() {
+        let mut sim = Sim::new();
+        sim.follow_auto = true;
+        sim.run(Duration::from_secs(5), 20 * MS, 10, 3000);
+        assert_eq!(sim.rate.auto_fps(), 60);
+
+        // A slow viewer: the target collapses, and the rate with it.
+        sim.run(Duration::from_secs(6), 20 * MS, 1500, 300);
+        assert_eq!(sim.rate.auto_fps(), 15);
+
+        // Clear again: faster rates come back, but not at once.
+        sim.run(Duration::from_secs(4), 20 * MS, 10, 3000);
+        assert_eq!(
+            sim.rate.auto_fps(),
+            15,
+            "retrying waits longer after a drop"
+        );
+        sim.run(Duration::from_secs(120), 20 * MS, 10, 3000);
+        assert_eq!(sim.rate.auto_fps(), 60);
     }
 }

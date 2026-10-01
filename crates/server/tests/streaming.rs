@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::media::source::{media_channel, MediaCommand};
+use protocol::media::{FrameRate, StreamStatus, MAX_FRAME_RATE};
 use reqwest::StatusCode;
 use serde_json::Value;
 use server::users::Role;
@@ -182,6 +183,29 @@ impl Viewer {
     }
 }
 
+impl Viewer {
+    /// Wait for the agent's stream status to satisfy `wanted`.
+    async fn status(&mut self, wanted: impl Fn(&StreamStatus) -> bool) -> StreamStatus {
+        timeout(DEADLINE, async {
+            loop {
+                match self.events.recv().await.expect("viewer events") {
+                    ViewerEvent::StreamStatus(status) if wanted(&status) => return status,
+                    // Keep decoding: later frames build on these.
+                    ViewerEvent::Frame(frame) => {
+                        if let Err(e) = self.decoder.decode(&frame) {
+                            panic!("decode error: {e}");
+                        }
+                    }
+                    ViewerEvent::Closed(reason) => panic!("viewer closed: {reason}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("stream status")
+    }
+}
+
 fn assert_colour(p: &Picture, expect: (u8, u8, u8)) {
     // A corner away from the moving square; allow codec rounding.
     let (r, g, b) = p.pixel(p.width - 4, p.height - 4);
@@ -252,6 +276,43 @@ async fn a_viewer_that_falls_behind_makes_the_agent_lower_its_bitrate() {
     .expect("the agent should have lowered its bitrate");
     assert!(cut >= agent::media::rate::MIN_BITRATE, "{cut}");
     drop(viewer);
+}
+
+#[tokio::test]
+async fn technicians_frame_rates_combine_and_come_back_as_status() {
+    // The settings and the status are sealed records: the relay carries
+    // them unread. The stream runs at the fastest rate anyone asked for.
+    let rig = rig().await;
+    let mut a = rig.viewer().await;
+    a.pictures(0, 3).await;
+    a.handle.set_frame_rate(FrameRate::Fixed(15));
+    let status = a.status(|s| s.frame_rate == FrameRate::Fixed(15)).await;
+    assert_eq!(status.fps, 15);
+    assert!(status.bitrate > 0, "{status:?}");
+
+    let mut b = rig.viewer().await;
+    b.handle.set_frame_rate(FrameRate::Max);
+    let expect_max = |s: &StreamStatus| s.frame_rate == FrameRate::Max;
+    assert_eq!(b.status(expect_max).await.fps, MAX_FRAME_RATE);
+    assert_eq!(
+        a.status(expect_max).await.fps,
+        MAX_FRAME_RATE,
+        "a is told too"
+    );
+
+    // b leaves: back to what a wants.
+    b.handle.close();
+    drop(b);
+    assert_eq!(
+        a.status(|s| s.fps == 15).await.frame_rate,
+        FrameRate::Fixed(15)
+    );
+    a.pictures(0, 3).await;
+    let rates = rig.log.frame_rates();
+    assert!(
+        rates.ends_with(&[15, MAX_FRAME_RATE, 15]),
+        "the source followed: {rates:?}"
+    );
 }
 
 #[tokio::test]

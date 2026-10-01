@@ -80,6 +80,16 @@ impl SourceLog {
             .collect()
     }
 
+    pub fn frame_rates(&self) -> Vec<u32> {
+        self.commands()
+            .iter()
+            .filter_map(|c| match c {
+                MediaCommand::SetFrameRate(fps) => Some(*fps),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn starts(&self) -> usize {
         self.commands()
             .iter()
@@ -122,7 +132,7 @@ pub fn run_source(end: MediaSourceEnd, log: Arc<SourceLog>) {
                                 }
                             }
                             // Logged above; the test encoder's rate is fixed.
-                            MediaCommand::SetBitrate(_) => {}
+                            MediaCommand::SetBitrate(_) | MediaCommand::SetFrameRate(_) => {}
                         }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,

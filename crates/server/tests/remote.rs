@@ -56,6 +56,8 @@ async fn start_agent(
     .unwrap();
     let mut config = credential.agent_config(Duration::from_secs(5)).unwrap();
     config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
+    // As the real agent does: users and disks come from the live system.
+    config.telemetry = Some(Arc::new(agent::telemetry::SystemTelemetry::new()));
     let session = agent::connect(&config).await.unwrap();
     tokio::spawn(async move { session.run(None).await });
     credential.agent_id
@@ -739,4 +741,201 @@ async fn agent_list_shows_hostname_online_state_and_open_shells() {
     })
     .await
     .expect("shell count drops after close");
+}
+
+#[tokio::test]
+async fn commands_launch_on_the_agent_desktop_and_are_audited() {
+    let rig = rig().await;
+    let admin = rig.session(&rig.admin).await;
+    let auditor = rig.session(&rig.auditor).await;
+    let agent = &rig.agents[0];
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("launched");
+    let launch = |token: &str, agent: &str, command: String| {
+        rig.api
+            .client
+            .post(rig.api.url(&format!("/api/agents/{agent}/launch")))
+            .bearer_auth(token)
+            .json(&json!({ "command": command }))
+            .send()
+    };
+
+    // The development agent runs it with `sh -c`; it does not wait for it.
+    let command = format!("touch '{}'", marker.display());
+    let resp = launch(&admin, agent, command.clone()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["command"], command);
+    timeout(DEADLINE, async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command ran");
+    let rows = rig.wait_for_audit("command.launch", 1).await;
+    assert_eq!(rows[0].0, "root");
+    assert_eq!(rows[0].1.as_deref(), Some(agent.as_str()));
+    assert_eq!(rows[0].2["command"], command);
+    assert_eq!(rows[0].2["outcome"]["result"], "started");
+
+    // Needs the desktop capability; the refusal is audited.
+    let resp = launch(&auditor, agent, "cmd".into()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let denied = rig.audit("permission.denied").await;
+    assert_eq!(denied.last().unwrap().2["capability"], "desktop");
+
+    // Bad commands never reach the agent; offline agents are a conflict.
+    for bad in ["   ", "cmd\ncalc"] {
+        let resp = launch(&admin, agent, bad.into()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    let resp = launch(&admin, "agt-nowhere", "cmd".into()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(rig.audit("command.launch").await.len(), 1);
+}
+
+#[tokio::test]
+async fn one_agent_shows_its_network_and_disks() {
+    let rig = rig().await;
+    let token = rig.session(&rig.auditor).await;
+    let agent_id = &rig.agents[0];
+    let get = |id: String| {
+        rig.api
+            .client
+            .get(rig.api.url(&format!("/api/agents/{id}")))
+            .bearer_auth(&token)
+            .send()
+    };
+    // Status is reported right after the agent connects.
+    let agent = timeout(DEADLINE, async {
+        loop {
+            let agent: Value = get(agent_id.clone()).await.unwrap().json().await.unwrap();
+            if agent["disks"].is_array() {
+                return agent;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("status reported");
+    assert_eq!(agent["id"], agent_id.as_str());
+    assert_eq!(agent["online"], true);
+    assert_eq!(agent["local_ip"], "127.0.0.1");
+    // What this machine has, as the agent sees it.
+    let disks = agent["disks"].as_array().unwrap();
+    assert!(!disks.is_empty(), "{agent}");
+    for disk in disks {
+        assert!(disk["name"].is_string());
+        assert!(disk["used_bytes"].as_u64().unwrap() <= disk["total_bytes"].as_u64().unwrap());
+    }
+    let expected_dns: Vec<String> = agent::device::dns_servers()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
+    assert_eq!(agent["dns_servers"], json!(expected_dns));
+
+    let resp = get("agt-nowhere".into()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The viewer's side panel, through its own API client: status, a command
+/// button, and a round trip through upload and download.
+#[tokio::test]
+async fn the_viewer_panel_client_works_against_the_real_api() {
+    use viewer::api::ApiClient;
+
+    let rig = rig().await;
+    let token = rig.session(&rig.admin).await;
+    let agent_id = &rig.agents[0];
+    let base = rig.api.url("");
+    let client = ApiClient::new(&base, token, &rig.certs.ca_cert).unwrap();
+
+    let details = timeout(DEADLINE, async {
+        loop {
+            let details = client.agent(agent_id).await.unwrap();
+            if details.disks.is_some() {
+                return details;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("status reported");
+    assert!(details.online && details.can("file_transfer") && details.can("desktop"));
+    assert_eq!(details.local_ip.as_deref(), Some("127.0.0.1"));
+    assert!(!details.is_windows(), "{:?}", details.os);
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("from-a-button");
+    client
+        .launch(agent_id, &format!("touch '{}'", marker.display()))
+        .await
+        .unwrap();
+    timeout(DEADLINE, async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the button's command ran");
+
+    // Upload (with progress), refuse to overwrite, overwrite, download.
+    let local = dir.path().join("local.bin");
+    let content = data(3 * 1024 * 1024 + 17);
+    std::fs::write(&local, &content).unwrap();
+    let remote = dir.path().join("remote.bin");
+    let remote = remote.to_str().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress = {
+        let seen = seen.clone();
+        move |done, total| seen.lock().unwrap().push((done, total))
+    };
+    let size = client
+        .upload(agent_id, &local, remote, false, progress)
+        .await
+        .unwrap();
+    assert_eq!(size, content.len() as u64);
+    assert_eq!(std::fs::read(remote).unwrap(), content);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.last(), Some(&(size, size)));
+    assert!(seen.windows(2).all(|w| w[0].0 < w[1].0));
+
+    let again = client
+        .upload(agent_id, &local, remote, false, |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(again.already_exists(), "{again:?}");
+    std::fs::write(&local, b"replaced").unwrap();
+    client
+        .upload(agent_id, &local, remote, true, |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(remote).unwrap(), b"replaced");
+
+    let back = dir.path().join("back.bin");
+    let size = client
+        .download(agent_id, remote, &back, |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(size, 8);
+    assert_eq!(std::fs::read(&back).unwrap(), b"replaced");
+    // A missing file is an error, and leaves nothing behind.
+    let missing = dir.path().join("missing.bin");
+    let error = client
+        .download(
+            agent_id,
+            missing.to_str().unwrap(),
+            &dir.path().join("x"),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, Some(404), "{error:?}");
+    assert!(!dir.path().join("x").exists() && !dir.path().join("x.part").exists());
+
+    // Every one of those is audited as the technician.
+    assert_eq!(rig.audit("command.launch").await.len(), 1);
+    let uploads = rig.wait_for_audit("file.upload", 3).await;
+    assert!(uploads.iter().all(|(actor, _, _)| actor == "root"));
 }

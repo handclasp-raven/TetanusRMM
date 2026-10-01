@@ -12,15 +12,18 @@ from pathlib import Path
 from textual import work
 from textual.app import App
 
-from .api import ApiError
+from .api import ApiClient, ApiError
 from .auth import SessionManager
 from .config import Config, data_dir
 from .screens import LoginScreen, MainScreen, SplashScreen
 from .scripts import ScriptLibrary
+from .state import UiState
 from .viewer import ViewerCommand, close_all
 from .viewer import launch as launch_process
 
 Launcher = Callable[[ViewerCommand, Path], "subprocess.Popen[bytes]"]
+#: Makes the API client for a server URL (tests substitute a mock).
+ApiFactory = Callable[[str, Path | None], ApiClient]
 
 
 class RmmApp(App):
@@ -34,13 +37,17 @@ class RmmApp(App):
         library: ScriptLibrary,
         launcher: Launcher = launch_process,
         log_dir: Path | None = None,
+        state: UiState | None = None,
+        api_factory: ApiFactory = ApiClient,
     ) -> None:
         super().__init__()
         self.config = config
         self.session = session
         self.library = library
         self._launcher = launcher
+        self._api_factory = api_factory
         self.log_dir = log_dir or data_dir()
+        self.state = state or UiState(self.log_dir / "state.json")
         self.viewers: list[subprocess.Popen[bytes]] = []
 
     def on_mount(self) -> None:
@@ -63,6 +70,23 @@ class RmmApp(App):
             self.show_login()
         else:
             self.show_main()
+
+    async def use_server(self, server_url: str) -> None:
+        """Talk to ``server_url`` from now on (signed out there until the
+        caller signs in). Raises :class:`ApiError` if the client cannot be
+        set up, e.g. the CA certificate is unreadable."""
+        if server_url == self.config.server_url:
+            return
+        api = self._api_factory(server_url, self.config.ca_path)
+        old = self.session.switch_server(api)
+        self.config = self.config.for_server(server_url)
+        await old.aclose()
+
+    def remember_server(self) -> None:
+        """Signed in: offer this server first next time."""
+        if self.state.last_server != self.config.server_url:
+            self.state.last_server = self.config.server_url
+            self.state.save()
 
     def _reset_to(self, screen) -> None:  # noqa: ANN001
         # Keep the default screen; replace whatever else is showing.

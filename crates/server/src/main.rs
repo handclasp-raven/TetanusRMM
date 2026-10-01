@@ -138,6 +138,10 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let pool = server::db::connect(&config.database_url, config.db_max_connections).await?;
     info!("database connected and migrated");
 
+    let enrollment_ca = config
+        .enrollment_ca()
+        .context("loading CA key for enrollment (re-run `gen-certs --force`?)")?;
+    let server_ca_pem = enrollment_ca.ca_pem().to_owned();
     let quic = Server::bind(ServerConfig {
         listen: config.quic_listen,
         ws_listen: config.ws_listen(),
@@ -148,9 +152,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     })?
     .with_registry(Registry {
         pool: pool.clone(),
-        ca: config
-            .enrollment_ca()
-            .context("loading CA key for enrollment (re-run `gen-certs --force`?)")?,
+        ca: enrollment_ca,
         api_url: config.public_url(),
     });
 
@@ -204,6 +206,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         public_url: config.public_url(),
         updates_dir: config.updates_dir.clone(),
         hub: Some(quic.hub()),
+        server_ca_pem,
     });
     let listener = std::net::TcpListener::bind(config.api_listen)
         .with_context(|| format!("binding API listener on {}", config.api_listen))?;

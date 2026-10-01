@@ -190,6 +190,16 @@ def test_bad_ca_path_is_reported(tmp_path) -> None:
         ApiClient(BASE, tmp_path / "missing.pem")
 
 
+def test_only_admins_edit_groups_and_auditors_make_no_links() -> None:
+    from rmm_tui.api import User
+
+    admin, engineer, auditor = (
+        User(1, n, r) for n, r in (("a", "admin"), ("e", "support_engineer"), ("c", "auditor"))
+    )
+    assert [u.is_admin for u in (admin, engineer, auditor)] == [True, False, False]
+    assert [u.can_enroll for u in (admin, engineer, auditor)] == [True, True, False]
+
+
 def test_roles_decide_what_the_ui_offers() -> None:
     from rmm_tui.api import User
 
@@ -199,3 +209,132 @@ def test_roles_decide_what_the_ui_offers() -> None:
     assert admin.can_control and admin.can_read_audit
     assert engineer.can_control and not engineer.can_read_audit
     assert not auditor.can_control and auditor.can_read_audit
+
+
+async def test_enrollment_link_sends_only_what_was_chosen(
+    api: ApiClient, server: FakeServer
+) -> None:
+    api.token = "sess"
+    server.on(
+        "POST",
+        "/api/enrollment-links",
+        body={
+            "token": "t0k",
+            "expires_at": "2026-10-01T10:00:00Z",
+            "download_url": "https://rmm:8443/api/download/windows-x86_64?token=t0k",
+            "msi_url": "https://rmm:8443/api/download/windows-x86_64/msi?token=t0k",
+            "server": "rmm:4433",
+            "server_name": "rmm",
+        },
+    )
+    link = await api.create_enrollment_link(
+        ttl_secs=3600, group_ids=[2], server="rmm:4433", server_name="rmm"
+    )
+    assert server.body() == {
+        "platform": "windows-x86_64",
+        "ttl_secs": 3600,
+        "group_ids": [2],
+        "server": "rmm:4433",
+        "server_name": "rmm",
+    }
+    assert link.msi_url and link.msi_url.endswith("/msi?token=t0k")
+    assert (link.server, link.server_name) == ("rmm:4433", "rmm")
+    await api.create_enrollment_link(platform="linux-x86_64")
+    assert server.body() == {"platform": "linux-x86_64"}
+
+
+async def test_download_goes_to_this_server_and_leaves_nothing_on_failure(
+    api: ApiClient, server: FakeServer, tmp_path
+) -> None:
+    server.on(
+        "GET",
+        "/api/download/windows-x86_64/msi",
+        handler=lambda req: httpx.Response(200, content=b"MSI" * 1000),
+    )
+    dest = tmp_path / "agent.msi"
+    # The link names the server's public URL; the TUI's own server is used.
+    size = await api.download(
+        "https://public.example:8443/api/download/windows-x86_64/msi?token=t", dest
+    )
+    assert size == 3000 and dest.read_bytes() == b"MSI" * 1000
+    request = server.requests[-1]
+    assert request.url.host == "rmm.test" and request.url.params["token"] == "t"
+    assert "authorization" not in request.headers
+
+    server.on("GET", "/api/download/windows-x86_64/msi", status=401, body={"error": "expired"})
+    other = tmp_path / "other.msi"
+    with pytest.raises(Unauthorized, match="expired"):
+        await api.download("https://x/api/download/windows-x86_64/msi?token=t", other)
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+async def test_group_changes(api: ApiClient, server: FakeServer) -> None:
+    api.token = "sess"
+    group = {"id": 4, "name": "Branch", "description": "Leeds", "agent_ids": ["agt-1"]}
+    server.on("POST", "/api/groups", status=201, body=group)
+    server.on("PATCH", "/api/groups/4", body=group)
+    server.on("PUT", "/api/groups/4/agents", body=group)
+    server.on("DELETE", "/api/groups/4", handler=lambda _req: httpx.Response(204))
+    assert (await api.create_group("Branch", "Leeds")).id == 4
+    assert server.body() == {"name": "Branch", "description": "Leeds"}
+    await api.update_group(4, "Branch", "Leeds office")
+    assert server.body() == {"name": "Branch", "description": "Leeds office"}
+    assert (await api.set_group_members(4, ["agt-1"])).agent_ids == ("agt-1",)
+    assert server.body() == {"agent_ids": ["agt-1"]}
+    await api.delete_group(4)
+    assert server.requests[-1].method == "DELETE"
+
+
+async def test_user_administration(api: ApiClient, server: FakeServer) -> None:
+    api.token = "sess"
+    user = {"id": 9, "username": "sam", "role": "support_engineer"}
+    enrollment = {"user": user, "totp_secret": "SECRET", "otpauth_url": "otpauth://totp/x"}
+    grant = {
+        "id": 3,
+        "user_id": 9,
+        "username": "sam",
+        "agent_id": None,
+        "group_id": 2,
+        "group_name": "Servers",
+        "all_agents": False,
+        "capabilities": ["desktop", "shell"],
+    }
+    server.on("GET", "/api/users", body=[user])
+    server.on("POST", "/api/users", status=201, body=enrollment)
+    server.on("PUT", "/api/users/9/role", body={**user, "role": "auditor"})
+    server.on("PUT", "/api/users/9/password", body=user)
+    server.on("POST", "/api/users/9/totp", body=enrollment)
+    server.on("DELETE", "/api/users/9", handler=lambda _req: httpx.Response(204))
+    server.on("GET", "/api/grants", body=[grant])
+    server.on("POST", "/api/grants", status=201, body=grant)
+    server.on("DELETE", "/api/grants/3", handler=lambda _req: httpx.Response(204))
+
+    assert [u.username for u in await api.list_users()] == ["sam"]
+    created = await api.create_user("sam", "a long password", "support_engineer")
+    assert created.totp_secret == "SECRET" and created.user.id == 9
+    assert server.body() == {
+        "username": "sam",
+        "password": "a long password",
+        "role": "support_engineer",
+    }
+    assert (await api.set_user_role(9, "auditor")).role == "auditor"
+    assert server.body() == {"role": "auditor"}
+    await api.set_user_password(9, "another password")
+    assert server.body() == {"password": "another password"}
+    assert (await api.reset_user_totp(9)).otpauth_url == "otpauth://totp/x"
+    await api.delete_user(9)
+    assert server.requests[-1].method == "DELETE"
+
+    grants = await api.list_grants(9)
+    assert server.requests[-1].url.params["user_id"] == "9"
+    assert grants[0].group_name == "Servers" and grants[0].capabilities == ("desktop", "shell")
+    await api.list_grants()
+    assert "user_id" not in server.requests[-1].url.params
+    await api.create_grant(9, ["shell"], group_id=2)
+    assert server.body() == {"user_id": 9, "capabilities": ["shell"], "group_id": 2}
+    await api.create_grant(9, ["shell"], agent_id="agt-1")
+    assert server.body() == {"user_id": 9, "capabilities": ["shell"], "agent_id": "agt-1"}
+    await api.create_grant(9, ["shell"])
+    assert server.body() == {"user_id": 9, "capabilities": ["shell"], "all_agents": True}
+    await api.delete_grant(3)
+    assert server.requests[-1].url.path == "/api/grants/3"

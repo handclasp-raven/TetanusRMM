@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,8 +75,9 @@ enum ServiceCommand {
 
 #[derive(Args)]
 struct ServerArgs {
-    /// Server QUIC (UDP) address.
-    #[arg(long, env = "RMM_SERVER", default_value = "127.0.0.1:4433")]
+    /// Server QUIC (UDP) address: `ip:port`, or `host:port` (resolved once,
+    /// when installing or enrolling).
+    #[arg(long, env = "RMM_SERVER", default_value = "127.0.0.1:4433", value_parser = server_addr)]
     server: SocketAddr,
     /// Name the server certificate must be valid for.
     #[arg(long, env = "RMM_SERVER_NAME", default_value = "localhost")]
@@ -87,8 +88,27 @@ struct ServerArgs {
     transport: TransportMode,
     /// TCP address of the server's WebSocket fallback, if it is not the
     /// --server address (e.g. published on 443). Stored with the credential.
-    #[arg(long, env = "RMM_WS_SERVER")]
+    #[arg(long, env = "RMM_WS_SERVER", value_parser = server_addr)]
     ws_server: Option<SocketAddr>,
+}
+
+/// `ip:port` as is; `host:port` resolved, preferring IPv4 (the server
+/// listens on `0.0.0.0` by default, and `localhost` often resolves to `::1`
+/// first).
+fn server_addr(value: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = value.parse() {
+        return Ok(addr);
+    }
+    let addrs: Vec<SocketAddr> = value
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {value:?} (expected host:port): {e}"))?
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addrs.first())
+        .copied()
+        .ok_or_else(|| format!("{value:?} has no addresses"))
 }
 
 impl ServerArgs {
@@ -322,4 +342,28 @@ fn helper() -> anyhow::Result<()> {
 #[cfg(not(windows))]
 fn input_helper(_service_pid: u32) -> anyhow::Result<()> {
     bail!("the input helper is only available on Windows")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_addr;
+
+    #[test]
+    fn server_accepts_addresses_and_host_names() {
+        assert_eq!(
+            server_addr("192.0.2.7:4433").unwrap(),
+            "192.0.2.7:4433".parse().unwrap()
+        );
+        assert_eq!(
+            server_addr("[::1]:4433").unwrap(),
+            "[::1]:4433".parse().unwrap()
+        );
+        // IPv4 preferred for names.
+        assert_eq!(
+            server_addr("localhost:4433").unwrap(),
+            "127.0.0.1:4433".parse().unwrap()
+        );
+        assert!(server_addr("localhost").is_err(), "port required");
+        assert!(server_addr("no-such-host.invalid:4433").is_err());
+    }
 }

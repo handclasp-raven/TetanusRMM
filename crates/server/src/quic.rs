@@ -580,6 +580,11 @@ async fn serve_agent(
     if version >= protocol::MIN_E2E_VERSION {
         let _ = to_agent.send(hooks.peer.message());
     }
+    if version >= protocol::MIN_STATUS_VERSION {
+        let _ = to_agent.send(Message::EnableStatusReports);
+    }
+    // Where the agent connects from; re-recorded when that changes.
+    let mut remote_ip = None;
 
     let writer = async {
         while let Some(msg) = outbox.recv().await {
@@ -607,6 +612,14 @@ async fn serve_agent(
                             registry::touch(&registry.pool, agent_id, telemetry.as_ref()).await
                         {
                             warn!(%agent_id, "registry update failed: {e}");
+                        }
+                        if remote_ip != Some(remote.ip()) {
+                            match registry::record_remote_ip(&registry.pool, agent_id, remote.ip())
+                                .await
+                            {
+                                Ok(()) => remote_ip = Some(remote.ip()),
+                                Err(e) => warn!(%agent_id, "recording remote address failed: {e}"),
+                            }
                         }
                     }
                     let _ = to_agent.send(Message::HeartbeatAck { seq });
@@ -654,6 +667,17 @@ async fn serve_agent(
                             registry::record_hostname(&registry.pool, agent_id, &hostname).await
                         {
                             warn!(%agent_id, "recording hostname failed: {e}");
+                        }
+                    }
+                }
+                Message::AgentStatus(status) => {
+                    let status = status.sanitized();
+                    info!(%agent_id, users = ?status.users, local_ip = ?status.local_ip, os = ?status.os, "agent status");
+                    if let Some(registry) = &hooks.registry {
+                        if let Err(e) =
+                            registry::record_status(&registry.pool, agent_id, &status).await
+                        {
+                            warn!(%agent_id, "recording status failed: {e}");
                         }
                     }
                 }

@@ -1,4 +1,5 @@
-"""Login, agent list and audit screens."""
+"""Login, agent list (with its column menu and classify dialog) and audit
+screens."""
 
 from __future__ import annotations
 
@@ -6,16 +7,39 @@ import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
-from textual.screen import Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Static
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    OptionList,
+    SelectionList,
+    Static,
+)
+from textual.widgets.option_list import Option
+from textual.widgets.selection_list import Selection
 
 from . import formatting
-from .api import DESKTOP, SCRIPT, SHELL, Agent, ApiError, Forbidden, Unauthorized
-from .viewer import ViewerError, build_command
+from .api import (
+    CLASSIFICATIONS,
+    DESKTOP,
+    SCRIPT,
+    SHELL,
+    Agent,
+    ApiError,
+    Forbidden,
+    Unauthorized,
+    derived_classification,
+)
+from .config import ConfigError, normalize_server_url
+from .viewer import FONT_FILE, ViewerError, build_command
 
 if TYPE_CHECKING:
     from .app import RmmApp
@@ -27,7 +51,8 @@ class SplashScreen(Screen):
 
 
 class LoginScreen(Screen):
-    """Username, password, TOTP."""
+    """Server, username, password, TOTP. The server defaults to the one
+    signed in to last."""
 
     app: RmmApp
 
@@ -37,7 +62,12 @@ class LoginScreen(Screen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="login-box"):
-            yield Static(f"Sign in to [b]{self.app.config.server_url}[/b]", id="login-title")
+            yield Static("[b]Sign in[/b]", id="login-title")
+            yield Input(
+                self.app.config.server_url,
+                placeholder="Server URL (https://host:8443)",
+                id="server",
+            )
             yield Input(placeholder="Username", id="username")
             yield Input(placeholder="Password", password=True, id="password")
             yield Input(placeholder="TOTP code", id="code", restrict=r"[0-9]*", max_length=8)
@@ -49,7 +79,7 @@ class LoginScreen(Screen):
 
     @on(Input.Submitted)
     def next_field(self, event: Input.Submitted) -> None:
-        order = ["username", "password", "code"]
+        order = ["server", "username", "password", "code"]
         index = order.index(event.input.id or "")
         if index + 1 < len(order):
             self.query_one(f"#{order[index + 1]}", Input).focus()
@@ -58,6 +88,13 @@ class LoginScreen(Screen):
 
     @on(Button.Pressed, "#sign-in")
     def submit(self) -> None:
+        try:
+            server_url = normalize_server_url(self.query_one("#server", Input).value)
+        except ConfigError as e:
+            self.set_status(str(e))
+            self.query_one("#server", Input).focus()
+            return
+        self.query_one("#server", Input).value = server_url
         username = self.query_one("#username", Input).value.strip()
         password = self.query_one("#password", Input).value
         code = self.query_one("#code", Input).value.strip()
@@ -66,14 +103,15 @@ class LoginScreen(Screen):
             return
         self.set_status("Signing in…")
         self.query_one("#sign-in", Button).disabled = True
-        self.sign_in(username, password, code)
+        self.sign_in(server_url, username, password, code)
 
     def set_status(self, text: str) -> None:
         self.query_one("#login-status", Static).update(text)
 
     @work(exclusive=True)
-    async def sign_in(self, username: str, password: str, code: str) -> None:
+    async def sign_in(self, server_url: str, username: str, password: str, code: str) -> None:
         try:
+            await self.app.use_server(server_url)
             await self.app.session.login(username, password, code)
         except ApiError as e:
             self.set_status(e.message)
@@ -86,23 +124,134 @@ class LoginScreen(Screen):
                 "again next time.",
                 severity="warning",
             )
+        self.app.remember_server()
         self.app.show_main()
 
 
-AGENT_COLUMNS = [
-    ("host", "Hostname"),
-    ("status", "Status"),
-    ("groups", "Groups"),
-    ("last_seen", "Last seen"),
-    ("cpu", "CPU"),
-    ("ram", "RAM"),
-    ("disk", "Disk"),
-    ("sessions", "Active sessions"),
-]
+class ColumnsScreen(ModalScreen[list[str] | None]):
+    """Pick and order the agent table's columns. Dismissed with the new
+    column keys, or ``None`` if cancelled."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("shift+up", "move(-1)", "Move up", show=False),
+        Binding("shift+down", "move(1)", "Move down", show=False),
+    ]
+
+    def __init__(self, columns: list[str]) -> None:
+        super().__init__()
+        self.shown = set(columns)
+        # Shown columns in their order, then the rest in the menu's order.
+        self.order = list(columns) + [k for k in formatting.COLUMNS if k not in self.shown]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="columns-box"):
+            yield Static("[b]Agent table columns[/b]", id="columns-title")
+            yield SelectionList[str](id="columns-list")
+            yield Static("Space: show/hide · Shift+↑/↓: move · Esc: cancel", id="columns-help")
+            with Horizontal(id="columns-buttons"):
+                yield Button("▲", id="column-up", tooltip="Move up (Shift+↑)")
+                yield Button("▼", id="column-down", tooltip="Move down (Shift+↓)")
+                yield Button("Defaults", id="column-defaults")
+                yield Button("Cancel", id="column-cancel")
+                yield Button("Apply", variant="primary", id="column-apply")
+
+    def on_mount(self) -> None:
+        self.fill(highlight=0)
+        self.query_one("#columns-list").focus()
+
+    def fill(self, highlight: int) -> None:
+        options = self.query_one("#columns-list", SelectionList)
+        options.clear_options()
+        options.add_options(
+            [Selection(formatting.COLUMNS[key].label, key, key in self.shown) for key in self.order]
+        )
+        options.highlighted = highlight
+
+    @on(SelectionList.SelectedChanged, "#columns-list")
+    def toggled(self, event: SelectionList.SelectedChanged) -> None:
+        self.shown = set(event.selection_list.selected)
+
+    def action_move(self, step: int) -> None:
+        index = self.query_one("#columns-list", SelectionList).highlighted
+        if index is None or not 0 <= index + step < len(self.order):
+            return
+        order = self.order
+        order[index], order[index + step] = order[index + step], order[index]
+        self.fill(highlight=index + step)
+
+    @on(Button.Pressed, "#column-up")
+    def up(self) -> None:
+        self.action_move(-1)
+
+    @on(Button.Pressed, "#column-down")
+    def down(self) -> None:
+        self.action_move(1)
+
+    @on(Button.Pressed, "#column-defaults")
+    def defaults(self) -> None:
+        self.shown = set(formatting.DEFAULT_COLUMNS)
+        self.order = list(formatting.DEFAULT_COLUMNS) + [
+            k for k in formatting.COLUMNS if k not in self.shown
+        ]
+        self.fill(highlight=0)
+
+    @on(Button.Pressed, "#column-apply")
+    def apply(self) -> None:
+        columns = [k for k in self.order if k in self.shown]
+        if not columns:
+            self.app.notify("Show at least one column.", severity="warning")
+            return
+        self.dismiss(columns)
+
+    @on(Button.Pressed, "#column-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ClassifyScreen(ModalScreen[str | None]):
+    """Pick an agent's classification. Dismissed with one of
+    :data:`CLASSIFICATIONS`, :attr:`AUTO` to let the device kind decide,
+    or ``None`` if cancelled."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    AUTO = "auto"
+
+    def __init__(self, agent: Agent) -> None:
+        super().__init__()
+        self.agent = agent
+
+    def compose(self) -> ComposeResult:
+        derived = derived_classification(self.agent.device_kind)
+        with Vertical(classes="dialog", id="classify-box"):
+            yield Static(Text.assemble(("Classify ", "bold"), (self.agent.label, "bold")))
+            yield OptionList(
+                *[Option(formatting.classification_label(c), id=c) for c in CLASSIFICATIONS],
+                Option(f"Automatic ({formatting.classification_label(derived)})", id=self.AUTO),
+                id="classify-list",
+            )
+            yield Static("Enter: choose · Esc: cancel", classes="dialog-help")
+
+    def on_mount(self) -> None:
+        options = self.query_one("#classify-list", OptionList)
+        options.highlighted = options.get_option_index(
+            self.agent.classification_override or self.AUTO
+        )
+        options.focus()
+
+    @on(OptionList.OptionSelected, "#classify-list")
+    def chosen(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class MainScreen(Screen):
-    """Live table of agents, and the actions on the selected one."""
+    """Live table of agents, and the actions on the selected one. A search
+    box over it filters by hostname, and a list of groups beside it by
+    group."""
 
     app: RmmApp
 
@@ -110,18 +259,42 @@ class MainScreen(Screen):
         Binding("d", "desktop", "Remote desktop"),
         Binding("s", "shell", "Shell"),
         Binding("r", "scripts", "Scripts"),
+        Binding("n", "new_agent", "New agent"),
+        Binding("k", "classify", "Classify"),
+        Binding("g", "groups", "Groups"),
+        Binding("u", "users", "Users"),
+        Binding("slash", "search", "Search"),
+        Binding("f", "filter", "Filter by group"),
         Binding("a", "audit", "Audit log"),
+        Binding("c", "columns", "Columns"),
+        Binding("v", "viewer_commands", "Viewer buttons"),
         Binding("f5", "refresh", "Refresh"),
         Binding("l", "logout", "Sign out"),
         Binding("q", "app.quit", "Quit"),
+        Binding("escape", "clear_search", "Clear search", show=False),
     ]
 
     #: Actions on the selected agent, and the capability each needs there.
     AGENT_ACTIONS = {"desktop": DESKTOP, "shell": SHELL}
 
+    #: Group list entries (besides ``group:<name>``).
+    ALL_GROUPS = "all"
+    NO_GROUP = "none"
+
     def __init__(self) -> None:
         super().__init__()
+        #: Every agent the user can see; the table shows those the filter lets through.
         self.agents: dict[str, Agent] = {}
+        self.columns: list[str] = []
+        #: Names of the groups the server has (for the group list).
+        self.group_names: set[str] = set()
+        self.group_filter = self.ALL_GROUPS
+        #: The group list's entries as last shown: values, and (value,
+        #: prompt) pairs.
+        self.filter_values: list[str] = []
+        self.group_entries: list[tuple[str, str]] = []
+        #: Lower-cased search text; agents whose hostname contains it are shown.
+        self.search = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -131,17 +304,28 @@ class MainScreen(Screen):
             f"{user.username if user else ''} ({role}) @ {self.app.config.server_url}",
             id="whoami",
         )
-        yield DataTable(id="agents", cursor_type="row", zebra_stripes=True)
+        yield Input(placeholder="Search by hostname  ( / )", id="search")
+        with Horizontal(id="agent-body"):
+            with Vertical(id="group-pane"):
+                yield Static("[b]Groups[/b]", id="group-title")
+                yield OptionList(id="group-list")
+            # The status dot keeps its colour on the highlighted row.
+            yield DataTable(
+                id="agents",
+                cursor_type="row",
+                zebra_stripes=True,
+                cursor_foreground_priority="renderable",
+            )
         yield Static("Loading agents…", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = "RMM support"
-        table = self.query_one("#agents", DataTable)
-        for key, label in AGENT_COLUMNS:
-            table.add_column(label, key=key)
-        table.focus()
+        self.set_columns(formatting.valid_columns(self.app.state.agent_columns))
+        self.update_group_options()
+        self.query_one("#agents", DataTable).focus()
         self.refresh_agents()
+        self.load_groups()
         self.set_interval(self.app.config.poll_interval, self.refresh_agents)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -158,6 +342,10 @@ class MainScreen(Screen):
             return bool(user and user.can_control)
         if action == "audit":
             return bool(user and user.can_read_audit)
+        if action == "new_agent":
+            return bool(user and user.can_enroll)
+        if action in ("classify", "users"):
+            return bool(user and user.is_admin)
         return True
 
     @on(DataTable.RowHighlighted, "#agents")
@@ -180,27 +368,147 @@ class MainScreen(Screen):
         self.show_agents(agents)
 
     def show_agents(self, agents: list[Agent]) -> None:
+        self.agents = {a.id: a for a in agents}
+        self.update_group_options()
+        self.update_table()
+
+    def matches(self, agent: Agent) -> bool:
+        """Whether the search and the group list let ``agent`` through."""
+        if self.search and self.search not in agent.label.lower():
+            return False
+        if self.group_filter == self.ALL_GROUPS:
+            return True
+        if self.group_filter == self.NO_GROUP:
+            return not agent.groups
+        return self.group_filter.removeprefix("group:") in agent.groups
+
+    def update_table(self) -> None:
+        """Bring the rows in line with the agents and the filter: rows are
+        updated in place, so the selection and scroll position stay."""
         table = self.query_one("#agents", DataTable)
         now = datetime.now(UTC)
-        fresh = {a.id: a for a in agents}
-        for gone in set(self.agents) - set(fresh):
+        visible = {a.id: a for a in self.agents.values() if self.matches(a)}
+        shown = {str(key.value) for key in table.rows}
+        for gone in shown - set(visible):
             table.remove_row(gone)
-        new = [a for a in agents if a.id not in self.agents]
-        for agent in agents:
-            if agent.id in self.agents:
-                for (key, _), value in zip(
-                    AGENT_COLUMNS, formatting.agent_row(agent, now), strict=True
-                ):
-                    table.update_cell(agent.id, key, value)
+        for agent_id in shown & set(visible):
+            agent = visible[agent_id]
+            for key, value in zip(
+                self.columns, formatting.agent_row(agent, now, self.columns), strict=True
+            ):
+                table.update_cell(agent_id, key, value)
+        new = [a for a in visible.values() if a.id not in shown]
         # Online agents first, then by name.
         for agent in sorted(new, key=lambda a: (not a.online, a.label.lower())):
-            table.add_row(*formatting.agent_row(agent, now), key=agent.id)
-        self.agents = fresh
+            table.add_row(*formatting.agent_row(agent, now, self.columns), key=agent.id)
         self.refresh_bindings()
-        online = sum(a.online for a in agents)
+        online = sum(a.online for a in visible.values())
+        count = f"{len(visible)} agents"
+        if len(visible) != len(self.agents):
+            count = f"{len(visible)} of {len(self.agents)} agents"
         self.query_one("#status", Static).update(
-            f"{len(agents)} agents, {online} online · updated {now.astimezone():%H:%M:%S}"
+            f"{count}, {online} online · updated {now.astimezone():%H:%M:%S}"
         )
+
+    # --- search ----------------------------------------------------------------
+
+    @on(Input.Changed, "#search")
+    def search_changed(self, event: Input.Changed) -> None:
+        self.search = event.value.strip().lower()
+        self.update_table()
+
+    @on(Input.Submitted, "#search")
+    def search_submitted(self) -> None:
+        self.query_one("#agents", DataTable).focus()
+
+    def action_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_clear_search(self) -> None:
+        search = self.query_one("#search", Input)
+        search.value = ""
+        self.query_one("#agents", DataTable).focus()
+
+    # --- group list -----------------------------------------------------------
+
+    def group_options(self) -> list[tuple[str, str]]:
+        """(value, prompt) for every entry of the group list: all agents,
+        those in no group, then each group, with how many agents each has."""
+        names = set(self.group_names)
+        counts: dict[str, int] = {}
+        for agent in self.agents.values():
+            names.update(agent.groups)
+            for name in agent.groups:
+                counts[name] = counts.get(name, 0) + 1
+        ungrouped = sum(not a.groups for a in self.agents.values())
+        return [
+            (self.ALL_GROUPS, f"All agents ({len(self.agents)})"),
+            (self.NO_GROUP, f"No group ({ungrouped})"),
+            *[
+                (f"group:{name}", f"{name} ({counts.get(name, 0)})")
+                for name in sorted(names, key=str.lower)
+            ],
+        ]
+
+    def update_group_options(self) -> None:
+        """List every group there is, keeping the choice while it exists."""
+        entries = self.group_options()
+        if entries == self.group_entries:
+            return
+        self.group_entries = entries
+        self.filter_values = [value for value, _ in entries]
+        if self.group_filter not in self.filter_values:
+            self.group_filter = self.ALL_GROUPS
+        group_list = self.query_one("#group-list", OptionList)
+        with group_list.prevent(OptionList.OptionHighlighted):
+            group_list.clear_options()
+            # Text, not markup: group names are the admins' own.
+            group_list.add_options([Option(Text(prompt), id=value) for value, prompt in entries])
+            group_list.highlighted = self.filter_values.index(self.group_filter)
+
+    @work(exclusive=True, group="groups")
+    async def load_groups(self) -> None:
+        try:
+            groups = await self.app.session.api.list_groups()
+        except ApiError:
+            return  # an older server has no groups; the agents still list theirs
+        self.group_names = {g.name for g in groups}
+        self.update_group_options()
+        self.update_table()
+
+    @on(OptionList.OptionHighlighted, "#group-list")
+    def group_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        self.group_filter = str(event.option.id)
+        self.update_table()
+
+    @on(OptionList.OptionSelected, "#group-list")
+    def group_selected(self) -> None:
+        self.query_one("#agents", DataTable).focus()
+
+    def action_filter(self) -> None:
+        self.query_one("#group-list", OptionList).focus()
+
+    def set_columns(self, columns: list[str]) -> None:
+        """Rebuild the table with ``columns``, keeping the selection."""
+        table = self.query_one("#agents", DataTable)
+        selected = self.selected()
+        self.columns = columns
+        table.clear(columns=True)
+        for key in columns:
+            table.add_column(formatting.COLUMNS[key].label, key=key)
+        self.update_table()
+        if selected is not None and selected.id in table.rows:
+            table.move_cursor(row=table.get_row_index(selected.id))
+
+    def action_columns(self) -> None:
+        def chosen(columns: list[str] | None) -> None:
+            if columns is None or columns == self.columns:
+                return
+            self.set_columns(columns)
+            self.app.state.agent_columns = columns
+            self.app.state.save()
+
+        self.app.push_screen(ColumnsScreen(self.columns), chosen)
 
     def selected(self) -> Agent | None:
         table = self.query_one("#agents", DataTable)
@@ -247,7 +555,13 @@ class MainScreen(Screen):
             if not session.online:
                 self.app.notify(f"{agent.label} went offline.", severity="error")
                 return
-            command = build_command(self.app.config, session)
+            command = build_command(
+                self.app.config,
+                session,
+                api_token=self.app.session.api.token,
+                commands=self.app.state.commands,
+                font_file=self.app.state.path.with_name(FONT_FILE),
+            )
             process = self.app.launch_viewer(command)
         except Unauthorized:
             self.app.session_expired()
@@ -283,6 +597,71 @@ class MainScreen(Screen):
 
     def action_audit(self) -> None:
         self.app.push_screen(AuditScreen())
+
+    def action_viewer_commands(self) -> None:
+        from .commands import CommandsScreen
+
+        def chosen(commands: list | None) -> None:
+            if commands is None:
+                return
+            self.app.state.viewer_commands = commands
+            self.app.state.save()
+            self.app.notify(
+                f"Saved {len(commands)} viewer buttons; viewers started from now on show them."
+            )
+
+        self.app.push_screen(CommandsScreen(self.app.state.commands), chosen)
+
+    def action_classify(self) -> None:
+        agent = self.selected()
+        if agent is None:
+            self.app.notify("No agent selected.", severity="warning")
+            return
+
+        def chosen(choice: str | None) -> None:
+            if choice is None:
+                return
+            classification = None if choice == ClassifyScreen.AUTO else choice
+            if classification != agent.classification_override:
+                self.classify(agent, classification)
+
+        self.app.push_screen(ClassifyScreen(agent), chosen)
+
+    @work(group="classify")
+    async def classify(self, agent: Agent, classification: str | None) -> None:
+        try:
+            now = await self.app.session.api.set_classification(agent.id, classification)
+        except Unauthorized:
+            self.app.session_expired()
+            return
+        except Forbidden:
+            self.app.notify(f"You may not classify {agent.label}.", severity="error")
+            return
+        except ApiError as e:
+            self.app.notify(e.message, severity="error")
+            return
+        self.app.notify(f"{agent.label} is now {formatting.classification_label(now).lower()}.")
+        self.refresh_agents()
+
+    def action_new_agent(self) -> None:
+        from .enroll import NewAgentScreen
+
+        self.app.push_screen(NewAgentScreen())
+
+    def action_groups(self) -> None:
+        from .groups import GroupsScreen
+
+        def closed(_: object) -> None:
+            # Groups may have changed: names, members, the filter's options.
+            self.refresh_agents()
+            self.load_groups()
+
+        self.app.push_screen(GroupsScreen(list(self.agents.values())), closed)
+
+    def action_users(self) -> None:
+        from .users import UsersScreen
+
+        self.app.push_screen(UsersScreen(list(self.agents.values())))
 
     @work(exclusive=True, group="logout")
     async def action_logout(self) -> None:

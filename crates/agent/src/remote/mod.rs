@@ -4,11 +4,14 @@
 //! - [`shell`]: interactive PowerShell on a pseudoconsole
 //! - [`script`]: a script or command run without a terminal, one result
 //! - [`transfer`]: file upload and download, chunked and hash-verified
+//! - [`launch`]: start a program on the signed-in user's desktop
 //!
-//! None of these involve the session helper or the user's desktop, and none
-//! are gated by the consent policy, which governs remote *desktop* sessions.
+//! Only [`launch`] touches the user's desktop (starting a program there as
+//! the user, for the viewer's command buttons). None are gated by the
+//! consent policy, which governs remote *desktop* sessions.
 //! The server checks the technician's role and audits every operation.
 
+pub mod launch;
 pub mod pty;
 pub mod script;
 pub mod shell;
@@ -41,6 +44,12 @@ where
         }
         StreamOpen::Upload(request) => transfer::upload(request, send, recv).await,
         StreamOpen::Download { path } => transfer::download(&path, send).await,
+        StreamOpen::Launch(request) => {
+            info!(command = %request.command, "launch requested");
+            let reply = launch::run(&request).await;
+            info!(?reply, "launch");
+            write_frame(send, &reply).await
+        }
     }
     .inspect_err(|e| warn!("remote operation stream failed: {e}"))
 }

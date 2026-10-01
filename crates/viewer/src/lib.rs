@@ -11,12 +11,18 @@
 //!   protocol, end-to-end encryption and direct paths.
 //! - [`decode`]: H.264 decoding with OpenH264. It is portable, unlike Media
 //!   Foundation, so the viewer builds everywhere.
-//! - [`render`]: scaling into the window and the on-screen monitor picker.
+//! - [`render`]: placing the picture (scale, stretch or fill) and drawing
+//!   primitives with a bitmap font.
+//! - [`ui`]: the toolbar and side panel around the picture: display mode,
+//!   monitors, the agent's status, command buttons and file transfer.
+//! - [`api`]: the server's HTTPS API behind the side panel.
 //! - [`keymap`]: physical keys to the scancodes the agent injects.
 //! - [`clipboard`]: two-way clipboard sync with the remote machine.
 
+pub mod api;
 pub mod client;
 pub mod clipboard;
 pub mod decode;
 pub mod keymap;
 pub mod render;
+pub mod ui;

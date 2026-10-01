@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clipboard::ClipboardData;
 use crate::input::InputEvent;
+use crate::media::{StreamSettings, StreamStatus};
 
 /// Length of every symmetric key and X25519 public key in a session.
 pub const KEY_LEN: usize = 32;
@@ -72,6 +73,12 @@ pub enum Control {
     /// Viewer -> agent (on the direct path): the newest frame received,
     /// for adaptive bitrate while the relay is out of the loop.
     FrameAck { seq: u64 },
+    /// Viewer -> agent: this technician's video settings (sent on connect
+    /// and when changed).
+    StreamSettings(StreamSettings),
+    /// Agent -> viewer: how the video is streamed now. Only to viewers
+    /// that sent `StreamSettings` (older viewers do not know this record).
+    StreamStatus(StreamStatus),
 }
 
 /// A video key. Keys change when a viewer leaves, so a departed viewer

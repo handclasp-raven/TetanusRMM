@@ -8,7 +8,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -24,6 +24,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{id}/role", put(set_role))
+        .route("/api/users/{id}/password", put(set_password))
+        .route("/api/users/{id}/totp", post(reset_totp))
         .route("/api/users/{id}", delete(delete_user))
         .route("/api/grants", get(list_grants).post(create_grant))
         .route("/api/grants/{id}", delete(delete_grant))
@@ -83,7 +85,9 @@ fn user_admin_error(e: UserAdminError) -> ApiError {
         UserAdminError::LastAdmin | UserAdminError::SelfDelete => {
             ApiError::Status(StatusCode::CONFLICT, e.to_string())
         }
+        UserAdminError::WeakPassword => ApiError::BadRequest(e.to_string()),
         UserAdminError::Db(e) => e.into(),
+        other => ApiError::Internal(other.to_string()),
     }
 }
 
@@ -160,6 +164,57 @@ async fn set_role(
         .await
         .map(Json)
         .map_err(user_admin_error)
+}
+
+#[derive(Deserialize)]
+struct PasswordRequest {
+    password: String,
+}
+
+/// The session to keep when an admin changes their own credentials;
+/// anyone else's sessions all end.
+fn own_session(session: &Session, user_id: i64) -> Option<&str> {
+    (session.user.id == user_id).then_some(session.token.as_str())
+}
+
+async fn set_password(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<i64>,
+    Json(req): Json<PasswordRequest>,
+) -> Result<Json<User>, ApiError> {
+    require_admin(&state.pool, &session.user, "user.password_change").await?;
+    users::set_password(
+        &state.pool,
+        &session.user.username,
+        id,
+        &req.password,
+        own_session(&session, id),
+    )
+    .await
+    .map(Json)
+    .map_err(user_admin_error)
+}
+
+async fn reset_totp(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<i64>,
+) -> Result<Json<CreatedUserResponse>, ApiError> {
+    require_admin(&state.pool, &session.user, "user.totp_reset").await?;
+    let reset = users::reset_totp(
+        &state.pool,
+        &session.user.username,
+        id,
+        own_session(&session, id),
+    )
+    .await
+    .map_err(user_admin_error)?;
+    Ok(Json(CreatedUserResponse {
+        user: reset.user,
+        totp_secret: reset.totp_secret,
+        otpauth_url: reset.otpauth_url,
+    }))
 }
 
 async fn delete_user(

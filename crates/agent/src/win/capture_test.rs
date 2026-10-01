@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use super::capture::{self, Captured, Duplicator};
+use super::capture::{self, Captured, ScreenCapture};
 use super::encoder::H264Encoder;
 
 pub fn run(monitor: u32, seconds: u64, out: &Path, fps: u32, bitrate: u32) -> anyhow::Result<()> {
@@ -25,7 +25,7 @@ pub fn run(monitor: u32, seconds: u64, out: &Path, fps: u32, bitrate: u32) -> an
             if m.primary { " primary" } else { "" }
         );
     }
-    let mut dup = Duplicator::new(monitor).context("starting desktop duplication")?;
+    let mut dup = ScreenCapture::new(monitor).context("starting screen capture")?;
     let (w, h) = (dup.frame().width, dup.frame().height);
     let mut enc = H264Encoder::new(w, h, fps, bitrate).context("creating encoder")?;
     println!(

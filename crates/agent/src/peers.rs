@@ -28,6 +28,7 @@ use peer::direct::{Credentials, DirectError, DirectLink, Listening};
 use peer::media::MediaSealer;
 use peer::noise::{Inbox, Opener, Responder, Sealer, StaticKey};
 use peer::DirectSettings;
+use peer::E2eError;
 use protocol::e2e::{AgentProof, Control, DirectAnswer, DirectOffer, Envelope, KEY_LEN};
 use protocol::media::{MediaFrame, ViewerDelay};
 use protocol::{read_frame, write_frame, Message};
@@ -229,11 +230,14 @@ impl Peers {
                 if !keys.inbox.wants(nonce) {
                     return;
                 }
-                let record = match keys.opener.open(nonce, &ciphertext) {
-                    Ok(record) => record,
+                let ready = match keys.opener.open(nonce, &ciphertext) {
+                    Ok(record) => keys.inbox.accept(nonce, record, Instant::now()),
+                    Err(e @ E2eError::UnknownRecord(_)) => {
+                        debug!(session_id, "{e}; skipped");
+                        keys.inbox.unreadable(nonce, Instant::now())
+                    }
                     Err(e) => return warn!(session_id, "sealed record rejected: {e}"),
                 };
-                let ready = keys.inbox.accept(nonce, record, Instant::now());
                 drop(inner);
                 for record in ready {
                     self.dispatch(session_id, record);
@@ -347,8 +351,8 @@ impl Peers {
                 }
             }
             // Only the viewer sends these; ignore them from it.
-            Control::MediaKey(_) | Control::DirectAnswer(_) => {}
-            record @ (Control::Input(_) | Control::Clipboard(_)) => {
+            Control::MediaKey(_) | Control::DirectAnswer(_) | Control::StreamStatus(_) => {}
+            record @ (Control::Input(_) | Control::Clipboard(_) | Control::StreamSettings(_)) => {
                 let _ = self.inbound.send(Inbound::Record { session_id, record });
             }
         }

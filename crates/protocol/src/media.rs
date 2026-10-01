@@ -70,6 +70,110 @@ impl MediaFrame {
     }
 }
 
+/// How many frames a second a technician wants to see (their viewer's FPS
+/// setting). The screen is captured when it changes, at most this often.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FrameRate {
+    /// The agent picks from [`AUTO_FRAME_RATES`] by how well the video is
+    /// being delivered (see the agent's `media::rate`).
+    #[default]
+    Auto,
+    /// Every change the screen shows, up to [`MAX_FRAME_RATE`].
+    Max,
+    /// At most this many frames a second.
+    Fixed(u32),
+}
+
+/// What [`FrameRate::Max`] means in practice: no display refreshes faster.
+pub const MAX_FRAME_RATE: u32 = 240;
+
+/// The rates [`FrameRate::Auto`] chooses between, fastest first.
+pub const AUTO_FRAME_RATES: [u32; 3] = [60, 30, 15];
+
+impl FrameRate {
+    /// The viewer's choices, in menu order.
+    pub const CHOICES: [FrameRate; 6] = [
+        FrameRate::Auto,
+        FrameRate::Max,
+        FrameRate::Fixed(120),
+        FrameRate::Fixed(60),
+        FrameRate::Fixed(30),
+        FrameRate::Fixed(15),
+    ];
+
+    /// Frames a second to capture at most, with `auto` standing in for
+    /// [`FrameRate::Auto`].
+    pub fn cap(self, auto: u32) -> u32 {
+        match self {
+            FrameRate::Auto => auto,
+            FrameRate::Max => MAX_FRAME_RATE,
+            FrameRate::Fixed(fps) => fps,
+        }
+        .clamp(1, MAX_FRAME_RATE)
+    }
+
+    /// Of several technicians' choices, the one to stream at: the fastest
+    /// (the stream is shared, and nobody asked for less than they get
+    /// elsewhere). `auto` is what [`FrameRate::Auto`] currently means.
+    pub fn fastest(choices: impl IntoIterator<Item = FrameRate>, auto: u32) -> Option<FrameRate> {
+        choices.into_iter().max_by_key(|c| c.cap(auto))
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            FrameRate::Auto => "Auto".into(),
+            FrameRate::Max => "Max".into(),
+            FrameRate::Fixed(fps) => fps.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for FrameRate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+impl std::str::FromStr for FrameRate {
+    type Err = String;
+
+    /// `auto`, `max`, or a number of frames a second (1-240).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("auto") {
+            return Ok(FrameRate::Auto);
+        }
+        if s.eq_ignore_ascii_case("max") {
+            return Ok(FrameRate::Max);
+        }
+        match s.parse::<u32>() {
+            Ok(fps @ 1..=MAX_FRAME_RATE) => Ok(FrameRate::Fixed(fps)),
+            _ => Err(format!(
+                "unknown frame rate {s:?} (auto, max, or 1-{MAX_FRAME_RATE})"
+            )),
+        }
+    }
+}
+
+/// Viewer -> agent (sealed): how this technician wants the video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSettings {
+    pub frame_rate: FrameRate,
+}
+
+/// Agent -> viewer (sealed): how the shared video is being streamed, sent
+/// to viewers that sent [`StreamSettings`] whenever it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamStatus {
+    /// The frame rate streamed at (the fastest any technician asked for).
+    pub frame_rate: FrameRate,
+    /// Frames a second captured at most, right now (for `Auto`, what the
+    /// agent chose).
+    pub fps: u32,
+    /// The encoder's bitrate target, bits per second.
+    pub bitrate: u32,
+}
+
 /// Delivery feedback for the agent's video (see `Message::StreamReport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamReport {
@@ -279,6 +383,31 @@ mod tests {
         let back: MediaFrame = postcard::from_bytes(&bytes).unwrap();
         assert!(back.keyframe && back.seq == 9);
         assert!(back.video().is_err());
+    }
+
+    #[test]
+    fn frame_rates_parse_cap_and_combine() {
+        assert_eq!("auto".parse(), Ok(FrameRate::Auto));
+        assert_eq!("MAX".parse(), Ok(FrameRate::Max));
+        assert_eq!(" 60 ".parse(), Ok(FrameRate::Fixed(60)));
+        assert!("0".parse::<FrameRate>().is_err());
+        assert!("241".parse::<FrameRate>().is_err());
+        assert!("fast".parse::<FrameRate>().is_err());
+        for choice in FrameRate::CHOICES {
+            assert_eq!(choice.label().parse(), Ok(choice));
+        }
+
+        assert_eq!(FrameRate::Auto.cap(30), 30);
+        assert_eq!(FrameRate::Max.cap(30), MAX_FRAME_RATE);
+        assert_eq!(FrameRate::Fixed(15).cap(60), 15);
+
+        let fastest = |c: &[FrameRate], auto| FrameRate::fastest(c.iter().copied(), auto);
+        assert_eq!(fastest(&[], 60), None);
+        let both = [FrameRate::Fixed(30), FrameRate::Auto];
+        assert_eq!(fastest(&both, 60), Some(FrameRate::Auto));
+        assert_eq!(fastest(&both, 15), Some(FrameRate::Fixed(30)));
+        let with_max = [FrameRate::Fixed(120), FrameRate::Max];
+        assert_eq!(fastest(&with_max, 60), Some(FrameRate::Max));
     }
 
     #[test]

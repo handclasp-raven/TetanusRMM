@@ -144,22 +144,50 @@ pub async fn create_token_in_groups(
     ttl: Duration,
     group_ids: &[i64],
 ) -> sqlx::Result<NewToken> {
+    create_link_token(pool, actor, ttl, group_ids, None).await
+}
+
+/// Where an agent installed from a link's MSI connects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallTarget {
+    /// QUIC address, `host:port`.
+    pub server: String,
+    /// Name the server certificate must be valid for.
+    pub server_name: String,
+}
+
+/// [`create_token_in_groups`], remembering `install` for the link's MSI.
+/// The caller validates it (see `crate::msi`).
+pub async fn create_link_token(
+    pool: &PgPool,
+    actor: &str,
+    ttl: Duration,
+    group_ids: &[i64],
+    install: Option<&InstallTarget>,
+) -> sqlx::Result<NewToken> {
     let token = new_token();
     let mut tx = pool.begin().await?;
     let (id, expires_at): (i64, DateTime<Utc>) = sqlx::query_as(
-        "INSERT INTO enrollment_tokens (token_hash, created_by, expires_at, group_ids)
-         VALUES ($1, $2, now() + make_interval(secs => $3), $4)
+        "INSERT INTO enrollment_tokens
+             (token_hash, created_by, expires_at, group_ids, install_server, install_server_name)
+         VALUES ($1, $2, now() + make_interval(secs => $3), $4, $5, $6)
          RETURNING id, expires_at",
     )
     .bind(token_hash(&token))
     .bind(actor)
     .bind(ttl.as_secs_f64())
     .bind(group_ids)
+    .bind(install.map(|i| &i.server))
+    .bind(install.map(|i| &i.server_name))
     .fetch_one(&mut *tx)
     .await?;
     let mut detail = json!({ "token_id": id, "expires_at": expires_at });
     if !group_ids.is_empty() {
         detail["group_ids"] = json!(group_ids);
+    }
+    if let Some(install) = install {
+        detail["server"] = json!(install.server);
+        detail["server_name"] = json!(install.server_name);
     }
     audit::append(
         &mut tx,
@@ -172,6 +200,30 @@ pub async fn create_token_in_groups(
         token,
         expires_at,
     })
+}
+
+/// A usable token's install target: `None` if the token is unusable,
+/// `Some(None)` if it was made without one.
+pub async fn usable_install_target(
+    pool: &PgPool,
+    token: &str,
+) -> sqlx::Result<Option<Option<InstallTarget>>> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT install_server, install_server_name FROM enrollment_tokens
+         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(server, server_name)| match (server, server_name) {
+            (Some(server), Some(server_name)) => Some(InstallTarget {
+                server,
+                server_name,
+            }),
+            _ => None,
+        }),
+    )
 }
 
 /// Whether `token` is currently usable (exists, unused, unexpired).

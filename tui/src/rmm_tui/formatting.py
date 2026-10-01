@@ -1,10 +1,16 @@
-"""Display formatting for the agent table."""
+"""Display formatting for the agent table, and the columns it can show."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from rich.text import Text
+
 from .api import Agent
+
+Cell = str | Text
 
 
 def bytes_short(n: int) -> str:
@@ -38,6 +44,20 @@ def ago(when: datetime | None, now: datetime | None = None) -> str:
     return f"{secs}s ago"
 
 
+def duration(secs: int | None) -> str:
+    """``3d 4h``, ``5h 12m`` or ``7m``; ``–`` if unknown."""
+    if secs is None:
+        return "–"
+    days, rest = divmod(max(0, secs), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def status(agent: Agent) -> str:
     if agent.enrollment_state == "revoked":
         return "revoked"
@@ -45,6 +65,16 @@ def status(agent: Agent) -> str:
         return "offline"
     # On the WebSocket fallback: worth knowing when a session feels slow.
     return "online (ws)" if agent.transport == "websocket" else "online"
+
+
+def status_cell(agent: Agent) -> Text:
+    """The status behind a green (online), red (offline) or grey
+    (revoked) dot."""
+    if agent.enrollment_state == "revoked":
+        colour = "bright_black"
+    else:
+        colour = "green" if agent.online else "red"
+    return Text.assemble(("●", colour), " ", status(agent))
 
 
 def groups(agent: Agent) -> str:
@@ -60,16 +90,94 @@ def sessions(agent: Agent) -> str:
     return ", ".join(parts) or "–"
 
 
-def agent_row(agent: Agent, now: datetime | None = None) -> tuple[str, ...]:
-    """Cells in column order: host, status, groups, last seen, CPU, RAM,
-    disk, sessions."""
-    return (
-        agent.label,
-        status(agent),
-        groups(agent),
-        ago(agent.last_seen, now),
-        cpu(agent.cpu_percent),
-        usage(agent.mem_used_bytes, agent.mem_total_bytes),
-        usage(agent.disk_used_bytes, agent.disk_total_bytes),
-        sessions(agent),
+def users(agent: Agent) -> str:
+    """Who is signed in right now: ``–`` while offline or not reported."""
+    if not agent.online or agent.logged_in_users is None:
+        return "–"
+    return ", ".join(agent.logged_in_users) or "none"
+
+
+def classification_label(classification: str) -> str:
+    """``Server``, ``Desktop`` or ``Other``."""
+    return classification.capitalize()
+
+
+def classification(agent: Agent) -> str:
+    """The classification; marked with ``*`` when an admin chose it."""
+    label = classification_label(agent.classification)
+    return f"{label}*" if agent.classification_override else label
+
+
+def uptime(agent: Agent) -> str:
+    # The last sample of an offline agent is stale: it may have rebooted.
+    return duration(agent.uptime_secs) if agent.online else "–"
+
+
+@dataclass(frozen=True)
+class Column:
+    key: str
+    label: str
+    render: Callable[[Agent, datetime], Cell]
+
+
+#: Every column the agent table can show, in the column menu's order.
+COLUMNS: dict[str, Column] = {
+    c.key: c
+    for c in (
+        Column("host", "Hostname", lambda a, _: a.label),
+        Column("status", "Status", lambda a, _: status_cell(a)),
+        Column("class", "Classification", lambda a, _: classification(a)),
+        Column("os", "OS", lambda a, _: a.os or "–"),
+        Column("user", "Logged-in user", lambda a, _: users(a)),
+        Column("ip", "IP address", lambda a, _: a.local_ip or "–"),
+        Column("public_ip", "Public IP", lambda a, _: a.remote_ip or "–"),
+        Column("uptime", "Uptime", lambda a, _: uptime(a)),
+        Column("groups", "Groups", lambda a, _: groups(a)),
+        Column("last_seen", "Last seen", lambda a, now: ago(a.last_seen, now)),
+        Column("cpu", "CPU", lambda a, _: cpu(a.cpu_percent)),
+        Column("ram", "RAM", lambda a, _: usage(a.mem_used_bytes, a.mem_total_bytes)),
+        Column("disk", "Disk", lambda a, _: usage(a.disk_used_bytes, a.disk_total_bytes)),
+        Column("sessions", "Active sessions", lambda a, _: sessions(a)),
+        Column("id", "Agent ID", lambda a, _: a.id),
     )
+}
+
+#: Shown until the user picks their own.
+DEFAULT_COLUMNS: tuple[str, ...] = (
+    "host",
+    "status",
+    "class",
+    "os",
+    "user",
+    "ip",
+    "uptime",
+    "groups",
+    "last_seen",
+    "cpu",
+    "ram",
+    "disk",
+    "sessions",
+)
+
+
+#: Columns since replaced: old key -> new key.
+RENAMED_COLUMNS = {"kind": "class"}
+
+
+def valid_columns(keys: Iterable[str] | None) -> list[str]:
+    """``keys`` without unknown or repeated ones (e.g. from an older or
+    hand-edited state file); the defaults if nothing is left."""
+    seen: dict[str, None] = {}
+    for key in keys or ():
+        key = RENAMED_COLUMNS.get(key, key)
+        if key in COLUMNS:
+            seen.setdefault(key)
+    return list(seen) or list(DEFAULT_COLUMNS)
+
+
+def agent_row(
+    agent: Agent, now: datetime | None = None, columns: Iterable[str] = DEFAULT_COLUMNS
+) -> tuple[Cell, ...]:
+    """Cells for ``columns`` (keys of :data:`COLUMNS`), in that order."""
+    now = now or datetime.now(UTC)
+    return tuple(COLUMNS[key].render(agent, now) for key in columns)

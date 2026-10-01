@@ -75,6 +75,10 @@ pub enum E2eError {
     Unauthentic,
     #[error("record is malformed: {0}")]
     Malformed(#[from] postcard::Error),
+    /// Authentic, but not a record this side knows (e.g. from a newer
+    /// peer). See [`Inbox::unreadable`].
+    #[error("record of an unknown kind: {0}")]
+    UnknownRecord(postcard::Error),
 }
 
 fn params() -> snow::params::NoiseParams {
@@ -423,7 +427,8 @@ impl Opener {
             .key
             .open_in_place(nonce(nonce_value), Aad::empty(), &mut buf)
             .map_err(|_| E2eError::Unauthentic)?;
-        Ok(postcard::from_bytes(plain)?)
+        // It is authentic, so the sender meant it: a newer peer's record.
+        postcard::from_bytes(plain).map_err(E2eError::UnknownRecord)
     }
 }
 
@@ -444,7 +449,9 @@ const MAX_HELD: usize = 1024;
 #[derive(Debug, Default)]
 pub struct Inbox {
     next: u64,
-    held: BTreeMap<u64, (Instant, Control)>,
+    /// `None`: a genuine record this side cannot read (see
+    /// [`Inbox::unreadable`]); it only fills its place in the order.
+    held: BTreeMap<u64, (Instant, Option<Control>)>,
 }
 
 impl Inbox {
@@ -456,6 +463,17 @@ impl Inbox {
 
     /// An opened record; returns what can now be delivered, in order.
     pub fn accept(&mut self, nonce: u64, record: Control, now: Instant) -> Vec<Control> {
+        self.hold(nonce, Some(record), now)
+    }
+
+    /// Record `nonce` was authentic but of a kind this side does not know
+    /// (the other side is newer). Nothing is delivered for it, but it is
+    /// not a gap: the records after it need not wait.
+    pub fn unreadable(&mut self, nonce: u64, now: Instant) -> Vec<Control> {
+        self.hold(nonce, None, now)
+    }
+
+    fn hold(&mut self, nonce: u64, record: Option<Control>, now: Instant) -> Vec<Control> {
         if !self.wants(nonce) {
             return Vec::new();
         }
@@ -495,7 +513,7 @@ impl Inbox {
     fn drain(&mut self) -> Vec<Control> {
         let mut out = Vec::new();
         while let Some((_, record)) = self.held.remove(&self.next) {
-            out.push(record);
+            out.extend(record);
             self.next += 1;
         }
         out
@@ -688,5 +706,17 @@ mod tests {
         // order.
         assert_eq!(inbox.accept(0, key(0), t0 + REORDER_WAIT), []);
         assert_eq!(inbox.accept(3, key(3), t0 + REORDER_WAIT), [key(3)]);
+    }
+
+    #[test]
+    fn an_unreadable_record_holds_nothing_up() {
+        let t0 = Instant::now();
+        let mut inbox = Inbox::default();
+        assert_eq!(inbox.accept(1, key(1), t0), []);
+        assert_eq!(inbox.unreadable(0, t0), [key(1)]);
+        assert!(!inbox.wants(0));
+        assert_eq!(inbox.unreadable(2, t0), []);
+        assert_eq!(inbox.accept(3, key(3), t0), [key(3)]);
+        assert_eq!(inbox.deadline(), None);
     }
 }

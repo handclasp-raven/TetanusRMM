@@ -386,3 +386,132 @@ async fn download_links_are_role_checked_and_expire_with_their_token() {
     );
     assert_eq!(actions.last().unwrap(), "agent.enroll");
 }
+
+/// Reads the MSI's properties.
+fn msi_properties(bytes: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut package = msi::Package::open(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    package
+        .select_rows(msi::Select::table("Property"))
+        .unwrap()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap().to_owned(),
+                row[1].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn msi_links_install_to_the_chosen_server() {
+    let db = start_db().await;
+    let certs = common::devcerts::generate("unused").unwrap();
+    let engineer = create_user(&db.pool, "sam", Role::SupportEngineer).await;
+
+    let updates = tempfile::tempdir().unwrap();
+    let build = updates.path().join("build.exe");
+    std::fs::write(&build, b"MZ agent build bytes").unwrap();
+    let key = server::updates::generate_key();
+    server::updates::write_key_pair(updates.path(), &key).unwrap();
+    server::updates::sign_file(
+        &updates.path().join(server::updates::SIGNING_KEY_FILE),
+        &build,
+        "windows-x86_64",
+        "0.4.2",
+    )
+    .unwrap();
+    server::updates::publish(updates.path(), &build, "windows-x86_64", "0.4.2").unwrap();
+
+    let api = start_api_with(db.pool.clone(), &certs, updates.path().to_owned()).await;
+    let session = api.session("sam", &engineer.totp_secret).await;
+    let create = |body: Value| {
+        api.client
+            .post(api.url("/api/enrollment-links"))
+            .bearer_auth(&session)
+            .json(&body)
+            .send()
+    };
+
+    let link: Value = create(json!({ "server": "rmm.lan:5443" }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = link["token"].as_str().unwrap();
+    // The TLS name follows a host name.
+    assert_eq!(
+        (&link["server"], &link["server_name"]),
+        (&json!("rmm.lan:5443"), &json!("rmm.lan"))
+    );
+    let msi_url = link["msi_url"].as_str().unwrap();
+    assert_eq!(
+        msi_url,
+        format!("{}/api/download/windows-x86_64/msi?token={token}", api.base)
+    );
+    let resp = api.client.get(msi_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/x-msi");
+    assert_eq!(
+        resp.headers()["content-disposition"],
+        "attachment; filename=\"rmm-agent-0.4.2.msi\""
+    );
+    let props = msi_properties(&resp.bytes().await.unwrap());
+    assert_eq!(props["RMM_SERVER"], "rmm.lan:5443");
+    assert_eq!(props["RMM_SERVER_NAME"], "rmm.lan");
+    assert_eq!(props["RMM_TOKEN"], token);
+    assert_eq!(props["ProductVersion"], "0.4.2");
+
+    // Defaults: this server's public host on the agent port. With an IP
+    // address, the TLS name stays the public host (what the cert covers).
+    let link: Value = create(json!({})).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        (&link["server"], &link["server_name"]),
+        (&json!("localhost:4433"), &json!("localhost"))
+    );
+    let link: Value = create(json!({ "server": "192.0.2.10:4433" }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(link["server_name"], "localhost");
+
+    // Nothing that could smuggle arguments onto the installer's command line.
+    for body in [
+        json!({ "server": "rmm.lan:4433 --token x" }),
+        json!({ "server": "rmm.lan" }),
+        json!({ "server_name": "a\"b" }),
+    ] {
+        let resp = create(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // Only Windows links have an MSI.
+    let link: Value = create(json!({ "platform": "linux-x86_64" }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(link["msi_url"].is_null());
+    let resp = api
+        .client
+        .get(api.url(&format!(
+            "/api/download/linux-x86_64/msi?token={}",
+            link["token"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A made-up token gets nothing.
+    let resp = api
+        .client
+        .get(api.url("/api/download/windows-x86_64/msi?token=nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

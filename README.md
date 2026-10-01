@@ -13,7 +13,7 @@ for the architecture and phase plan.
 | `crates/peer` | lib | End-to-end encrypted sessions between agent and viewer (Noise), and direct peer-to-peer paths: candidate gathering (host + STUN), hole punching, pinned QUIC, merging video from two paths |
 | `crates/server` | bin + lib | QUIC listener for agents, HTTPS API, Postgres, auth, audit log, enrollment CA, update publishing |
 | `crates/agent` | bin + lib | Enrollment, heartbeats with telemetry, protected credential storage, signed self-update, Windows service + session helper + tray, remote shell / scripts / file transfer |
-| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC (or the WebSocket fallback) to the server, straight to the agent when NAT allows, end-to-end encrypted, OpenH264 decode, winit + softbuffer window |
+| `crates/viewer` | bin + lib | Cross-platform remote desktop viewer (Linux, macOS, Windows): QUIC (or the WebSocket fallback) to the server, straight to the agent when NAT allows, end-to-end encrypted, OpenH264 decode, winit + softbuffer window with a toolbar (display mode, monitors) and a side panel (agent status, command buttons, file transfer) |
 | `tui/` | Python project | Support TUI (Textual): sign in, live agent table, launch the viewer, shell console and script runner through the server ([tui/README.md](tui/README.md)) |
 
 Server modules: `quic` (agent and viewer listeners: QUIC and the WebSocket
@@ -120,7 +120,10 @@ Agents do not share a certificate. Each one gets its own at enrollment:
      -H 'content-type: application/json' \
      -d '{"platform": "windows-x86_64", "ttl_secs": 86400}' \
      https://localhost:8443/api/enrollment-links
-   # {"token":"9f3c…","expires_at":"…","download_url":"https://localhost:8443/api/download/windows-x86_64?token=9f3c…"}
+   # {"token":"9f3c…","expires_at":"…",
+   #  "download_url":"https://localhost:8443/api/download/windows-x86_64?token=9f3c…",
+   #  "msi_url":"https://localhost:8443/api/download/windows-x86_64/msi?token=9f3c…",
+   #  "server":"localhost:4433","server_name":"localhost"}
    ```
 
    Each link mints a random, single-use token that expires after `ttl_secs`
@@ -130,6 +133,14 @@ Agents do not share a certificate. Each one gets its own at enrollment:
    the latest published build for that platform (see
    [Publishing a signed update](#publishing-a-signed-update)). It keeps working
    until the token is used to enroll.
+
+   `"server"` (`host:port`) and `"server_name"` say where an agent installed
+   from the link's MSI connects, and which name the server certificate must
+   match. The server defaults to this server's public host (from
+   `RMM_PUBLIC_URL`) on port 4433. The name defaults to that host, unless the
+   server is given as an IP address, in which case it stays the public host.
+   Both are stored with the token. Windows links also get an `msi_url`: see
+   [the MSI installer](#msi-installer).
 
 2. **Enroll** on the target machine with the token and the server's CA
    certificate:
@@ -158,6 +169,44 @@ Agents do not share a certificate. Each one gets its own at enrollment:
    certificate. The server accepts `Hello` only if the certificate is the one
    pinned to that agent id and the agent is not revoked. Setting
    `agents.enrollment_state = 'revoked'` locks it out at its next connection.
+
+## MSI installer
+
+`GET /api/download/windows-x86_64/msi?token=…` (a link's `msi_url`) returns
+an MSI built on the fly. It holds the latest published Windows build, the CA
+certificate agents must trust, and the link's server, TLS name and token as
+properties. Double-click it (UAC prompts), or deploy it silently:
+
+```powershell
+msiexec /i rmm-agent.msi /qn /l*v install.log
+```
+
+It installs `rmm-agent.exe` and `ca.crt` to `C:\Program Files\RMM`, then runs
+`rmm-agent.exe service install …` as LocalSystem, so the service enrolls
+itself on first start and joins the link's groups. Nothing else is needed on
+the machine. The token is a hidden property, so it shows as `**********` in
+logs. Uninstall (Apps & features, or `msiexec /x rmm-agent.msi`) runs
+`service uninstall`, then removes the files. The credential in
+`%ProgramData%\RMM\agent` is kept, as with `service uninstall`, so
+reinstalling reuses the same agent identity.
+
+Like the plain download, the MSI needs a usable token but doesn't use it up;
+enrolling does. So only the first machine installed from one link enrolls.
+
+The server writes the MSI itself (`crates/server/src/msi.rs`, with the `msi`
+and `cab` crates), so it needs no Windows tooling. Some limits:
+- **x64 only**, with a fixed product code. On a machine that already has the
+  agent from an MSI, Windows Installer refuses a second one ("another version
+  of this product is already installed"). Agents update themselves instead.
+- **Not Authenticode-signed:** SmartScreen may warn when it's opened from a
+  browser download. The agent binary inside is covered by the update
+  signature.
+- **Patched `msi` crate:** `vendor/msi` is `msi` 0.10.0 with one fix. Windows
+  Installer only opens databases whose rows are stored in key order, so see
+  `vendor/msi/RMM-PATCH.md`.
+
+`--server` accepts `host:port` as well as an IP address (for the MSI and by
+hand). A name is resolved once, at install or enrollment, preferring IPv4.
 
 ## Installing the agent on Windows (service + session helper)
 
@@ -474,11 +523,83 @@ it reports as `rmm_stream_viewer_delay_seconds`.
 
    In the window, mouse, wheel and keyboard go to the remote machine (keys
    are sent by physical position, so the remote keyboard layout applies).
+
+   **Toolbar** (top): **Display** (drop-down: **Scale** fits the picture
+   keeping its shape, **Stretch** fills the area ignoring it, **Fill** fills
+   the area keeping it, cropping the edges, **Original size** shows one
+   remote pixel per screen pixel: a remote screen larger than the window
+   pans when the pointer is held near an edge, with bars along the right
+   and bottom edges showing which part is in view), **FPS** (drop-down:
+   **Auto**, **Max**, 120, 60, 30 or 15 frames a second; see below),
+   **Monitor** (drop-down),
+   **Text** (drop-down: the size of the toolbar's and panel's text, 8-20
+   px; default 10), **Refresh** (a fresh keyframe), **Full screen**, and on
+   the right
+   **Panel** (show/hide the side panel) and **Disconnect**. In a narrow
+   window, Full screen, Refresh and Text are left out (they have
+   shortcuts). `--display scale|stretch|fill|original` picks the mode at
+   startup, `--fps auto|max|N` (or `RMM_VIEWER_FPS`) the frame rate,
+   `--no-panel` starts
+   with the panel hidden, and `--font-size PX` (6-32, or
+   `RMM_VIEWER_FONT_SIZE`) the text size. With `--remember-font-size
+   FILE` a size picked in the viewer is saved there as `{"font_size": N}`;
+   the TUI uses this to start each viewer at the size last picked.
+
+   **Frame rate.** The agent captures when the screen changes, at most at
+   the frame rate asked for: a still screen sends nothing (so the fps shown
+   drops, without any delay to the next change), a video as many frames as
+   the cap allows. **Auto** lets the agent choose 15, 30 or 60 by how well
+   the network carries the video (the button shows its choice, e.g. "FPS:
+   Auto (60)"); it starts at 30, moves up after a few seconds of full
+   quality on clear links, and down when the links congest. **Max** is
+   every change the screen shows. With several technicians watching one
+   machine, the stream runs at the fastest rate any of them asked for. The
+   bitrate ceiling rises with the frame rate, and each frame gets its share
+   of it whatever the screen's real pace. Agents older than this ignore the
+   setting (and stream at 30).
+
+   On machines whose desktop is drawn in software (virtual machines,
+   servers without a GPU), the agent reads screen pixels through GDI rather
+   than from Desktop Duplication, whose image there can be read while
+   Windows is still writing it (video arrives torn). That is tear-free but
+   slower: expect fewer frames a second than on a machine with a GPU. The
+   helper's log names the adapter and the source it chose ("screen capture
+   source").
+
+   **Side panel** (right): the agent's **status**: hostname, signed-in
+   user, internal IP (the agent's own address on its route to the server),
+   external IP (the address the server sees), DNS servers, OS, and every
+   fixed disk with a usage bar (amber from 80%, red from 90%), refreshed
+   every 5 s. Under it, **command buttons**, each starting its command on
+   the agent's desktop as the signed-in user (`cmd`, `ncpa.cpl`, `mstsc`,
+   ...: anything the Run dialog takes), and **Upload file** / **Download
+   file**, which ask for the path on the agent and use the local file
+   dialog for the other end (an upload onto an existing file asks before
+   replacing it). The panel scrolls with the mouse wheel.
+
+   The panel works through the HTTPS API as the technician, so it needs
+   `--api-url https://host:8443` and the technician's session token in
+   `RMM_API_TOKEN` (never on the command line). The TUI passes both, plus
+   its command buttons as `--command "LABEL=COMMAND"` (repeatable;
+   `--no-default-commands` for none). Without them the viewer works as
+   before and the panel says where to get it. Command buttons need
+   `desktop` on the agent and file transfer `file_transfer`; the server
+   checks and audits both (`command.launch`, `file.upload`,
+   `file.download`).
+
    The viewer's own shortcuts all use **Ctrl+Alt+Shift**:
-   - **Ctrl+Alt+Shift+M** shows the monitor picker (then **1–9** picks,
+   - **Ctrl+Alt+Shift+M** opens the monitor menu (then **1–9** picks,
      **Esc** closes it); **Ctrl+Alt+Shift+1–9** switches monitor directly.
+   - **Ctrl+Alt+Shift+P** shows or hides the panel, **Ctrl+Alt+Shift+F**
+     toggles full screen.
+   - **Ctrl+Alt+Shift+-** / **Ctrl+Alt+Shift+=** make the text a pixel
+     smaller or larger.
    - **Ctrl+Alt+Shift+F5** requests a fresh keyframe.
-   - **Ctrl+Alt+Shift+Q** (or closing the window) quits.
+   - **Ctrl+Alt+Shift+Q** (or closing the window, or **Disconnect**) quits.
+
+   While a menu or dialog is open, clicks and keys go to it rather than the
+   remote machine; in a path prompt **Ctrl+V** pastes from the local
+   clipboard.
 
    Under the `require` consent mode the viewer shows "Waiting for the remote
    user to accept" until the user answers (see
@@ -771,6 +892,20 @@ Agents at protocol 6 also report their **hostname** once per connection
 (`Message::AgentInfo`, sent after `DeviceInfo`), stored as `agents.hostname`.
 Older agents keep working and show no hostname until they update.
 
+Agents at protocol 9 also report their **status**: who is signed in (every
+Windows session with a user, console or remote desktop, as `DOMAIN\user`;
+utmpx logins elsewhere) and their own address on the route to the server
+(the LAN address behind NAT). The server asks for it with
+`EnableStatusReports` right after `Hello`, and only asks agents at version 9
+or later; the agent then sends `AgentStatus` at once and again whenever it
+changes (checked every heartbeat interval). An agent never sends it unasked,
+so a new agent still works with an older server. The server cleans the names
+(control characters, at most 32 names of 256 bytes) and stores them as
+`agents.logged_in_users` and `agents.local_ip`. It also records the address it
+sees the agent connect from as `agents.remote_ip` (the public address behind
+NAT; behind Docker's userland proxy it is the proxy's address). All three
+keep their last value while the agent is offline, and are `null` until known.
+
 `GET /api/agents` adds live state from the relay to each row: `online`
 (connected right now), `viewer_sessions` (remote-desktop viewers watching)
 and `shell_sessions` (interactive shells open).
@@ -779,6 +914,32 @@ and `shell_sessions` (interactive shells open).
 
 Agents only install updates signed with the ed25519 key whose public half was
 baked in at build time.
+
+### Windows builds without Windows
+
+`scripts/build-windows-agent.sh` cross-compiles the Windows agent on Linux,
+signs it, and publishes it:
+
+```sh
+scripts/build-windows-agent.sh            # version from crates/agent/Cargo.toml
+scripts/build-windows-agent.sh 0.2.0      # or give one
+scripts/build-windows-agent.sh --no-publish   # build and sign only
+```
+
+The first run builds `rmm-agent-windows-builder` from
+`docker/agent-windows.Dockerfile`: Rust's `x86_64-pc-windows-msvc` target
+with clang/lld via `cargo-xwin`, plus Microsoft's CRT and Windows SDK. Those
+are downloaded into the image, and building it accepts Microsoft's license
+for them. The image is about 3.6 GB. Each build mounts the source read-only,
+bakes in `update-keys/update.pub`, and keeps its cache in the
+`rmm-xwin-target` and `rmm-xwin-cargo` Docker volumes (a full release build
+takes about a minute). The signed exe lands in
+`target/windows-x86_64/rmm-agent.exe`. The signing key never enters the
+container; signing and publishing run on the host. A cross-compiled agent
+installs and runs like one built on Windows, as tested on Windows 11 via the
+MSI.
+
+### By hand
 
 ```sh
 # Once: create the signing key. Keep update-keys/update.key secret.
@@ -867,14 +1028,18 @@ Sessions are sent as `Authorization: Bearer <token>`. Errors come back as
 | POST | `/api/auth/login` | none | `{username, password}` → `{challenge_token, expires_in_secs}` |
 | POST | `/api/auth/totp` | none | `{challenge_token, code}` → `{session_token, expires_at, user}` |
 | POST | `/api/auth/logout` | session | Ends the session |
-| POST | `/api/enrollment-links` | admin, support_engineer | `{ttl_secs?, platform?, group_ids?}` → `{token, expires_at, download_url}`. `group_ids`: admins only. |
+| POST | `/api/enrollment-links` | admin, support_engineer | `{ttl_secs?, platform?, group_ids?, server?, server_name?}` → `{token, expires_at, download_url, msi_url, server, server_name}`. `group_ids`: admins only. `msi_url`: Windows only. |
 | POST | `/api/agents/{id}/viewer-sessions` | `desktop` on the agent | → `{token, expires_at, agent_id, online}`: single-use viewer token, valid 60 s |
 | GET | `/api/download/{platform}?token=` | enrollment token | Latest published agent build. Does not use up the token. |
+| GET | `/api/download/windows-x86_64/msi?token=` | enrollment token | [MSI](#msi-installer) that installs and enrolls the latest build. Does not use up the token. |
 | GET | `/api/updates/{platform}/manifest` | none | `{platform, version, sha256, size}` |
 | GET | `/api/updates/{platform}/binary` | none | Agent build (signed, so public) |
 | GET | `/api/updates/{platform}/signature` | none | 64-byte detached ed25519 signature |
 | GET | `/api/me` | session | Current user |
-| GET | `/api/agents` | session | The agents the user can see (engineers: granted ones), with hostname, telemetry, `groups`, the user's `capabilities` on each, and live `online` / `transport` / `viewer_sessions` / `shell_sessions` |
+| GET | `/api/agents` | session | The agents the user can see (engineers: granted ones), with hostname, telemetry, `logged_in_users` / `local_ip` / `remote_ip` / `os` / `dns_servers` / `disks`, `classification` (and `classification_override`), `groups`, the user's `capabilities` on each, and live `online` / `transport` / `viewer_sessions` / `shell_sessions` |
+| GET | `/api/agents/{id}` | session; agent visible to the user | One agent, as listed above (the viewer's side panel) |
+| PUT | `/api/agents/{id}/classification` | admin | `{classification: "server" \| "desktop" \| "other" \| null}` (`null`: back to the device kind's) → `{classification, classification_override}`; audited as `agent.classify` |
+| POST | `/api/agents/{id}/launch` | `desktop` on the agent | `{command}` (as typed at a Run prompt) → `{command, user}`: started on the agent's desktop as the signed-in user; 409 if nobody is signed in. Audited as `command.launch` |
 | GET | `/api/audit?limit=` | admin, auditor | Newest audit entries first (default 100, at most 1000) |
 | GET | `/api/audit/verify` | admin, auditor | Walks the whole chain: `{"status":"valid","entries":n}` or `{"status":"broken","id":…,"reason":…}` |
 | GET | `/api/agents/{id}/policy` | session; agent visible to the user | Consent policy |
@@ -886,6 +1051,8 @@ Sessions are sent as `Authorization: Bearer <token>`. Errors come back as
 | GET | `/api/users` | admin | Users and roles |
 | POST | `/api/users` | admin | `{username, password, role}` → `{user, totp_secret, otpauth_url}` (201) |
 | PUT | `/api/users/{id}/role` | admin | `{role}`; refused (409) if it would leave no admin |
+| PUT | `/api/users/{id}/password` | admin | `{password}`; ends the user's sessions (an admin changing their own keeps the one in use) |
+| POST | `/api/users/{id}/totp` | admin | New TOTP secret → `{user, totp_secret, otpauth_url}`; ends the user's sessions likewise |
 | DELETE | `/api/users/{id}` | admin | Deletes the user, their sessions and grants; not yourself, not the last admin |
 | GET | `/api/grants?user_id=` | admin; anyone for their own `user_id` | Access grants |
 | POST | `/api/grants` | admin | `{user_id, agent_id \| group_id \| all_agents: true, capabilities?}` (201). Capabilities default to all four. |
@@ -908,7 +1075,8 @@ change, download-link creation and agent enrollment is written to the
 hash-chained `audit_log` table. So is every remote shell (`shell.open`,
 `shell.close`), script run (`script.run`, `script.complete`), file transfer
 (`file.upload`, `file.download`), refused operation (`permission.denied`),
-and every RBAC change (`user.role_change`, `user.delete`, `grant.create`,
+and every RBAC change (`user.role_change`, `user.password_change`,
+`user.totp_reset`, `user.delete`, `grant.create`,
 `grant.delete`, `group.create`, `group.update`, `group.delete`,
 `group.members`). Chain verification is `server::audit::verify`, exposed as
 `GET /api/audit/verify`.
@@ -1012,7 +1180,11 @@ only to the server's HTTPS API:
 - actions follow the user's per-agent capabilities: an engineer only gets
   remote desktop, shell or scripts where a grant allows them;
 - an audit-log view with chain verification for admins and auditors.
-  Auditors see agents and the audit log but get none of the control actions.
+  Auditors see agents and the audit log but get none of the control actions;
+- **new agent:** makes a download link (MSI for Windows) for a chosen server
+  address, optionally into groups (admins), and can save the MSI locally;
+- **groups:** everyone can view them and their members; admins create,
+  rename, delete and set members. The agent table filters by group.
 
 Install, configuration and usage: [tui/README.md](tui/README.md).
 

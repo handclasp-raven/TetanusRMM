@@ -109,7 +109,8 @@ pub struct User {
     pub role: Role,
 }
 
-/// A freshly created user and the TOTP secret to load into an authenticator app.
+/// A user and their fresh TOTP secret (newly created, or reset) to load
+/// into an authenticator app.
 #[derive(Debug)]
 pub struct CreatedUser {
     pub user: User,
@@ -206,6 +207,12 @@ pub enum UserAdminError {
     LastAdmin,
     #[error("you cannot delete your own account")]
     SelfDelete,
+    #[error("password must be at least {MIN_PASSWORD_LEN} characters")]
+    WeakPassword,
+    #[error(transparent)]
+    Password(#[from] password::HashError),
+    #[error(transparent)]
+    Totp(#[from] totp::TotpError),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -285,6 +292,101 @@ pub async fn delete_user(pool: &PgPool, actor: &User, user_id: i64) -> Result<()
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// End `user_id`'s sessions (and pending logins), except `keep`: the
+/// session of an admin changing their own credentials.
+async fn end_sessions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: i64,
+    keep: Option<&str>,
+) -> sqlx::Result<u64> {
+    let ended = sqlx::query(
+        "DELETE FROM sessions WHERE user_id = $1 AND ($2::bytea IS NULL OR token_hash <> $2)",
+    )
+    .bind(user_id)
+    .bind(keep.map(crate::auth::token_hash))
+    .execute(&mut **tx)
+    .await?;
+    Ok(ended.rows_affected())
+}
+
+async fn lock_user(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: i64,
+) -> Result<User, UserAdminError> {
+    sqlx::query_as("SELECT id, username, role FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(UserAdminError::NotFound)
+}
+
+/// Set a user's password and end their sessions, except `keep_session`
+/// (the token of an admin changing their own). Audited as
+/// `user.password_change` by `actor`.
+pub async fn set_password(
+    pool: &PgPool,
+    actor: &str,
+    user_id: i64,
+    password: &str,
+    keep_session: Option<&str>,
+) -> Result<User, UserAdminError> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(UserAdminError::WeakPassword);
+    }
+    let password_hash = password::hash(password.to_owned()).await?;
+    let mut tx = pool.begin().await?;
+    let user = lock_user(&mut tx, user_id).await?;
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(&password_hash)
+        .execute(&mut *tx)
+        .await?;
+    let ended = end_sessions(&mut tx, user_id, keep_session).await?;
+    audit::append(
+        &mut tx,
+        NewEntry::new(actor, Action::UserPasswordChange)
+            .target(&user.username)
+            .detail(json!({ "user_id": user_id, "sessions_ended": ended })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Give a user a new TOTP secret (the old authenticator entry stops
+/// working) and end their sessions, except `keep_session`. Audited as
+/// `user.totp_reset` by `actor`.
+pub async fn reset_totp(
+    pool: &PgPool,
+    actor: &str,
+    user_id: i64,
+    keep_session: Option<&str>,
+) -> Result<CreatedUser, UserAdminError> {
+    let secret = totp::generate_secret();
+    let mut tx = pool.begin().await?;
+    let user = lock_user(&mut tx, user_id).await?;
+    let otpauth_url = totp::otpauth_url(&secret, &user.username)?;
+    sqlx::query("UPDATE users SET totp_secret = $2, totp_last_step = NULL WHERE id = $1")
+        .bind(user_id)
+        .bind(&secret)
+        .execute(&mut *tx)
+        .await?;
+    let ended = end_sessions(&mut tx, user_id, keep_session).await?;
+    audit::append(
+        &mut tx,
+        NewEntry::new(actor, Action::UserTotpReset)
+            .target(&user.username)
+            .detail(json!({ "user_id": user_id, "sessions_ended": ended })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(CreatedUser {
+        user,
+        totp_secret: secret,
+        otpauth_url,
+    })
 }
 
 #[cfg(test)]

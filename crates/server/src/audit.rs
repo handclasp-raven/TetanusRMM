@@ -62,6 +62,10 @@ pub enum Action {
     /// An admin changed a user's role.
     UserRoleChange,
     UserDelete,
+    /// An admin set a user's password; their sessions were ended.
+    UserPasswordChange,
+    /// An admin replaced a user's TOTP secret; their sessions were ended.
+    UserTotpReset,
     /// Access granted to a support engineer; detail has scope and capabilities.
     GrantCreate,
     GrantDelete,
@@ -71,6 +75,11 @@ pub enum Action {
     GroupDelete,
     /// Agents were added to or removed from a group.
     GroupMembers,
+    /// An admin set or cleared an agent's classification.
+    AgentClassify,
+    /// A program was started on an agent's desktop; detail has the command
+    /// and how it went.
+    CommandLaunch,
 }
 
 impl Action {
@@ -100,12 +109,16 @@ impl Action {
             Action::FileDownload => "file.download",
             Action::UserRoleChange => "user.role_change",
             Action::UserDelete => "user.delete",
+            Action::UserPasswordChange => "user.password_change",
+            Action::UserTotpReset => "user.totp_reset",
             Action::GrantCreate => "grant.create",
             Action::GrantDelete => "grant.delete",
             Action::GroupCreate => "group.create",
             Action::GroupUpdate => "group.update",
             Action::GroupDelete => "group.delete",
             Action::GroupMembers => "group.members",
+            Action::AgentClassify => "agent.classify",
+            Action::CommandLaunch => "command.launch",
         }
     }
 }

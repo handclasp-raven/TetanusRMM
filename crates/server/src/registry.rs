@@ -96,6 +96,52 @@ pub struct Agent {
     pub device_kind: Option<DeviceKind>,
     /// As last reported by the agent (protocol 6+).
     pub hostname: Option<String>,
+    /// Users signed in to the machine, as last reported (protocol 9+).
+    pub logged_in_users: Option<Vec<String>>,
+    /// The agent's own address on its route to the server (protocol 9+).
+    pub local_ip: Option<String>,
+    /// The address the server last saw the agent connect from.
+    pub remote_ip: Option<String>,
+    /// An admin's classification; `None`: derived (see
+    /// [`Agent::effective_classification`]).
+    #[serde(rename = "classification_override")]
+    pub classification: Option<Classification>,
+    /// Operating system name and version, as last reported (protocol 9+).
+    pub os: Option<String>,
+    /// DNS servers configured on the agent, as last reported (protocol 9+).
+    pub dns_servers: Option<Vec<String>>,
+    /// Fixed disks and their usage, as last reported (protocol 9+).
+    pub disks: Option<sqlx::types::Json<Vec<protocol::DiskUsage>>>,
+}
+
+impl Agent {
+    /// The admin's classification, else what the reported device kind
+    /// suggests.
+    pub fn effective_classification(&self) -> Classification {
+        self.classification
+            .unwrap_or_else(|| Classification::from_kind(self.device_kind))
+    }
+}
+
+/// What an agent is, for technicians: a server, a desktop, or other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "classification", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum Classification {
+    Server,
+    Desktop,
+    Other,
+}
+
+impl Classification {
+    /// The default for an agent that reported `kind`.
+    pub fn from_kind(kind: Option<DeviceKind>) -> Self {
+        match kind {
+            Some(DeviceKind::Server) => Classification::Server,
+            Some(DeviceKind::Workstation) => Classification::Desktop,
+            None => Classification::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
@@ -262,6 +308,97 @@ pub async fn record_hostname(pool: &PgPool, agent_id: &str, hostname: &str) -> s
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Record the status an agent reported, already sanitized by the caller.
+pub async fn record_status(
+    pool: &PgPool,
+    agent_id: &str,
+    status: &protocol::AgentStatus,
+) -> sqlx::Result<()> {
+    // An agent that cannot tell its OS keeps the last one known.
+    sqlx::query(
+        "UPDATE agents SET logged_in_users = $2, local_ip = $3, os = COALESCE($4, os),
+             dns_servers = $5, disks = $6
+         WHERE id = $1",
+    )
+    .bind(agent_id)
+    .bind(&status.users)
+    .bind(status.local_ip.map(|ip| ip.to_string()))
+    .bind(&status.os)
+    .bind(
+        status
+            .dns_servers
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>(),
+    )
+    .bind(sqlx::types::Json(&status.disks))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set (or with `None`, clear) an admin's classification of an agent.
+/// Audited as `agent.classify` with before and after. Returns the
+/// effective classification, or `None` if there is no such agent.
+pub async fn set_classification(
+    pool: &PgPool,
+    actor: &str,
+    agent_id: &str,
+    classification: Option<Classification>,
+) -> sqlx::Result<Option<Classification>> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<Classification>, Option<DeviceKind>)> =
+        sqlx::query_as("SELECT classification, device_kind FROM agents WHERE id = $1 FOR UPDATE")
+            .bind(agent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((before, kind)) = row else {
+        return Ok(None);
+    };
+    if before != classification {
+        sqlx::query("UPDATE agents SET classification = $2 WHERE id = $1")
+            .bind(agent_id)
+            .bind(classification)
+            .execute(&mut *tx)
+            .await?;
+        audit::append(
+            &mut tx,
+            NewEntry::new(actor, Action::AgentClassify)
+                .target(agent_id)
+                .detail(json!({ "before": before, "after": classification })),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(
+        classification.unwrap_or_else(|| Classification::from_kind(kind)),
+    ))
+}
+
+/// Record the address an agent connects from (on connect, and when the
+/// connection migrates).
+pub async fn record_remote_ip(
+    pool: &PgPool,
+    agent_id: &str,
+    ip: std::net::IpAddr,
+) -> sqlx::Result<()> {
+    // An IPv4 client on a dual-stack socket shows as ::ffff:a.b.c.d.
+    let ip = ip.to_canonical().to_string();
+    sqlx::query("UPDATE agents SET remote_ip = $2 WHERE id = $1 AND remote_ip IS DISTINCT FROM $2")
+        .bind(agent_id)
+        .bind(ip)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_agent(pool: &PgPool, agent_id: &str) -> sqlx::Result<Option<Agent>> {
+    sqlx::query_as("SELECT * FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn list_agents(pool: &PgPool) -> sqlx::Result<Vec<Agent>> {

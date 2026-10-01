@@ -162,3 +162,19 @@ async def test_expired_mid_session_forgets_the_token(
     await m.login("jane", "pw", "123456")
     m.expired()
     assert saved(memory_keyring) is None and api.token is None
+
+
+async def test_switching_server_signs_out_and_uses_that_servers_keyring_entry(
+    api: ApiClient, memory_keyring: MemoryKeyring
+) -> None:
+    other_url = "https://other:8443"
+    TokenStore(other_url, memory_keyring).save(StoredSession("other-tok", LATER, "jane"))
+    session = manager(api, memory_keyring)
+    api.token = "tok"
+    session.user = object()  # type: ignore[assignment]
+    other = ApiClient(other_url, transport=httpx.MockTransport(FakeServer()))
+    assert session.switch_server(other) is api
+    assert session.api is other and session.user is None
+    assert session.store.load() == StoredSession("other-tok", LATER, "jane")
+    await api.aclose()
+    await other.aclose()

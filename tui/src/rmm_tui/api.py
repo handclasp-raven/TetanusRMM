@@ -8,12 +8,13 @@ to an agent directly and never needs the viewer for shells or scripts.
 from __future__ import annotations
 
 import json
+import os
 import ssl
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 
@@ -26,8 +27,19 @@ DESKTOP = "desktop"
 SHELL = "shell"
 SCRIPT = "script"
 FILE_TRANSFER = "file_transfer"
+#: Every capability, in the order the TUI offers them.
+CAPABILITIES = (DESKTOP, SHELL, SCRIPT, FILE_TRANSFER)
+#: Every role, in the order the TUI offers them.
+ROLES = ("admin", "support_engineer", "auditor")
+#: Shortest password the server accepts.
+MIN_PASSWORD_LEN = 12
 #: Roles that may read the audit log.
 AUDIT_ROLES = frozenset({"admin", "auditor"})
+#: Roles that may make download links for new agents.
+ENROLL_ROLES = frozenset({"admin", "support_engineer"})
+
+#: What an agent is, in the order the TUI offers them.
+CLASSIFICATIONS = ("server", "desktop", "other")
 
 #: Extra seconds allowed for a script run beyond its own timeout (the
 #: server waits up to 30 s past it for the agent's answer).
@@ -77,6 +89,60 @@ class User:
     def can_read_audit(self) -> bool:
         return self.role in AUDIT_ROLES
 
+    @property
+    def can_enroll(self) -> bool:
+        """Make download links (and MSIs) for new agents."""
+        return self.role in ENROLL_ROLES
+
+    @property
+    def is_admin(self) -> bool:
+        """Edit groups, put new agents straight into them, and manage users."""
+        return self.role == "admin"
+
+
+@dataclass(frozen=True)
+class TotpEnrollment:
+    """A user's new TOTP secret, for their authenticator app. The server
+    shows it once: on creating the user, or resetting their TOTP."""
+
+    user: User
+    totp_secret: str
+    otpauth_url: str
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> TotpEnrollment:
+        return cls(
+            user=User.from_json(d["user"]),
+            totp_secret=d["totp_secret"],
+            otpauth_url=d["otpauth_url"],
+        )
+
+
+@dataclass(frozen=True)
+class Grant:
+    """What a support engineer may do, and where: on one agent, a group's
+    members, or every agent."""
+
+    id: int
+    user_id: int
+    agent_id: str | None
+    group_id: int | None
+    group_name: str | None
+    all_agents: bool
+    capabilities: tuple[str, ...]
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Grant:
+        return cls(
+            id=int(d["id"]),
+            user_id=int(d["user_id"]),
+            agent_id=d.get("agent_id"),
+            group_id=d.get("group_id"),
+            group_name=d.get("group_name"),
+            all_agents=bool(d.get("all_agents", False)),
+            capabilities=tuple(d.get("capabilities") or ()),
+        )
+
 
 @dataclass(frozen=True)
 class LoginResult:
@@ -106,10 +172,27 @@ class Agent:
     #: What the signed-in user may do on this agent. ``None`` from servers
     #: older than per-agent grants: then the role decides.
     capabilities: frozenset[str] | None = None
+    #: ``"workstation"`` or ``"server"``, once reported.
+    device_kind: str | None = None
+    #: Users signed in to the machine, as last reported. ``None`` if the
+    #: agent (or server) is too old to report them.
+    logged_in_users: tuple[str, ...] | None = None
+    #: The agent's own address (its LAN address behind NAT).
+    local_ip: str | None = None
+    #: The address the server sees it connect from.
+    remote_ip: str | None = None
+    #: One of :data:`CLASSIFICATIONS`: an admin's choice, else from the
+    #: device kind.
+    classification: str = "other"
+    #: What an admin chose, if anything (``None``: derived).
+    classification_override: str | None = None
+    #: Operating system and version, as last reported.
+    os: str | None = None
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Agent:
         caps = d.get("capabilities")
+        users = d.get("logged_in_users")
         return cls(
             id=d["id"],
             hostname=d.get("hostname"),
@@ -127,6 +210,13 @@ class Agent:
             transport=d.get("transport"),
             groups=tuple(d.get("groups") or ()),
             capabilities=frozenset(caps) if caps is not None else None,
+            device_kind=d.get("device_kind"),
+            logged_in_users=tuple(users) if users is not None else None,
+            local_ip=d.get("local_ip"),
+            remote_ip=d.get("remote_ip"),
+            classification=d.get("classification") or derived_classification(d.get("device_kind")),
+            classification_override=d.get("classification_override"),
+            os=d.get("os"),
         )
 
     def allows(self, capability: str, user: User | None) -> bool:
@@ -149,6 +239,12 @@ class Agent:
         return f"{self.hostname} [{self.id.removeprefix('agt-')[:6]}]"
 
 
+def derived_classification(device_kind: str | None) -> str:
+    """What the server derives from a device kind (for older servers that
+    send no classification)."""
+    return {"server": "server", "workstation": "desktop"}.get(device_kind or "", "other")
+
+
 @dataclass(frozen=True)
 class Group:
     """An agent group (members limited to agents the user can see)."""
@@ -165,6 +261,31 @@ class Group:
             name=d["name"],
             description=d.get("description", ""),
             agent_ids=tuple(d.get("agent_ids") or ()),
+        )
+
+
+@dataclass(frozen=True)
+class EnrollmentLink:
+    """A single-use download link for a new agent."""
+
+    token: str
+    expires_at: datetime
+    download_url: str
+    #: Windows only: an MSI that installs and enrolls the agent unattended.
+    msi_url: str | None
+    #: Where the agent connects (``host:port``), and the TLS name it checks.
+    server: str
+    server_name: str
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> EnrollmentLink:
+        return cls(
+            token=d["token"],
+            expires_at=parse_time(d["expires_at"]),  # type: ignore[arg-type]
+            download_url=d["download_url"],
+            msi_url=d.get("msi_url"),
+            server=d.get("server", ""),
+            server_name=d.get("server_name", ""),
         )
 
 
@@ -323,8 +444,149 @@ class ApiClient:
     async def list_agents(self) -> list[Agent]:
         return [Agent.from_json(a) for a in (await self._request("GET", "/api/agents")).json()]
 
+    async def set_classification(self, agent_id: str, classification: str | None) -> str:
+        """Classify an agent (admins only); ``None`` returns it to the
+        derived classification. Returns the one now in effect."""
+        response = await self._request(
+            "PUT",
+            f"/api/agents/{quote(agent_id, safe='')}/classification",
+            json={"classification": classification},
+        )
+        return response.json()["classification"]
+
     async def list_groups(self) -> list[Group]:
         return [Group.from_json(g) for g in (await self._request("GET", "/api/groups")).json()]
+
+    # --- groups -----------------------------------------------------------
+
+    async def create_group(self, name: str, description: str = "") -> Group:
+        response = await self._request(
+            "POST", "/api/groups", json={"name": name, "description": description}
+        )
+        return Group.from_json(response.json())
+
+    async def update_group(self, group_id: int, name: str, description: str) -> Group:
+        response = await self._request(
+            "PATCH", f"/api/groups/{group_id}", json={"name": name, "description": description}
+        )
+        return Group.from_json(response.json())
+
+    async def delete_group(self, group_id: int) -> None:
+        await self._request("DELETE", f"/api/groups/{group_id}")
+
+    async def set_group_members(self, group_id: int, agent_ids: list[str]) -> Group:
+        response = await self._request(
+            "PUT", f"/api/groups/{group_id}/agents", json={"agent_ids": agent_ids}
+        )
+        return Group.from_json(response.json())
+
+    # --- users (admins only) ----------------------------------------------
+
+    async def list_users(self) -> list[User]:
+        return [User.from_json(u) for u in (await self._request("GET", "/api/users")).json()]
+
+    async def create_user(self, username: str, password: str, role: str) -> TotpEnrollment:
+        response = await self._request(
+            "POST", "/api/users", json={"username": username, "password": password, "role": role}
+        )
+        return TotpEnrollment.from_json(response.json())
+
+    async def set_user_role(self, user_id: int, role: str) -> User:
+        response = await self._request("PUT", f"/api/users/{user_id}/role", json={"role": role})
+        return User.from_json(response.json())
+
+    async def set_user_password(self, user_id: int, password: str) -> User:
+        """Also ends the user's sessions (not the one making the change)."""
+        response = await self._request(
+            "PUT", f"/api/users/{user_id}/password", json={"password": password}
+        )
+        return User.from_json(response.json())
+
+    async def reset_user_totp(self, user_id: int) -> TotpEnrollment:
+        """A new secret: the user's old authenticator entry stops working."""
+        response = await self._request("POST", f"/api/users/{user_id}/totp")
+        return TotpEnrollment.from_json(response.json())
+
+    async def delete_user(self, user_id: int) -> None:
+        await self._request("DELETE", f"/api/users/{user_id}")
+
+    async def list_grants(self, user_id: int | None = None) -> list[Grant]:
+        """Everyone's grants, or one user's."""
+        params = {} if user_id is None else {"user_id": user_id}
+        response = await self._request("GET", "/api/grants", params=params)
+        return [Grant.from_json(g) for g in response.json()]
+
+    async def create_grant(
+        self,
+        user_id: int,
+        capabilities: list[str],
+        *,
+        agent_id: str | None = None,
+        group_id: int | None = None,
+    ) -> Grant:
+        """Grant ``capabilities`` on one agent, on a group's members, or
+        (given neither) on every agent."""
+        body: dict[str, Any] = {"user_id": user_id, "capabilities": capabilities}
+        if agent_id is not None:
+            body["agent_id"] = agent_id
+        elif group_id is not None:
+            body["group_id"] = group_id
+        else:
+            body["all_agents"] = True
+        return Grant.from_json((await self._request("POST", "/api/grants", json=body)).json())
+
+    async def delete_grant(self, grant_id: int) -> None:
+        await self._request("DELETE", f"/api/grants/{grant_id}")
+
+    # --- new agents -------------------------------------------------------
+
+    async def create_enrollment_link(
+        self,
+        *,
+        platform: str = "windows-x86_64",
+        ttl_secs: int | None = None,
+        group_ids: list[int] | None = None,
+        server: str | None = None,
+        server_name: str | None = None,
+    ) -> EnrollmentLink:
+        body: dict[str, Any] = {"platform": platform}
+        if ttl_secs is not None:
+            body["ttl_secs"] = ttl_secs
+        if group_ids:
+            body["group_ids"] = group_ids
+        if server:
+            body["server"] = server
+        if server_name:
+            body["server_name"] = server_name
+        response = await self._request("POST", "/api/enrollment-links", json=body)
+        return EnrollmentLink.from_json(response.json())
+
+    async def download(self, url: str, dest: Path) -> int:
+        """Save a download link (its token is in the URL) to ``dest`` via
+        this client's server, whatever host the link names. Returns the
+        size. Written to a temporary file first, so a failed download
+        leaves nothing behind."""
+        parts = urlsplit(url)
+        path = parts.path + (f"?{parts.query}" if parts.query else "")
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            async with self._http.stream("GET", path, timeout=120) as response:
+                if response.is_error:
+                    await response.aread()
+                    raise error_for(response.status_code, _error_message(response))
+                size = 0
+                with tmp.open("wb") as f:
+                    async for chunk in response.aiter_bytes():
+                        f.write(chunk)
+                        size += len(chunk)
+            os.replace(tmp, dest)
+            return size
+        except httpx.HTTPError as e:
+            raise ApiError(0, f"download failed: {e}") from e
+        except OSError as e:
+            raise ApiError(0, f"cannot write {dest}: {e}") from e
+        finally:
+            tmp.unlink(missing_ok=True)
 
     async def create_viewer_session(self, agent_id: str) -> ViewerSession:
         response = await self._request(

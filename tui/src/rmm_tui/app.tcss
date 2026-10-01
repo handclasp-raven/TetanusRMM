@@ -112,3 +112,306 @@ LoginScreen {
     width: 3fr;
     border: round $primary;
 }
+
+#library-controls > Button {
+    width: auto;
+    min-width: 8;
+}
+
+/* --- column menu and new-script dialog ----------------------------------- */
+
+ColumnsScreen, NewScriptScreen, CommandsScreen {
+    align: center middle;
+}
+
+/* Fixed heights, so on a small terminal the list or editor shrinks
+   instead of the buttons being cut off. */
+#columns-box, #new-script-box {
+    width: 64;
+    height: 29;
+    max-height: 100%;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#columns-list {
+    height: 1fr;
+    min-height: 3;
+}
+
+#columns-help {
+    color: $text-muted;
+    margin-top: 1;
+}
+
+#columns-buttons, #new-buttons {
+    height: auto;
+    margin-top: 1;
+    align-horizontal: right;
+}
+
+#columns-buttons > Button, #new-buttons > Button {
+    width: auto;
+    min-width: 6;
+    margin-left: 1;
+}
+
+#new-script-box {
+    width: 80;
+    height: 30;
+}
+
+#new-script-box > Input {
+    margin-top: 1;
+}
+
+#new-body {
+    height: 1fr;
+    min-height: 3;
+    margin-top: 1;
+}
+
+#new-status {
+    height: auto;
+}
+
+/* --- search and group list --------------------------------------------- */
+
+#search {
+    margin: 0 1;
+}
+
+#agent-body {
+    height: 1fr;
+}
+
+#group-pane {
+    width: 28;
+    border-right: vkey $primary;
+}
+
+#group-title {
+    padding: 0 1;
+}
+
+#group-list {
+    height: 1fr;
+    border: none;
+}
+
+#agents {
+    width: 1fr;
+}
+
+/* --- new agent ------------------------------------------------------------ */
+
+#new-agent {
+    padding: 0 2;
+}
+
+#new-agent > Label {
+    margin-top: 1;
+}
+
+#na-intro {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#new-agent > Select, #new-agent > Input {
+    width: 80;
+}
+
+#na-groups {
+    width: 80;
+    height: auto;
+    max-height: 10;
+}
+
+#na-groups-note {
+    color: $text-muted;
+}
+
+#na-actions {
+    height: 3;
+    margin-top: 1;
+}
+
+#na-status {
+    padding: 1 2 0 2;
+}
+
+#na-result {
+    height: auto;
+    margin: 1 0;
+    padding: 0 1;
+    border: round $success;
+}
+
+#na-msi {
+    height: auto;
+}
+
+#na-summary {
+    margin-bottom: 1;
+}
+
+.na-url-row {
+    height: 3;
+}
+
+.na-url {
+    width: 1fr;
+}
+
+.na-url-row > Button {
+    width: auto;
+    min-width: 8;
+}
+
+/* --- groups ----------------------------------------------------------------- */
+
+#groups-table {
+    height: 1fr;
+}
+
+#group-detail {
+    height: 12;
+    border: round $primary;
+    padding: 0 1;
+}
+
+#groups-status {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+ConfirmScreen, GroupEditScreen, MembersScreen, ClassifyScreen, NewUserScreen,
+RoleScreen, PasswordScreen, TotpScreen, GrantsScreen, GrantEditScreen {
+    align: center middle;
+}
+
+.dialog {
+    width: 64;
+    height: auto;
+    max-height: 100%;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+.dialog > Input {
+    margin-top: 1;
+}
+
+#classify-list {
+    height: auto;
+    margin-top: 1;
+}
+
+.dialog-help {
+    color: $text-muted;
+    margin-top: 1;
+}
+
+#members-list {
+    height: auto;
+    max-height: 20;
+    margin-top: 1;
+}
+
+.dialog-buttons {
+    height: auto;
+    margin-top: 1;
+    align-horizontal: right;
+}
+
+.dialog-buttons > Button {
+    width: auto;
+    min-width: 8;
+    margin-left: 1;
+}
+
+/* --- users ------------------------------------------------------------------- */
+
+#users-table {
+    height: 1fr;
+}
+
+#users-status {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+#role-list, #nu-role, #grants-list, #gr-scope {
+    height: auto;
+    max-height: 12;
+    margin-top: 1;
+}
+
+#gr-capabilities {
+    height: auto;
+    margin-top: 1;
+}
+
+#totp-box, #grants-box {
+    width: 90;
+}
+
+/* --- viewer command buttons ------------------------------------------------ */
+
+#commands-box {
+    width: 90;
+    height: 30;
+    max-height: 100%;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#commands-intro, #commands-help {
+    color: $text-muted;
+}
+
+#commands-list {
+    height: 1fr;
+    min-height: 3;
+    margin-top: 1;
+}
+
+#commands-edit {
+    height: 3;
+    margin-top: 1;
+}
+
+#command-label {
+    width: 2fr;
+}
+
+#command-text {
+    width: 3fr;
+}
+
+#commands-edit > Button {
+    width: auto;
+    min-width: 7;
+}
+
+#commands-status {
+    height: auto;
+}
+
+#commands-buttons {
+    height: auto;
+    margin-top: 1;
+    align-horizontal: right;
+}
+
+#commands-buttons > Button {
+    width: auto;
+    min-width: 6;
+    margin-left: 1;
+}

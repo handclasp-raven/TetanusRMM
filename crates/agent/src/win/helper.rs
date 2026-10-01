@@ -216,6 +216,7 @@ async fn pipe_client(
                 IpcMessage::StopCapture => WorkerCommand::Stop,
                 IpcMessage::ForceKeyframe => WorkerCommand::ForceKeyframe,
                 IpcMessage::SetBitrate { bps } => WorkerCommand::SetBitrate(bps),
+                IpcMessage::SetFrameRate { fps } => WorkerCommand::SetFrameRate(fps),
                 other => {
                     debug!(?other, "ignoring message from service");
                     continue;

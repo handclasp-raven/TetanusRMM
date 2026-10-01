@@ -32,6 +32,10 @@ impl TelemetrySource for Fixed {
             uptime_secs: 1000 + n,
         }
     }
+
+    fn signed_in_users(&self) -> Vec<String> {
+        vec!["CORP\\alice".into(), "bob\u{7}".into()]
+    }
 }
 
 #[tokio::test]
@@ -69,7 +73,9 @@ async fn heartbeat_telemetry_is_stored_and_served_by_the_api() {
                 .unwrap()
         }
     };
-    assert!(agents(&api, session.clone()).await[0]["cpu_percent"].is_null());
+    let before = &agents(&api, session.clone()).await[0];
+    assert!(before["cpu_percent"].is_null());
+    assert!(before["logged_in_users"].is_null() && before["remote_ip"].is_null());
 
     let mut config = credential.agent_config(Duration::from_millis(50)).unwrap();
     config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
@@ -91,7 +97,38 @@ async fn heartbeat_telemetry_is_stored_and_served_by_the_api() {
     .await
     .expect("acks");
 
-    let agent = &agents(&api, session).await[0];
+    // Status arrives on its own schedule, right after the server asks.
+    let agent = timeout(Duration::from_secs(10), async {
+        loop {
+            let agent = agents(&api, session.clone()).await.remove(0);
+            if !agent["logged_in_users"].is_null() && !agent["remote_ip"].is_null() {
+                return agent;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("status reported");
+    // Cleaned by the server.
+    assert_eq!(
+        agent["logged_in_users"],
+        serde_json::json!(["CORP\\alice", "bob"])
+    );
+    assert_eq!(agent["local_ip"], "127.0.0.1");
+    assert_eq!(agent["remote_ip"], "127.0.0.1");
+    // This machine's OS, as the agent describes it.
+    assert!(
+        !agent["os"].as_str().expect("os reported").is_empty(),
+        "{agent}"
+    );
+    // No admin has classified it: the reported device kind decides.
+    assert!(agent["classification_override"].is_null());
+    let expected = match agent["device_kind"].as_str() {
+        Some("server") => "server",
+        Some("workstation") => "desktop",
+        _ => "other",
+    };
+    assert_eq!(agent["classification"], expected);
     assert_eq!(agent["id"], credential.agent_id.as_str());
     assert_eq!(agent["cpu_percent"], 42.5);
     assert_eq!(agent["mem_used_bytes"], 6u64 << 30);

@@ -28,7 +28,7 @@ use peer::DirectSettings;
 use protocol::clipboard::{ClipboardData, MAX_CLIPBOARD_BYTES};
 use protocol::e2e::{Control, DirectAnswer, DirectOffer, Envelope, Path};
 use protocol::input::InputEvent;
-use protocol::media::{MediaFrame, MonitorInfo};
+use protocol::media::{FrameRate, MediaFrame, MonitorInfo, StreamSettings, StreamStatus};
 use protocol::{read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -91,6 +91,9 @@ pub enum ViewerEvent {
     Frame(MediaFrame),
     /// The remote user's clipboard changed.
     Clipboard(ClipboardData),
+    /// How the agent streams the video now (agents that support frame-rate
+    /// settings send it after `set_frame_rate`).
+    StreamStatus(StreamStatus),
     /// Video now flows this way (`Relayed` or `Direct`), or a direct
     /// attempt failed (`DirectFailed`: the session stays on the relay).
     Path(Path),
@@ -171,6 +174,13 @@ impl ViewerHandle {
     /// Ask for a keyframe, e.g. after a decode error.
     pub fn request_keyframe(&self) {
         let _ = self.shared.commands.send(Message::RequestKeyframe);
+    }
+
+    /// This technician's frame rate. Sent once on connecting and whenever
+    /// it changes; the agent streams at the fastest any technician wants.
+    pub fn set_frame_rate(&self, frame_rate: FrameRate) {
+        self.shared
+            .send_sealed(&Control::StreamSettings(StreamSettings { frame_rate }));
     }
 
     /// Inject input on the remote machine.
@@ -626,6 +636,15 @@ async fn run(running: Running, early: Vec<Message>) {
                             return;
                         }
                     }
+                    Control::StreamStatus(status) => {
+                        if events
+                            .send(ViewerEvent::StreamStatus(status))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     record @ (Control::DirectAnswer(_) | Control::DirectFailed { .. }) => {
                         let _ = wiring.signals.send(record);
                     }
@@ -758,6 +777,10 @@ fn open(opener: &Opener, inbox: &mut Inbox, envelope: Envelope) -> Vec<Control> 
     }
     match opener.open(nonce, &ciphertext) {
         Ok(record) => inbox.accept(nonce, record, std::time::Instant::now()),
+        Err(e @ peer::E2eError::UnknownRecord(_)) => {
+            debug!("{e}; skipped");
+            inbox.unreadable(nonce, std::time::Instant::now())
+        }
         Err(e) => {
             warn!("sealed record rejected: {e}");
             Vec::new()

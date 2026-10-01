@@ -9,6 +9,7 @@ pub mod e2e;
 pub mod framing;
 pub mod input;
 pub mod ipc;
+pub mod launch;
 pub mod media;
 pub mod script;
 pub mod shell;
@@ -41,7 +42,19 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   see [`e2e`]). Session content is sealed between agent and viewer, so
 ///   a session needs both ends at version 8: the server refuses older
 ///   viewers, and refuses to connect viewers to older agents.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// - 9: agent status (appended variants): the server sends
+///   `EnableStatusReports` to agents at version 9+, which then report
+///   `AgentStatus` (signed-in users, local address, OS, DNS servers, disks)
+///   and again whenever it changes. Agents never send it unasked, so an
+///   older server is not upset. Also `StreamOpen::Launch` (appended
+///   variant): start a program on the signed-in user's desktop.
+pub const PROTOCOL_VERSION: u32 = 9;
+
+/// Oldest agent protocol that reports [`AgentStatus`].
+pub const MIN_STATUS_VERSION: u32 = 9;
+
+/// Oldest agent protocol that serves [`StreamOpen::Launch`].
+pub const MIN_LAUNCH_VERSION: u32 = 9;
 
 /// Oldest agent and viewer protocol with end-to-end encrypted sessions;
 /// the oldest that may take part in a remote-desktop session at all.
@@ -221,6 +234,121 @@ pub enum Message {
     /// metrics and the audit log; `Direct` also stops the relay forwarding
     /// video to this viewer, and `Relayed` restarts it (from a keyframe).
     PathReport(e2e::Path),
+
+    // --- Agent status (Phase 11) ------------------------------------------
+    /// Server to agent (version 9+), after `Hello`: send `AgentStatus` now
+    /// and whenever it changes.
+    EnableStatusReports,
+    /// Agent to server, once enabled: who is signed in and where the agent
+    /// is on its own network. The server cleans it (see
+    /// [`AgentStatus::sanitized`]).
+    AgentStatus(AgentStatus),
+}
+
+/// Most signed-in users an [`AgentStatus`] carries.
+pub const MAX_STATUS_USERS: usize = 32;
+/// Longest user name kept, in bytes.
+pub const MAX_USER_NAME_LEN: usize = 256;
+/// Longest OS description kept, in bytes.
+pub const MAX_OS_LEN: usize = 128;
+/// Most DNS servers an [`AgentStatus`] carries.
+pub const MAX_DNS_SERVERS: usize = 16;
+/// Most disks an [`AgentStatus`] carries.
+pub const MAX_DISKS: usize = 32;
+/// Longest disk name (mount point) kept, in bytes.
+pub const MAX_DISK_NAME_LEN: usize = 128;
+
+/// One mounted disk and how full it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsage {
+    /// Where it is mounted: `C:\` on Windows, `/home` elsewhere.
+    pub name: String,
+    pub total_bytes: u64,
+    /// At most `total_bytes`. Agents round it (see
+    /// [`DiskUsage::rounded`]) so that a busy disk does not make every
+    /// status check a change worth reporting.
+    pub used_bytes: u64,
+}
+
+impl DiskUsage {
+    /// `used_bytes` rounded down to a thousandth of the disk (0.1%).
+    pub fn rounded(mut self) -> DiskUsage {
+        let step = (self.total_bytes / 1000).max(1);
+        self.used_bytes = self.used_bytes.min(self.total_bytes) / step * step;
+        self
+    }
+}
+
+/// An agent's state beyond telemetry, shown to technicians.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentStatus {
+    /// Users signed in to the machine's interactive sessions (console or
+    /// remote desktop), e.g. `CORP\alice`, without duplicates.
+    pub users: Vec<String>,
+    /// The agent's own address on its route to the server: its LAN
+    /// address when it is behind NAT.
+    pub local_ip: Option<std::net::IpAddr>,
+    /// Operating system name and version, e.g. `Windows 11 Pro (build
+    /// 26100)`. `None` if the agent cannot tell.
+    pub os: Option<String>,
+    /// DNS servers configured on the machine's active network adapters, in
+    /// the order they are used, without duplicates.
+    pub dns_servers: Vec<std::net::IpAddr>,
+    /// Fixed disks (not network or removable media).
+    pub disks: Vec<DiskUsage>,
+}
+
+impl AgentStatus {
+    /// Fit for display and storage: user names cleaned like hostnames,
+    /// cut to [`MAX_USER_NAME_LEN`], de-duplicated, at most
+    /// [`MAX_STATUS_USERS`] of them; the OS cleaned the same way, cut to
+    /// [`MAX_OS_LEN`]; at most [`MAX_DNS_SERVERS`] distinct DNS servers; at
+    /// most [`MAX_DISKS`] disks with names cleaned and used space no more
+    /// than the total.
+    pub fn sanitized(&self) -> AgentStatus {
+        let mut users: Vec<String> = Vec::new();
+        for user in &self.users {
+            if users.len() == MAX_STATUS_USERS {
+                break;
+            }
+            if let Some(user) = clean_for_display(user, MAX_USER_NAME_LEN) {
+                if !users.contains(&user) {
+                    users.push(user);
+                }
+            }
+        }
+        let mut dns_servers = Vec::new();
+        for ip in &self.dns_servers {
+            if dns_servers.len() == MAX_DNS_SERVERS {
+                break;
+            }
+            if !dns_servers.contains(ip) {
+                dns_servers.push(*ip);
+            }
+        }
+        let disks = self
+            .disks
+            .iter()
+            .filter_map(|d| {
+                Some(DiskUsage {
+                    name: clean_for_display(&d.name, MAX_DISK_NAME_LEN)?,
+                    total_bytes: d.total_bytes,
+                    used_bytes: d.used_bytes.min(d.total_bytes),
+                })
+            })
+            .take(MAX_DISKS)
+            .collect();
+        AgentStatus {
+            users,
+            local_ip: self.local_ip,
+            os: self
+                .os
+                .as_deref()
+                .and_then(|os| clean_for_display(os, MAX_OS_LEN)),
+            dns_servers,
+            disks,
+        }
+    }
 }
 
 /// Longest hostname the server stores, in bytes (the DNS limit).
@@ -230,10 +358,14 @@ pub const MAX_HOSTNAME_LEN: usize = 253;
 /// whitespace trimmed, cut to [`MAX_HOSTNAME_LEN`] bytes on a character
 /// boundary. `None` if nothing is left.
 pub fn sanitize_hostname(raw: &str) -> Option<String> {
+    clean_for_display(raw, MAX_HOSTNAME_LEN)
+}
+
+fn clean_for_display(raw: &str, max_len: usize) -> Option<String> {
     let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
     let mut name = cleaned.trim();
-    if name.len() > MAX_HOSTNAME_LEN {
-        let mut end = MAX_HOSTNAME_LEN;
+    if name.len() > max_len {
+        let mut end = max_len;
         while !name.is_char_boundary(end) {
             end -= 1;
         }
@@ -245,7 +377,7 @@ pub fn sanitize_hostname(raw: &str) -> Option<String> {
 /// First frame on a bidirectional stream the **server** opens to an agent.
 /// Each remote operation gets its own stream, so a large file transfer never
 /// delays a shell or the control stream. What follows depends on the kind:
-/// see [`shell`], [`script`] and [`transfer`].
+/// see [`shell`], [`script`], [`transfer`] and [`launch`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamOpen {
     /// Interactive PowerShell on a pseudoconsole of this size.
@@ -256,6 +388,9 @@ pub enum StreamOpen {
     Upload(transfer::UploadRequest),
     /// Read a file from the agent. `path` is absolute.
     Download { path: String },
+    /// Start a program on the signed-in user's desktop, as that user
+    /// (version 9+); the agent replies with one [`launch::LaunchReply`].
+    Launch(launch::LaunchRequest),
 }
 
 /// Agent health sample, sent on each heartbeat.
@@ -413,5 +548,107 @@ mod tests {
         assert!(cut.len() <= MAX_HOSTNAME_LEN);
         assert_eq!(cut.len(), 252);
         assert!(cut.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn agent_status_round_trips_and_is_cleaned() {
+        let status = AgentStatus {
+            users: vec![
+                " CORP\\alice\r\n".into(),
+                "CORP\\alice".into(),
+                "".into(),
+                "bob".into(),
+                "x".repeat(300),
+            ],
+            local_ip: Some("192.168.1.20".parse().unwrap()),
+            os: Some(" Windows 11 Pro\n".into()),
+            dns_servers: vec![
+                "192.168.1.1".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                "192.168.1.1".parse().unwrap(),
+            ],
+            disks: vec![
+                DiskUsage {
+                    name: "C:\\".into(),
+                    total_bytes: 500,
+                    used_bytes: 200,
+                },
+                DiskUsage {
+                    name: " \n".into(),
+                    total_bytes: 1,
+                    used_bytes: 1,
+                },
+                DiskUsage {
+                    name: "D:\\".into(),
+                    total_bytes: 100,
+                    used_bytes: 900,
+                },
+            ],
+        };
+        let msg = Message::AgentStatus(status.clone());
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+
+        let clean = status.sanitized();
+        assert_eq!(clean.users.len(), 3);
+        assert_eq!(clean.users[..2], ["CORP\\alice", "bob"]);
+        assert_eq!(clean.users[2].len(), MAX_USER_NAME_LEN);
+        assert_eq!(clean.local_ip, status.local_ip);
+        assert_eq!(clean.os.as_deref(), Some("Windows 11 Pro"));
+        assert_eq!(clean.dns_servers, status.dns_servers[..2]);
+        // Nameless disks are dropped; used never exceeds total.
+        assert_eq!(
+            clean.disks,
+            [
+                DiskUsage {
+                    name: "C:\\".into(),
+                    total_bytes: 500,
+                    used_bytes: 200
+                },
+                DiskUsage {
+                    name: "D:\\".into(),
+                    total_bytes: 100,
+                    used_bytes: 100
+                },
+            ]
+        );
+        let long_os = AgentStatus {
+            os: Some("y".repeat(500)),
+            ..Default::default()
+        };
+        assert_eq!(long_os.sanitized().os.unwrap().len(), MAX_OS_LEN);
+        let blank_os = AgentStatus {
+            os: Some(" \t".into()),
+            ..Default::default()
+        };
+        assert_eq!(blank_os.sanitized().os, None);
+
+        let many = AgentStatus {
+            users: (0..100).map(|i| format!("u{i}")).collect(),
+            ..Default::default()
+        };
+        assert_eq!(many.sanitized().users.len(), MAX_STATUS_USERS);
+    }
+
+    #[test]
+    fn disk_usage_rounds_to_a_thousandth() {
+        let disk = |total, used| DiskUsage {
+            name: "C:\\".into(),
+            total_bytes: total,
+            used_bytes: used,
+        };
+        // 500 GB: steps of 0.5 GB, so a few MB written change nothing.
+        let gb = 1_000_000_000u64;
+        assert_eq!(
+            disk(500 * gb, 123 * gb + 7_000_000).rounded().used_bytes,
+            123 * gb
+        );
+        assert_eq!(
+            disk(500 * gb, 123 * gb + gb / 2).rounded().used_bytes,
+            123 * gb + gb / 2
+        );
+        // Tiny and odd disks.
+        assert_eq!(disk(10, 7).rounded().used_bytes, 7);
+        assert_eq!(disk(0, 5).rounded().used_bytes, 0);
     }
 }

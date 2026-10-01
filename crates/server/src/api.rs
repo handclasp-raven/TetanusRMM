@@ -8,10 +8,13 @@
 //! | POST   | /api/auth/logout            | session         |
 //! | GET    | /api/me                     | session         |
 //! | GET    | /api/agents                 | session (engineers: granted agents only) |
+//! | GET    | /api/agents/{id}            | session (agent visible to the user) |
 //! | GET    | /api/audit?limit=           | session (admin, auditor) |
 //! | GET    | /api/audit/verify           | session (admin, auditor) |
 //! | GET    | /api/agents/{id}/policy     | session (agent visible to the user) |
 //! | PUT    | /api/agents/{id}/policy     | session (admin) |
+//! | PUT    | /api/agents/{id}/classification | session (admin) |
+//! | POST   | /api/agents/{id}/launch     | `desktop` on the agent |
 //! | POST   | /api/enrollment-links       | session (admin, support_engineer; `group_ids` admin only) |
 //! | POST   | /api/agents/{id}/viewer-sessions | `desktop` on the agent |
 //! | GET    | /api/agents/{id}/shell?cols=&rows= | `shell` on the agent; WebSocket |
@@ -21,6 +24,8 @@
 //! | GET    | /api/users                  | session (admin) |
 //! | POST   | /api/users                  | session (admin) |
 //! | PUT    | /api/users/{id}/role        | session (admin) |
+//! | PUT    | /api/users/{id}/password    | session (admin) |
+//! | POST   | /api/users/{id}/totp        | session (admin) |
 //! | DELETE | /api/users/{id}             | session (admin) |
 //! | GET    | /api/grants?user_id=        | session (admin; anyone for their own) |
 //! | POST   | /api/grants                 | session (admin) |
@@ -57,7 +62,7 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use protocol::shell::TermSize;
@@ -88,6 +93,9 @@ pub struct AppState {
     pub updates_dir: PathBuf,
     /// The media relay, to report whether an agent is online.
     pub hub: Option<Arc<crate::relay::Hub>>,
+    /// PEM CA certificate agents must trust (it signed the server's
+    /// certificate), packaged into MSIs.
+    pub server_ca_pem: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -98,9 +106,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/agents", get(list_agents))
+        .route("/api/agents/{id}", get(get_agent))
+        .route("/api/agents/{id}/launch", post(launch_command))
         .route("/api/audit", get(list_audit))
         .route("/api/audit/verify", get(verify_audit))
         .route("/api/agents/{id}/policy", get(get_policy).put(put_policy))
+        .route("/api/agents/{id}/classification", put(put_classification))
         .route("/api/enrollment-links", post(create_enrollment_link))
         .route(
             "/api/agents/{id}/viewer-sessions",
@@ -115,6 +126,7 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/download/{platform}", get(download_agent))
+        .route("/api/download/{platform}/msi", get(download_msi))
         .route("/api/updates/{platform}/manifest", get(update_manifest))
         .route("/api/updates/{platform}/binary", get(update_binary))
         .route("/api/updates/{platform}/signature", get(update_signature))
@@ -190,7 +202,9 @@ impl From<RemoteError> for ApiError {
             RemoteError::Forbidden => return ApiError::Forbidden,
             RemoteError::Db(e) => return ApiError::Internal(e.to_string()),
             RemoteError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            RemoteError::AgentOffline | RemoteError::Unsupported => StatusCode::CONFLICT,
+            RemoteError::AgentOffline | RemoteError::Unsupported | RemoteError::NoUser => {
+                StatusCode::CONFLICT
+            }
             RemoteError::Agent { kind, .. } => match kind {
                 ErrorKind::InvalidPath => StatusCode::BAD_REQUEST,
                 ErrorKind::NotFound => StatusCode::NOT_FOUND,
@@ -350,6 +364,9 @@ struct AgentView {
     shell_sessions: usize,
     /// Names of the groups it is in.
     groups: Vec<String>,
+    /// Server, desktop or other: an admin's choice
+    /// (`classification_override`), else from the reported device kind.
+    classification: registry::Classification,
     /// What the requesting user may do on it.
     capabilities: Vec<crate::users::Capability>,
 }
@@ -368,19 +385,75 @@ async fn list_agents(
             .into_iter()
             .filter(|agent| visibility.sees(&agent.id))
             .map(|agent| {
-                let link = state.hub.as_ref().and_then(|hub| hub.get(&agent.id));
-                AgentView {
-                    groups: groups.remove(&agent.id).unwrap_or_default(),
-                    capabilities: visibility.capabilities(&agent.id).into_iter().collect(),
-                    online: link.is_some(),
-                    transport: link.as_ref().and_then(|l| l.transport()),
-                    viewer_sessions: link.as_ref().map_or(0, |l| l.viewers()),
-                    shell_sessions: link.as_ref().map_or(0, |l| l.shells()),
-                    agent,
-                }
+                let groups = groups.remove(&agent.id).unwrap_or_default();
+                agent_view(&state, &visibility, agent, groups)
             })
             .collect(),
     ))
+}
+
+fn agent_view(
+    state: &AppState,
+    visibility: &access::Visibility,
+    agent: Agent,
+    groups: Vec<String>,
+) -> AgentView {
+    let link = state.hub.as_ref().and_then(|hub| hub.get(&agent.id));
+    AgentView {
+        groups,
+        classification: agent.effective_classification(),
+        capabilities: visibility.capabilities(&agent.id).into_iter().collect(),
+        online: link.is_some(),
+        transport: link.as_ref().and_then(|l| l.transport()),
+        viewer_sessions: link.as_ref().map_or(0, |l| l.viewers()),
+        shell_sessions: link.as_ref().map_or(0, |l| l.shells()),
+        agent,
+    }
+}
+
+/// One agent, as listed by `GET /api/agents` (the viewer's status panel).
+async fn get_agent(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentView>, ApiError> {
+    let visibility = access::visibility(&state.pool, &session.user).await?;
+    // Agents the user cannot see do not exist, as far as they know.
+    if !visibility.sees(&agent_id) {
+        return Err(ApiError::NotFound);
+    }
+    let agent = registry::get_agent(&state.pool, &agent_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let groups = crate::groups::names_by_agent(&state.pool)
+        .await?
+        .remove(&agent_id)
+        .unwrap_or_default();
+    Ok(Json(agent_view(&state, &visibility, agent, groups)))
+}
+
+#[derive(Deserialize)]
+struct LaunchBody {
+    /// As typed at a Run prompt: `cmd`, `ncpa.cpl`, `mstsc /v:srv01`.
+    command: String,
+}
+
+/// Start a program on the agent's desktop, as the signed-in user.
+async fn launch_command(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+    Json(body): Json<LaunchBody>,
+) -> Result<Json<remote::launch::Launched>, ApiError> {
+    let launched = remote::launch::launch(
+        &state.pool,
+        hub(&state)?,
+        &session.user,
+        &agent_id,
+        &body.command,
+    )
+    .await?;
+    Ok(Json(launched))
 }
 
 #[derive(Deserialize)]
@@ -456,6 +529,42 @@ async fn put_policy(
 }
 
 #[derive(Deserialize)]
+struct ClassificationRequest {
+    /// `null` returns the agent to its derived classification.
+    classification: Option<registry::Classification>,
+}
+
+#[derive(Serialize)]
+struct ClassificationResponse {
+    /// In effect now.
+    classification: registry::Classification,
+    /// What the admin chose, if anything.
+    classification_override: Option<registry::Classification>,
+}
+
+/// Classify an agent as a server, a desktop or other (admins only).
+async fn put_classification(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+    Json(request): Json<ClassificationRequest>,
+) -> Result<Json<ClassificationResponse>, ApiError> {
+    rbac::require_admin(&state.pool, &session.user, "agent_classify").await?;
+    let classification = registry::set_classification(
+        &state.pool,
+        &session.user.username,
+        &agent_id,
+        request.classification,
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    Ok(Json(ClassificationResponse {
+        classification,
+        classification_override: request.classification,
+    }))
+}
+
+#[derive(Deserialize)]
 struct EnrollmentLinkRequest {
     /// Token lifetime; defaults to 24 h, capped at 7 days.
     ttl_secs: Option<u64>,
@@ -464,6 +573,12 @@ struct EnrollmentLinkRequest {
     /// Groups the agent joins when it enrolls (admins only).
     #[serde(default)]
     group_ids: Vec<i64>,
+    /// Where an agent installed from the MSI connects: QUIC `host:port`.
+    /// Defaults to this server's public host on port 4433.
+    server: Option<String>,
+    /// Name the server certificate must be valid for. Defaults to the
+    /// host of `server` if it is a name, else this server's public host.
+    server_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -471,6 +586,75 @@ struct EnrollmentLinkResponse {
     token: String,
     expires_at: DateTime<Utc>,
     download_url: String,
+    /// Windows only: an MSI that installs and enrolls the agent unattended.
+    msi_url: Option<String>,
+    /// What the MSI's agent connects to.
+    server: String,
+    server_name: String,
+}
+
+/// QUIC port agents use unless told otherwise.
+const DEFAULT_AGENT_PORT: u16 = 4433;
+
+/// The platform whose builds can be packaged as an MSI.
+const MSI_PLATFORM: &str = "windows-x86_64";
+
+/// The host part of this server's public URL.
+fn public_host(public_url: &str) -> String {
+    public_url
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_owned))
+        .unwrap_or_else(|| "localhost".into())
+}
+
+/// The link's install target: the request's, checked, with defaults.
+fn install_target(
+    public_url: &str,
+    server: Option<&str>,
+    server_name: Option<&str>,
+) -> Result<enroll::InstallTarget, ApiError> {
+    let public = public_host(public_url);
+    let server = match server.map(str::trim) {
+        Some(server) if !server.is_empty() => server.to_owned(),
+        _ => {
+            let host = if public.contains(':') && !public.starts_with('[') {
+                format!("[{public}]")
+            } else {
+                public.clone()
+            };
+            format!("{host}:{DEFAULT_AGENT_PORT}")
+        }
+    };
+    if !crate::msi::valid_host_port(&server) {
+        return Err(ApiError::BadRequest(
+            "server must be host:port (e.g. rmm.example.com:4433)".into(),
+        ));
+    }
+    let server_name = match server_name.map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => {
+            let (host, _) = server.rsplit_once(':').expect("checked above");
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                public
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned()
+            } else {
+                host.to_owned()
+            }
+        }
+    };
+    if !crate::msi::valid_host(&server_name) {
+        return Err(ApiError::BadRequest(
+            "server_name must be a host name or IP address".into(),
+        ));
+    }
+    Ok(enroll::InstallTarget {
+        server,
+        server_name,
+    })
 }
 
 async fn create_enrollment_link(
@@ -504,16 +688,27 @@ async fn create_enrollment_link(
             .await
             .map_err(rbac::group_error)?;
     }
-    let minted =
-        enroll::create_token_in_groups(&state.pool, &session.user.username, ttl, &req.group_ids)
-            .await?;
+    let install = install_target(
+        &state.public_url,
+        req.server.as_deref(),
+        req.server_name.as_deref(),
+    )?;
+    let minted = enroll::create_link_token(
+        &state.pool,
+        &session.user.username,
+        ttl,
+        &req.group_ids,
+        Some(&install),
+    )
+    .await?;
+    let base = format!("{}/api/download/{platform}", state.public_url);
     Ok(Json(EnrollmentLinkResponse {
-        download_url: format!(
-            "{}/api/download/{platform}?token={}",
-            state.public_url, minted.token
-        ),
+        download_url: format!("{base}?token={}", minted.token),
+        msi_url: (platform == MSI_PLATFORM).then(|| format!("{base}/msi?token={}", minted.token)),
         token: minted.token,
         expires_at: minted.expires_at,
+        server: install.server,
+        server_name: install.server_name,
     }))
 }
 
@@ -547,6 +742,65 @@ async fn download_agent(
             .expect("valid header"),
     );
     Ok(resp)
+}
+
+/// The latest Windows agent build as an MSI that installs and enrolls it
+/// unattended (see `crate::msi`). Like [`download_agent`], needs a usable
+/// enrollment token and does not consume it.
+async fn download_msi(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    Query(query): Query<DownloadQuery>,
+) -> Result<Response, ApiError> {
+    let Some(install) = enroll::usable_install_target(&state.pool, &query.token).await? else {
+        return Err(ApiError::Unauthorized(
+            "download link is invalid or expired",
+        ));
+    };
+    if platform != MSI_PLATFORM {
+        return Err(ApiError::NotFound);
+    }
+    // Links made before install targets existed get the defaults.
+    let install = match install {
+        Some(install) => install,
+        None => install_target(&state.public_url, None, None)?,
+    };
+    let manifest = updates::load_manifest(&state.updates_dir, &platform)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    let binary = tokio::fs::read(state.updates_dir.join(&platform).join(updates::BINARY_FILE))
+        .await
+        .map_err(|e| ApiError::Internal(format!("reading the agent build: {e}")))?;
+    let ca_pem = state.server_ca_pem.clone();
+    let token = query.token;
+    let version = manifest.version.clone();
+    let msi = tokio::task::spawn_blocking(move || {
+        crate::msi::build(&crate::msi::MsiConfig {
+            agent_exe: &binary,
+            version: &version,
+            ca_pem: &ca_pem,
+            server: &install.server,
+            server_name: &install.server_name,
+            token: &token,
+        })
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(format!("building the MSI: {e}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-msi".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"rmm-agent-{}.msi\"",
+                    manifest.version
+                ),
+            ),
+        ],
+        msi,
+    )
+        .into_response())
 }
 
 async fn update_manifest(

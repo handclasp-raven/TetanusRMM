@@ -11,6 +11,7 @@ from . import config as config_mod
 from .api import ApiClient, ApiError
 from .auth import SessionManager, TokenStore
 from .scripts import ScriptLibrary
+from .state import UiState
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -28,19 +29,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_config(args: argparse.Namespace, state: UiState) -> config_mod.Config:
+    """The config file, overridden by flags. The server is ``--server-url``
+    if given, else the one signed in to last time, else the file's."""
+    config = config_mod.load(args.config).with_overrides(
+        ca_path=args.ca_path.resolve() if args.ca_path else None,
+        viewer_path=args.viewer_path,
+        quic_addr=args.quic_addr,
+    )
+    if args.server_url:
+        return config.with_overrides(server_url=args.server_url)
+    if state.last_server:
+        try:
+            return config.for_server(config_mod.normalize_server_url(state.last_server))
+        except config_mod.ConfigError:
+            pass  # a hand-edited state file: ignore it
+    return config
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    log_dir = config_mod.data_dir()
+    state = UiState.load(log_dir / "state.json")
     try:
-        config = config_mod.load(args.config).with_overrides(
-            server_url=args.server_url,
-            ca_path=args.ca_path.resolve() if args.ca_path else None,
-            viewer_path=args.viewer_path,
-            quic_addr=args.quic_addr,
-        )
+        config = resolve_config(args, state)
     except config_mod.ConfigError as e:
         sys.exit(f"rmm-tui: {e}")
 
-    log_dir = config_mod.data_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     # Never log to the terminal: it belongs to the TUI.
     logging.basicConfig(
@@ -66,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
         session=SessionManager(api, store),
         library=ScriptLibrary(config.scripts_path),
         log_dir=log_dir,
+        state=state,
     )
     try:
         app.run()

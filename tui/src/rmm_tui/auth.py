@@ -41,6 +41,10 @@ class TokenStore:
         self.key = server_url.rstrip("/")
         self._backend = backend
 
+    def for_server(self, server_url: str) -> TokenStore:
+        """The store for another server, in the same keyring."""
+        return TokenStore(server_url, self._backend)
+
     def load(self) -> StoredSession | None:
         """The saved session, or ``None`` if there is none, it is unreadable,
         or the keyring is unavailable."""
@@ -134,6 +138,15 @@ class SessionManager:
             raise
         self.user = user
         return user
+
+    def switch_server(self, api: ApiClient) -> ApiClient:
+        """Talk to another server from now on, signed out (its saved
+        session is untouched). Returns the old client, for the caller to
+        close."""
+        old, self.api = self.api, api
+        self.store = self.store.for_server(api.base_url)
+        self.user = None
+        return old
 
     async def login(self, username: str, password: str, code: str) -> User:
         result = await self.api.login(username, password, code)

@@ -32,6 +32,9 @@ struct State {
     monitor: Option<u32>,
     /// Adaptive-bitrate target, if lowered (cleared by a stop).
     bitrate: Option<u32>,
+    /// Frame rate, once set (kept across stops: the next stream starts at
+    /// the rate the technicians asked for).
+    frame_rate: Option<u32>,
     /// A frame was dropped here; ask the helper for a keyframe (once).
     resync_requested: bool,
     /// Who is connected, for the tray.
@@ -99,6 +102,10 @@ impl Bridge {
                 state.bitrate = Some(bps);
                 IpcMessage::SetBitrate { bps }
             }
+            MediaCommand::SetFrameRate(fps) => {
+                state.frame_rate = Some(fps);
+                IpcMessage::SetFrameRate { fps }
+            }
         };
         if let Some(helper) = &state.helper {
             let _ = helper.send(message);
@@ -158,6 +165,9 @@ impl Bridge {
         let _ = helper.send(IpcMessage::ListMonitors);
         if let Some(bps) = state.bitrate {
             let _ = helper.send(IpcMessage::SetBitrate { bps });
+        }
+        if let Some(fps) = state.frame_rate {
+            let _ = helper.send(IpcMessage::SetFrameRate { fps });
         }
         if let Some(monitor) = state.monitor {
             let _ = helper.send(IpcMessage::StartCapture { monitor });

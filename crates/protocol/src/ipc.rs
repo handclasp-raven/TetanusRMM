@@ -68,6 +68,9 @@ pub enum IpcMessage {
     /// Service to helper: encode at (at most) this many bits per second,
     /// from now on and for streams started later (adaptive bitrate).
     SetBitrate { bps: u32 },
+    /// Service to helper: capture at most this many frames a second, from
+    /// now on and for streams started later.
+    SetFrameRate { fps: u32 },
 }
 
 /// An encoded video frame from the helper.
@@ -181,6 +184,7 @@ mod tests {
             IpcMessage::Clipboard(ClipboardData::Files(vec![r"C:\a".into()])),
             IpcMessage::KillSwitch,
             IpcMessage::SetBitrate { bps: 1_500_000 },
+            IpcMessage::SetFrameRate { fps: 60 },
         ];
         let mut buf = Vec::new();
         for m in &msgs {

@@ -4,6 +4,7 @@ WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 
 # Plain build (no BuildKit cache mounts) so it works with any Docker builder.
 RUN cargo build --release --locked -p server \
