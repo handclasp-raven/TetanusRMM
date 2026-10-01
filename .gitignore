@@ -8,3 +8,7 @@
 /tui/build
 __pycache__/
 *.egg-info/
+
+# Local-only: personal smoke script and Claude Code settings
+/test.sh
+/.claude/
