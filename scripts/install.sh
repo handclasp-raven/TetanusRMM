@@ -2,7 +2,7 @@
 # Install the TetanusRMM server on a Linux host, from nothing to a running server
 # with published agent and viewer builds.
 #
-#   curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/TetanusRMM/main/scripts/install.sh -o install.sh
+#   curl -fsSL https://raw.githubusercontent.com/handclasp-raven/TetanusRMM/main/scripts/install.sh -o install.sh
 #   bash install.sh --host rmm.example.com
 #
 # or, from a checkout: scripts/install.sh --host rmm.example.com
@@ -36,7 +36,7 @@
 # RMM_ADMIN_PASSWORD sets the admin password without a prompt.
 set -euo pipefail
 
-REPO=${RMM_REPO:-https://github.com/CHANGE-ME/TetanusRMM.git}
+REPO=${RMM_REPO:-https://github.com/handclasp-raven/TetanusRMM.git}
 BRANCH=${RMM_BRANCH:-}
 DIR=${RMM_DIR:-}
 HOST=${RMM_HOST:-}
@@ -138,9 +138,6 @@ fetch_source() {
             say "Updating $DIR"
             git -C "$DIR" pull --ff-only
         else
-            case $REPO in *CHANGE-ME*)
-                die "no repository to clone: pass --repo URL (or set RMM_REPO)" ;;
-            esac
             say "Cloning $REPO into $DIR"
             git clone ${BRANCH:+--branch "$BRANCH"} "$REPO" "$DIR"
         fi

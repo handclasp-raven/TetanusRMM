@@ -77,8 +77,8 @@ they are missing (asking first), and needs no Rust or Python: everything is
 built in containers.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/TetanusRMM/main/scripts/install.sh -o install.sh
-bash install.sh --repo https://github.com/CHANGE-ME/TetanusRMM.git --host rmm.example.com
+curl -fsSL https://raw.githubusercontent.com/handclasp-raven/TetanusRMM/main/scripts/install.sh -o install.sh
+bash install.sh --host rmm.example.com
 ```
 
 Run it as root, or as a user in the `docker` group. From a checkout, run
@@ -130,7 +130,7 @@ These are the script's steps. They need Docker (with the Compose plugin)
 and git on the host, and nothing else. `HOST` is the name or IP from above.
 
 ```sh
-git clone https://github.com/CHANGE-ME/TetanusRMM.git tetanusrmm && cd tetanusrmm
+git clone https://github.com/handclasp-raven/TetanusRMM.git tetanusrmm && cd tetanusrmm
 HOST=rmm.example.com
 ```
 
