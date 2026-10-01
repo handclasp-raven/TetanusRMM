@@ -124,7 +124,7 @@ def build_command(
     # The certificate is checked against the name, not the address.
     server_name = host if config.quic_addr else config.api_host
     argv = [
-        config.viewer_path,
+        config.viewer_path or "viewer",
         "--server",
         addr,
         "--server-name",

@@ -289,7 +289,7 @@ ColumnsScreen, NewScriptScreen, CommandsScreen {
 }
 
 ConfirmScreen, GroupEditScreen, MembersScreen, ClassifyScreen, NewUserScreen,
-RoleScreen, PasswordScreen, TotpScreen, GrantsScreen, GrantEditScreen {
+RoleScreen, PasswordScreen, TotpScreen, GrantsScreen, GrantEditScreen, TrustScreen {
     align: center middle;
 }
 
@@ -309,6 +309,14 @@ RoleScreen, PasswordScreen, TotpScreen, GrantsScreen, GrantEditScreen {
 #classify-list {
     height: auto;
     margin-top: 1;
+}
+
+.dialog-text, #trust-fingerprint {
+    margin-top: 1;
+}
+
+#trust-fingerprint {
+    text-align: center;
 }
 
 .dialog-help {

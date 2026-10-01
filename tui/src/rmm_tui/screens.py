@@ -36,9 +36,11 @@ from .api import (
     ApiError,
     Forbidden,
     Unauthorized,
+    UntrustedServer,
     derived_classification,
 )
 from .config import ConfigError, normalize_server_url
+from .trust import fingerprint
 from .viewer import FONT_FILE, ViewerError, build_command
 
 if TYPE_CHECKING:
@@ -48,6 +50,57 @@ if TYPE_CHECKING:
 class SplashScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Static("Connecting…", id="splash")
+
+
+class TrustScreen(ModalScreen[bool]):
+    """First contact with a server whose certificate is signed by its own
+    CA: show the CA's fingerprint and ask whether to trust it. Dismissed
+    with ``True`` to trust it."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, server_url: str, ca_fingerprint: str) -> None:
+        super().__init__()
+        self.server_url = server_url
+        self.ca_fingerprint = ca_fingerprint
+
+    def compose(self) -> ComposeResult:
+        pairs = self.ca_fingerprint.split(":")
+        half = len(pairs) // 2
+        with Vertical(classes="dialog", id="trust-box"):
+            yield Static(Text("Trust this server?", style="bold"))
+            yield Static(
+                Text(
+                    f"{self.server_url} uses its own certificate authority, which this "
+                    "computer has not seen before. Its SHA-256 fingerprint is:"
+                ),
+                classes="dialog-text",
+            )
+            yield Static(
+                Text(":".join(pairs[:half]) + "\n" + ":".join(pairs[half:]), style="bold"),
+                id="trust-fingerprint",
+            )
+            yield Static(
+                Text(
+                    "Check it against the fingerprint from your administrator. Once "
+                    "trusted, you are not asked again for this server."
+                ),
+                classes="dialog-text",
+            )
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Trust", variant="primary", id="trust")
+
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
+    @on(Button.Pressed, "#trust")
+    def trust(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class LoginScreen(Screen):
@@ -112,7 +165,12 @@ class LoginScreen(Screen):
     async def sign_in(self, server_url: str, username: str, password: str, code: str) -> None:
         try:
             await self.app.use_server(server_url)
-            await self.app.session.login(username, password, code)
+            try:
+                await self.app.session.login(username, password, code)
+            except UntrustedServer as e:
+                # Nothing was sent: the TLS handshake failed first.
+                await self.accept_ca(server_url, e)
+                await self.app.session.login(username, password, code)
         except ApiError as e:
             self.set_status(e.message)
             self.query_one("#code", Input).value = ""
@@ -126,6 +184,26 @@ class LoginScreen(Screen):
             )
         self.app.remember_server()
         self.app.show_main()
+
+    async def accept_ca(self, server_url: str, error: UntrustedServer) -> None:
+        """Offer to trust the server's CA, on first contact only. Returns
+        once it is trusted; raises :class:`ApiError` otherwise."""
+        if self.app.config.ca_path is not None:
+            raise ApiError(0, f"{error.message} (checked against {self.app.config.ca_path})")
+        if self.app.trust.pinned(server_url) is not None:
+            raise ApiError(
+                0,
+                "The server's certificate no longer matches the one you trusted. If an "
+                "administrator confirms its certificates were replaced, run "
+                f"`rmm-tui --forget-ca --server-url {server_url}` and sign in again. "
+                "Otherwise the connection may be being intercepted.",
+            )
+        self.set_status("Checking the server's certificate…")
+        pem = await self.app.fetch_ca(server_url)
+        if not await self.app.push_screen_wait(TrustScreen(server_url, fingerprint(pem))):
+            raise ApiError(0, "Not signed in: the server's certificate was not trusted.")
+        await self.app.trust_server(server_url, pem)
+        self.set_status("Signing in…")
 
 
 class ColumnsScreen(ModalScreen[list[str] | None]):
@@ -556,7 +634,7 @@ class MainScreen(Screen):
                 self.app.notify(f"{agent.label} went offline.", severity="error")
                 return
             command = build_command(
-                self.app.config,
+                await self.app.viewer_config(),
                 session,
                 api_token=self.app.session.api.token,
                 commands=self.app.state.commands,

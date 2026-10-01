@@ -64,6 +64,22 @@ class Forbidden(ApiError):
     """403: the user's role does not allow this (the server audits it)."""
 
 
+class UntrustedServer(ApiError):
+    """The server's certificate did not verify (status 0): it is signed by
+    a CA this client does not trust, or is not valid for the host."""
+
+
+def cert_failure(error: BaseException) -> str | None:
+    """Why the server's certificate failed verification, if that is what
+    ``error`` was (e.g. "unable to get local issuer certificate")."""
+    seen: BaseException | None = error
+    while seen is not None:
+        if isinstance(seen, ssl.SSLCertVerificationError):
+            return getattr(seen, "verify_message", None) or str(seen)
+        seen = seen.__cause__ or seen.__context__
+    return None
+
+
 def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -309,6 +325,25 @@ class ViewerSession:
 
 
 @dataclass(frozen=True)
+class ViewerBuild:
+    """The viewer build the server publishes for a platform."""
+
+    platform: str
+    version: str
+    sha256: str
+    size: int
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> ViewerBuild:
+        return cls(
+            platform=d["platform"],
+            version=d["version"],
+            sha256=d["sha256"],
+            size=int(d["size"]),
+        )
+
+
+@dataclass(frozen=True)
 class AuditEntry:
     id: int
     ts: datetime
@@ -402,6 +437,11 @@ class ApiClient:
         try:
             response = await self._http.request(method, path, headers=headers, **kwargs)
         except httpx.HTTPError as e:
+            failure = cert_failure(e)
+            if failure is not None:
+                raise UntrustedServer(
+                    0, f"the server's certificate is not trusted: {failure}"
+                ) from e
             raise ApiError(0, f"cannot reach server: {e}") from e
         if response.is_error:
             raise error_for(response.status_code, _error_message(response))
@@ -587,6 +627,24 @@ class ApiClient:
             raise ApiError(0, f"cannot write {dest}: {e}") from e
         finally:
             tmp.unlink(missing_ok=True)
+
+    async def ca_certificate(self) -> str:
+        """The server's CA certificate (PEM): the one the viewer must trust."""
+        return (await self._request("GET", "/api/ca", auth=False)).text
+
+    async def viewer_build(self, platform: str) -> ViewerBuild | None:
+        """The viewer build published for ``platform``; ``None`` if there is
+        none (or the server is too old to publish viewers)."""
+        try:
+            response = await self._request("GET", f"/api/viewer/{platform}/manifest", auth=False)
+        except ApiError as e:
+            if e.status == 404:
+                return None
+            raise
+        try:
+            return ViewerBuild.from_json(response.json())
+        except (ValueError, KeyError, TypeError) as e:
+            raise ApiError(0, "the server sent a malformed viewer manifest") from e
 
     async def create_viewer_session(self, agent_id: str) -> ViewerSession:
         response = await self._request(

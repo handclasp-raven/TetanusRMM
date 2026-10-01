@@ -42,6 +42,12 @@
 //! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
 //! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
 //! | GET    | /api/updates/{platform}/signature| none |
+//! | GET    | /api/ca                     | none (the CA certificate is public) |
+//! | GET    | /api/viewer/{platform}/manifest | none |
+//! | GET    | /api/viewer/{platform}/binary   | none |
+//! | GET    | /install                    | none: the staff install page (`install`) |
+//! | GET    | /install/{wheel}            | none: the published TUI wheel |
+//! | GET    | /install/viewer/{platform}  | none: the published viewer |
 //!
 //! Sessions are passed as `Authorization: Bearer <token>`.
 //!
@@ -71,6 +77,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use tracing::error;
 
+mod install;
 mod rbac;
 
 use crate::access;
@@ -94,7 +101,7 @@ pub struct AppState {
     /// The media relay, to report whether an agent is online.
     pub hub: Option<Arc<crate::relay::Hub>>,
     /// PEM CA certificate agents must trust (it signed the server's
-    /// certificate), packaged into MSIs.
+    /// certificate), packaged into MSIs and served at `/api/ca`.
     pub server_ca_pem: String,
 }
 
@@ -130,7 +137,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/updates/{platform}/manifest", get(update_manifest))
         .route("/api/updates/{platform}/binary", get(update_binary))
         .route("/api/updates/{platform}/signature", get(update_signature))
+        .route("/api/ca", get(ca_certificate))
+        .route("/api/viewer/{platform}/manifest", get(viewer_manifest))
+        .route("/api/viewer/{platform}/binary", get(viewer_binary))
         .merge(rbac::routes())
+        .merge(install::routes())
         // Per route, so the route template is known (unmatched requests
         // are not counted).
         .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
@@ -828,6 +839,37 @@ async fn update_signature(
     Path(platform): Path<String>,
 ) -> Result<Response, ApiError> {
     serve_update_file(&state.updates_dir, &platform, updates::SIGNATURE_FILE).await
+}
+
+/// The CA certificate that signed the server's and the agents' certificates
+/// (PEM). The support TUI fetches it for the viewer, and to offer it for
+/// trust the first time it meets a server whose certificate this CA signed.
+async fn ca_certificate(State(state): State<AppState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/x-pem-file")],
+        state.server_ca_pem.clone(),
+    )
+        .into_response()
+}
+
+async fn viewer_manifest(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+) -> Result<Json<protocol::update::UpdateManifest>, ApiError> {
+    updates::load_viewer_manifest(&state.updates_dir, &platform)
+        .map_err(|e| match e {
+            updates::UpdateError::InvalidPlatform(_) => ApiError::NotFound,
+            other => ApiError::Internal(other.to_string()),
+        })?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+async fn viewer_binary(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+) -> Result<Response, ApiError> {
+    serve_update_file(&state.updates_dir, &platform, updates::VIEWER_BINARY_FILE).await
 }
 
 /// Stream a published file without loading it into memory.

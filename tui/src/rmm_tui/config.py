@@ -3,11 +3,15 @@
 Example ``config.toml``::
 
     server_url = "https://rmm.example.com:8443"
-    ca_path = "/etc/rmm/ca.crt"          # dev CA; omit to use the system trust store
-    viewer_path = "/opt/rmm/viewer"      # the native remote-desktop viewer
+    ca_path = "/etc/rmm/ca.crt"          # optional; see below
+    viewer_path = "/opt/rmm/viewer"      # optional; default: the server's build
     quic_addr = "rmm.example.com:4433"   # optional; default: API host, port 4433
     poll_interval = 5
     viewer_font_size = 9                 # optional; the viewer's default is 10
+
+None of it is required: the server is typed on the login screen, its CA is
+accepted there the first time (see ``trust``), and the viewer is downloaded
+from the server (see ``provision``).
 """
 
 from __future__ import annotations
@@ -78,11 +82,12 @@ def default_config_path() -> Path:
 class Config:
     #: Base URL of the server's HTTPS API.
     server_url: str = "https://localhost:8443"
-    #: PEM CA certificate to trust for the server (dev CA). ``None`` uses the
-    #: system trust store. The viewer needs one either way.
+    #: PEM CA certificate to trust for the server. ``None``: the CA accepted
+    #: for the server at first sign-in, else the system trust store.
     ca_path: Path | None = None
     #: The native viewer binary: a path, or a name looked up on PATH.
-    viewer_path: str = "viewer"
+    #: ``None``: the build the server publishes, else ``viewer`` on PATH.
+    viewer_path: str | None = None
     #: ``host:port`` of the server's QUIC listener, for the viewer. Default:
     #: the API's host on port 4433.
     quic_addr: str | None = None

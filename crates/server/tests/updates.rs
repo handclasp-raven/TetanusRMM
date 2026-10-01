@@ -213,3 +213,100 @@ async fn update_endpoints_reject_path_traversal() {
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{platform}");
     }
 }
+
+#[tokio::test]
+async fn the_ca_and_published_viewer_builds_are_served_for_the_tui() {
+    let f = Fixture::new().await;
+
+    let resp = f.api.client.get(f.api.url("/api/ca")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), f.certs.ca_cert);
+
+    let manifest_url = f.api.url(&format!("/api/viewer/{PLATFORM}/manifest"));
+    let binary_url = f.api.url(&format!("/api/viewer/{PLATFORM}/binary"));
+    for url in [&manifest_url, &binary_url] {
+        assert_eq!(f.api.client.get(url).send().await.unwrap().status(), 404);
+    }
+
+    let build = f.dir.path().join("viewer-build");
+    std::fs::write(&build, b"viewer v0.3.0").unwrap();
+    updates::publish_viewer(&f.updates_dir(), &build, PLATFORM, "0.3.0").unwrap();
+
+    let manifest: protocol::update::UpdateManifest = f
+        .api
+        .client
+        .get(&manifest_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(manifest.version, "0.3.0");
+    assert_eq!(manifest.sha256, updates::sha256_hex(b"viewer v0.3.0"));
+    let binary = f.api.client.get(&binary_url).send().await.unwrap();
+    assert_eq!(binary.bytes().await.unwrap().as_ref(), b"viewer v0.3.0");
+
+    // A viewer build is not an agent release.
+    let agent = f.api.url(&format!("/api/updates/{PLATFORM}/manifest"));
+    assert_eq!(f.api.client.get(agent).send().await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn the_install_page_offers_the_published_tui_and_viewer() {
+    let f = Fixture::new().await;
+    let get = |path: &str| f.api.client.get(f.api.url(path)).send();
+
+    // The site root leads to the page (the test client follows redirects).
+    let empty = get("/").await.unwrap();
+    assert_eq!(empty.status(), 200);
+    assert!(empty.url().path().ends_with("/install"));
+    assert!(empty
+        .text()
+        .await
+        .unwrap()
+        .contains("has not been published"));
+
+    let name = "rmm_tui-0.1.0-py3-none-any.whl";
+    let wheel = f.dir.path().join(name);
+    std::fs::write(&wheel, b"wheel bytes").unwrap();
+    updates::publish_tui(&f.updates_dir(), &wheel).unwrap();
+    let build = f.dir.path().join("viewer-build");
+    std::fs::write(&build, b"viewer v0.3.0").unwrap();
+    updates::publish_viewer(&f.updates_dir(), &build, "windows-x86_64", "0.3.0").unwrap();
+
+    let page = get("/install").await.unwrap();
+    assert!(page.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    let page = page.text().await.unwrap();
+    assert!(page.contains(&format!("href=\"/install/{name}\"")));
+    assert!(page.contains("href=\"/install/viewer/windows-x86_64\""));
+    // The address to type in the TUI, and the CA fingerprint it will show.
+    assert!(page.contains(f.api.base.trim_start_matches("https://")));
+    let fingerprint = server::quic::pem_fingerprint(&f.certs.ca_cert).unwrap();
+    assert!(page.contains(&fingerprint[..47]));
+
+    let download = get(&format!("/install/{name}")).await.unwrap();
+    assert_eq!(
+        download.headers()["content-disposition"],
+        format!("attachment; filename=\"{name}\"")
+    );
+    assert_eq!(download.bytes().await.unwrap().as_ref(), b"wheel bytes");
+    let viewer = get("/install/viewer/windows-x86_64").await.unwrap();
+    assert_eq!(
+        viewer.headers()["content-disposition"],
+        "attachment; filename=\"rmm-viewer.exe\""
+    );
+    assert_eq!(viewer.bytes().await.unwrap().as_ref(), b"viewer v0.3.0");
+
+    // Only the published wheel is served from there.
+    for path in [
+        "/install/rmm_tui-9.9.9-py3-none-any.whl",
+        "/install/viewer/linux-x86_64",
+        "/install/viewer/..%2Ftui",
+    ] {
+        assert_eq!(get(path).await.unwrap().status(), 404, "{path}");
+    }
+}

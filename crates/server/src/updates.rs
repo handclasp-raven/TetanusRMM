@@ -11,6 +11,14 @@
 //!    API serves.
 //!
 //! Layout: `<updates_dir>/<platform>/{manifest.json, agent, agent.sig}`.
+//!
+//! Viewer builds are published next to them (`publish_viewer`), as
+//! `<updates_dir>/<platform>/{viewer.json, viewer}`, for the support TUI to
+//! download. They are not signed with the update key: a signature made for a
+//! viewer would also pass an agent's update check.
+//!
+//! The support TUI's wheel is published as `<updates_dir>/tui/<wheel>`
+//! (`publish_tui`), under its own file name, for the install page.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +31,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const BINARY_FILE: &str = "agent";
 pub const SIGNATURE_FILE: &str = "agent.sig";
+pub const VIEWER_MANIFEST_FILE: &str = "viewer.json";
+pub const VIEWER_BINARY_FILE: &str = "viewer";
+/// Directory of the published TUI wheel, beside the platform directories.
+pub const TUI_DIR: &str = "tui";
 pub const SIGNING_KEY_FILE: &str = "update.key";
 pub const PUBLIC_KEY_FILE: &str = "update.pub";
 
@@ -38,6 +50,8 @@ pub enum UpdateError {
     InvalidPlatform(String),
     #[error("invalid version {0:?}: must be semver like 1.2.3")]
     InvalidVersion(String),
+    #[error("{0:?} is not a TUI wheel: expected a file named rmm_tui-<version>-….whl")]
+    InvalidWheel(String),
     #[error("invalid key file: expected 64 hex characters")]
     InvalidKey,
     #[error("invalid signature file: expected 64 bytes")]
@@ -154,28 +168,119 @@ pub fn publish(
         return Err(UpdateError::InvalidSignature);
     }
 
-    let dir = updates_dir.join(platform);
-    fs::create_dir_all(&dir).map_err(io_err(&dir))?;
     let manifest = UpdateManifest {
         platform: platform.to_owned(),
         version: version.to_owned(),
         sha256: sha256_hex(&binary),
         size: binary.len() as u64,
     };
-    for (name, bytes) in [
-        (BINARY_FILE, binary.as_slice()),
-        (SIGNATURE_FILE, signature.as_slice()),
-        (
-            MANIFEST_FILE,
-            serde_json::to_vec_pretty(&manifest)?.as_slice(),
-        ),
-    ] {
+    write_release(
+        &updates_dir.join(platform),
+        &[
+            (BINARY_FILE, binary.as_slice()),
+            (SIGNATURE_FILE, signature.as_slice()),
+            (
+                MANIFEST_FILE,
+                serde_json::to_vec_pretty(&manifest)?.as_slice(),
+            ),
+        ],
+    )?;
+    Ok(manifest)
+}
+
+/// Write `files` into `dir` in order, each through a temporary file.
+fn write_release(dir: &Path, files: &[(&str, &[u8])]) -> Result<(), UpdateError> {
+    fs::create_dir_all(dir).map_err(io_err(dir))?;
+    for (name, bytes) in files {
         let tmp = dir.join(format!(".{name}.tmp"));
         let dest = dir.join(name);
         fs::write(&tmp, bytes).map_err(io_err(&tmp))?;
         fs::rename(&tmp, &dest).map_err(io_err(&dest))?;
     }
+    Ok(())
+}
+
+/// Copy the viewer build `file` into `<updates_dir>/<platform>/` and write
+/// its manifest (last, as in [`publish`]). The support TUI downloads it over
+/// HTTPS and checks it against the manifest's SHA-256.
+pub fn publish_viewer(
+    updates_dir: &Path,
+    file: &Path,
+    platform: &str,
+    version: &str,
+) -> Result<UpdateManifest, UpdateError> {
+    check_release(platform, version)?;
+    let binary = fs::read(file).map_err(io_err(file))?;
+    let manifest = UpdateManifest {
+        platform: platform.to_owned(),
+        version: version.to_owned(),
+        sha256: sha256_hex(&binary),
+        size: binary.len() as u64,
+    };
+    write_release(
+        &updates_dir.join(platform),
+        &[
+            (VIEWER_BINARY_FILE, binary.as_slice()),
+            (
+                VIEWER_MANIFEST_FILE,
+                serde_json::to_vec_pretty(&manifest)?.as_slice(),
+            ),
+        ],
+    )?;
     Ok(manifest)
+}
+
+/// Whether `name` is a TUI wheel's file name (and safe as a path segment).
+/// Installers read the version from the name, so it is kept as built.
+pub fn valid_wheel_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.starts_with("rmm_tui-")
+        && name.ends_with(".whl")
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+/// Copy the TUI wheel `file` into `<updates_dir>/tui/`, replacing any wheel
+/// published before. Returns its file name.
+pub fn publish_tui(updates_dir: &Path, file: &Path) -> Result<String, UpdateError> {
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| valid_wheel_name(n))
+        .ok_or_else(|| UpdateError::InvalidWheel(file.display().to_string()))?
+        .to_owned();
+    let bytes = fs::read(file).map_err(io_err(file))?;
+    let dir = updates_dir.join(TUI_DIR);
+    let previous = tui_wheels(&dir)?;
+    write_release(&dir, &[(name.as_str(), bytes.as_slice())])?;
+    for old in previous.iter().filter(|old| **old != name) {
+        let path = dir.join(old);
+        fs::remove_file(&path).map_err(io_err(&path))?;
+    }
+    Ok(name)
+}
+
+/// The published TUI wheel's file name, if any.
+pub fn tui_wheel(updates_dir: &Path) -> Result<Option<String>, UpdateError> {
+    Ok(tui_wheels(&updates_dir.join(TUI_DIR))?.into_iter().max())
+}
+
+fn tui_wheels(dir: &Path) -> Result<Vec<String>, UpdateError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(dir)(e)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(io_err(dir))?.file_name();
+        if let Some(name) = name.to_str().filter(|n| valid_wheel_name(n)) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
 }
 
 /// The published manifest for `platform`, if any.
@@ -183,10 +288,26 @@ pub fn load_manifest(
     updates_dir: &Path,
     platform: &str,
 ) -> Result<Option<UpdateManifest>, UpdateError> {
+    load_manifest_file(updates_dir, platform, MANIFEST_FILE)
+}
+
+/// The published viewer manifest for `platform`, if any.
+pub fn load_viewer_manifest(
+    updates_dir: &Path,
+    platform: &str,
+) -> Result<Option<UpdateManifest>, UpdateError> {
+    load_manifest_file(updates_dir, platform, VIEWER_MANIFEST_FILE)
+}
+
+fn load_manifest_file(
+    updates_dir: &Path,
+    platform: &str,
+    name: &str,
+) -> Result<Option<UpdateManifest>, UpdateError> {
     if !valid_platform(platform) {
         return Err(UpdateError::InvalidPlatform(platform.to_owned()));
     }
-    let path = updates_dir.join(platform).join(MANIFEST_FILE);
+    let path = updates_dir.join(platform).join(name);
     match fs::read(&path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -272,6 +393,56 @@ mod tests {
             Err(UpdateError::InvalidPlatform(_))
         ));
         assert_eq!(load_manifest(dir.path(), "linux-x86_64").unwrap(), None);
+    }
+
+    #[test]
+    fn viewer_builds_are_published_beside_agent_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("viewer-build");
+        fs::write(&file, b"viewer binary").unwrap();
+        assert_eq!(
+            load_viewer_manifest(dir.path(), "linux-x86_64").unwrap(),
+            None
+        );
+        let manifest = publish_viewer(dir.path(), &file, "linux-x86_64", "0.3.0").unwrap();
+        assert_eq!(manifest.sha256, sha256_hex(b"viewer binary"));
+        assert_eq!(
+            load_viewer_manifest(dir.path(), "linux-x86_64").unwrap(),
+            Some(manifest)
+        );
+        assert_eq!(
+            fs::read(dir.path().join("linux-x86_64").join(VIEWER_BINARY_FILE)).unwrap(),
+            b"viewer binary"
+        );
+        // The agent's release is separate.
+        assert_eq!(load_manifest(dir.path(), "linux-x86_64").unwrap(), None);
+    }
+
+    #[test]
+    fn the_tui_wheel_is_published_under_its_own_name_and_replaces_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates = dir.path().join("updates");
+        assert_eq!(tui_wheel(&updates).unwrap(), None);
+        for (name, bytes) in [
+            ("rmm_tui-0.1.0-py3-none-any.whl", b"one"),
+            ("rmm_tui-0.2.0-py3-none-any.whl", b"two"),
+        ] {
+            let file = dir.path().join(name);
+            fs::write(&file, bytes).unwrap();
+            assert_eq!(publish_tui(&updates, &file).unwrap(), name);
+            assert_eq!(tui_wheel(&updates).unwrap().as_deref(), Some(name));
+            assert_eq!(fs::read(updates.join(TUI_DIR).join(name)).unwrap(), bytes);
+        }
+        assert_eq!(fs::read_dir(updates.join(TUI_DIR)).unwrap().count(), 1);
+
+        let other = dir.path().join("something-else.whl");
+        fs::write(&other, b"x").unwrap();
+        assert!(matches!(
+            publish_tui(&updates, &other),
+            Err(UpdateError::InvalidWheel(_))
+        ));
+        assert!(!valid_wheel_name("rmm_tui-../x.whl"));
+        assert!(!valid_wheel_name("rmm_tui-0.1.0/x.whl"));
     }
 
     #[test]

@@ -35,6 +35,12 @@ enum Command {
     SignUpdate(SignUpdateArgs),
     /// Copy a signed agent build into the updates directory and publish it.
     PublishUpdate(PublishUpdateArgs),
+    /// Copy a viewer build into the updates directory, for the support TUI
+    /// to download.
+    PublishViewer(PublishViewerArgs),
+    /// Copy the support TUI's wheel into the updates directory, for the
+    /// install page (`/install`) to offer.
+    PublishTui(PublishTuiArgs),
 }
 
 #[derive(Args)]
@@ -74,6 +80,24 @@ struct PublishUpdateArgs {
     file: PathBuf,
     #[command(flatten)]
     release: Release,
+    #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
+    updates_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct PublishViewerArgs {
+    /// Viewer binary.
+    file: PathBuf,
+    #[command(flatten)]
+    release: Release,
+    #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
+    updates_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct PublishTuiArgs {
+    /// The wheel, e.g. `rmm_tui-0.1.0-py3-none-any.whl`.
+    file: PathBuf,
     #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
     updates_dir: PathBuf,
 }
@@ -131,6 +155,21 @@ async fn main() -> anyhow::Result<()> {
             info!(platform = %manifest.platform, version = %manifest.version, sha256 = %manifest.sha256, "published");
             Ok(())
         }
+        Command::PublishViewer(args) => {
+            let manifest = updates::publish_viewer(
+                &args.updates_dir,
+                &args.file,
+                &args.release.platform,
+                &args.release.version,
+            )?;
+            info!(platform = %manifest.platform, version = %manifest.version, sha256 = %manifest.sha256, "published viewer");
+            Ok(())
+        }
+        Command::PublishTui(args) => {
+            let name = updates::publish_tui(&args.updates_dir, &args.file)?;
+            info!(wheel = %name, "published TUI");
+            Ok(())
+        }
     }
 }
 
@@ -142,6 +181,8 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         .enrollment_ca()
         .context("loading CA key for enrollment (re-run `gen-certs --force`?)")?;
     let server_ca_pem = enrollment_ca.ca_pem().to_owned();
+    // What the support TUI asks its user to check on first sign-in.
+    info!(sha256 = %server::quic::pem_fingerprint(&server_ca_pem)?, "CA certificate fingerprint");
     let quic = Server::bind(ServerConfig {
         listen: config.quic_listen,
         ws_listen: config.ws_listen(),
@@ -244,6 +285,12 @@ fn gen_certs(args: GenCertsArgs) -> anyhow::Result<()> {
     let certs = devcerts::generate_with_names("unused", &args.extra_names)?;
     certs.write_to_dir(&args.out)?;
     info!(dir = %args.out.display(), extra_names = ?args.extra_names, "wrote dev CA and server certificate");
+    // Command output, not logging: staff compare it with what the TUI shows.
+    writeln!(
+        std::io::stdout().lock(),
+        "CA fingerprint (SHA-256): {}",
+        server::quic::pem_fingerprint(&certs.ca_cert)?
+    )?;
     Ok(())
 }
 

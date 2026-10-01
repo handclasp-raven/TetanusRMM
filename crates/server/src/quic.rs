@@ -972,3 +972,16 @@ impl Drop for EndSession<'_> {
 pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
     hex::encode(digest(&SHA256, cert.as_ref()))
 }
+
+/// SHA-256 of the first certificate in `pem`, as `openssl x509 -fingerprint
+/// -sha256` prints it (`AB:CD:…`).
+pub fn pem_fingerprint(pem: &str) -> Result<String, common::tls::TlsError> {
+    let certs = common::tls::certs_from_pem(pem)?;
+    let hex = certs
+        .first()
+        .map(cert_fingerprint)
+        .unwrap_or_default()
+        .to_uppercase();
+    let pairs: Vec<&str> = (0..hex.len()).step_by(2).map(|i| &hex[i..i + 2]).collect();
+    Ok(pairs.join(":"))
+}

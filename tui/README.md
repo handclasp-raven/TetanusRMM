@@ -34,7 +34,20 @@ directly. What it does:
 
 ## Install
 
-Python 3.11 or newer. With [uv](https://docs.astral.sh/uv/):
+For staff: open your server's install page, `https://<server>:8443/install`,
+download the TUI there and follow its steps (an administrator fills the page
+with `scripts/build-clients.sh`). Then run `rmm-tui` and sign in. No config
+file, certificate or viewer has to be set up by hand: see
+[First sign-in](#first-sign-in). The install itself is one command, with
+[uv](https://docs.astral.sh/uv/) (which fetches Python itself) or pipx
+(Python 3.11 or newer):
+
+```sh
+uv tool install rmm_tui-0.1.0-py3-none-any.whl     # or: pipx install rmm_tui-…whl
+rmm-tui
+```
+
+For development, from the repository, with uv:
 
 ```sh
 cd tui
@@ -59,10 +72,47 @@ Service on Linux (GNOME Keyring or KWallet). If no keyring is available, the
 TUI still works, but you have to sign in on each launch; it tells you when
 this happens.
 
+## First sign-in
+
+Type the server's address in **Server URL** (`rmm.example.com:8443`;
+`https://` is assumed), then your username, password and TOTP code. The
+server is remembered for next time.
+
+**Trusting the server.** A server usually has its own certificate authority
+(from `server gen-certs`), which your computer has never seen. The first
+time you sign in to such a server, before anything is sent to it, the TUI
+shows the SHA-256 fingerprint of that CA and asks whether to trust it.
+Compare it with the fingerprint from your administrator (the server prints
+it when the certificates are made and logs it at every start: `CA
+certificate fingerprint`; or `openssl x509 -in ca.crt -noout -fingerprint
+-sha256`). Once accepted, the CA is kept in the data directory
+(`servers/<host>_<port>/ca.crt`) and that server is only ever verified
+against it: you are not asked again.
+
+If the server later presents a certificate that the accepted CA did not
+sign, the TUI refuses to sign in rather than ask again. If the server's
+certificates really were replaced, forget the old CA and accept the new one:
+
+```sh
+rmm-tui --forget-ca --server-url https://rmm.example.com:8443
+```
+
+A server whose API has a publicly trusted certificate (`RMM_API_TLS_CERT`)
+needs no prompt at all. Setting `ca_path` turns the prompt off: the server
+is then verified against that file only.
+
+**The viewer.** The first time you start a remote desktop session the TUI
+downloads the server's viewer build for your platform (Linux or Windows,
+x86-64) into the data directory (`viewer/`), checks it against the SHA-256
+the server publishes, and starts it. It is fetched again whenever the server
+publishes a new build, so it always matches the server. The viewer is given
+the CA accepted above. If the server publishes no viewer for your platform,
+`viewer` on `PATH` is used; `viewer_path` names another.
+
 ## Configuration
 
-Settings come from a TOML file, and command-line flags override them. The
-file lives at:
+Every setting is optional, and so is the file. Settings come from a TOML
+file, and command-line flags override them. The file lives at:
 
 | OS | Default path |
 |---|---|
@@ -74,8 +124,8 @@ Pass `--config PATH` or set `RMM_TUI_CONFIG` to use a different file.
 
 ```toml
 server_url = "https://rmm.example.com:8443"   # the HTTPS API
-ca_path = "/etc/rmm/ca.crt"                   # CA to trust for the server
-viewer_path = "/opt/rmm/viewer"               # native viewer binary
+ca_path = "/etc/rmm/ca.crt"                   # optional: CA to trust for the server
+viewer_path = "/opt/rmm/viewer"               # optional: native viewer binary
 quic_addr = "rmm.example.com:4433"            # optional, see below
 poll_interval = 5                             # seconds between agent refreshes
 scripts_path = "~/rmm-scripts.json"           # optional; default is in the data dir
@@ -85,8 +135,8 @@ viewer_font_size = 9                          # optional; the viewer's text size
 | Setting | Flag | Default | |
 |---|---|---|---|
 | `server_url` | `--server-url` | `https://localhost:8443` | Must be `https://`. |
-| `ca_path` | `--ca` | *(system trust store)* | PEM CA certificate. Needed for the dev CA (`dev-certs/ca.crt`), and always needed to launch the viewer. |
-| `viewer_path` | `--viewer` | `viewer` (on `PATH`) | E.g. `target/release/viewer`. |
+| `ca_path` | `--ca` | *(the CA accepted at first sign-in, else the system trust store)* | PEM CA certificate to verify the server against, instead of asking. Also given to the viewer. |
+| `viewer_path` | `--viewer` | *(the server's build, else `viewer` on `PATH`)* | A viewer to use instead of the downloaded one, e.g. `target/release/viewer`. |
 | `quic_addr` | `--quic-addr` | API host, port `4433` | The server's QUIC listener, for the viewer. The name is resolved to an address (IPv4 preferred), and the viewer checks the certificate against the name. |
 | `poll_interval` | | `5` | At least 1. |
 | `scripts_path` | | data dir `/scripts.json` | The saved-script library. |
@@ -95,8 +145,9 @@ viewer_font_size = 9                          # optional; the viewer's text size
 Relative paths in the file are relative to the file. Unknown keys are an
 error, so typos get caught.
 
-TLS is always verified: against `ca_path` if set, otherwise against the
-system trust store. There is no option to turn verification off.
+TLS is always verified: against `ca_path` if set, otherwise against the CA
+accepted for the server at [first sign-in](#first-sign-in), otherwise
+against the system trust store. There is no option to turn verification off.
 
 The TUI also remembers the server you last signed in to and your agent-table
 columns, in `state.json` in the data directory.

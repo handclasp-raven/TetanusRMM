@@ -3,27 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from textual import work
 from textual.app import App
 
+from . import provision
 from .api import ApiClient, ApiError
 from .auth import SessionManager
 from .config import Config, data_dir
 from .screens import LoginScreen, MainScreen, SplashScreen
 from .scripts import ScriptLibrary
 from .state import UiState
-from .viewer import ViewerCommand, close_all
+from .trust import TrustStore, fetch_ca
+from .viewer import ViewerCommand, ViewerError, close_all
 from .viewer import launch as launch_process
 
 Launcher = Callable[[ViewerCommand, Path], "subprocess.Popen[bytes]"]
 #: Makes the API client for a server URL (tests substitute a mock).
 ApiFactory = Callable[[str, Path | None], ApiClient]
+#: Fetches the CA certificate a server offers, for the user to accept.
+CaFetcher = Callable[[str], Awaitable[str]]
 
 
 class RmmApp(App):
@@ -39,6 +44,8 @@ class RmmApp(App):
         log_dir: Path | None = None,
         state: UiState | None = None,
         api_factory: ApiFactory = ApiClient,
+        trust: TrustStore | None = None,
+        ca_fetcher: CaFetcher = fetch_ca,
     ) -> None:
         super().__init__()
         self.config = config
@@ -48,6 +55,8 @@ class RmmApp(App):
         self._api_factory = api_factory
         self.log_dir = log_dir or data_dir()
         self.state = state or UiState(self.log_dir / "state.json")
+        self.trust = trust or TrustStore(self.log_dir / "servers")
+        self.fetch_ca = ca_fetcher
         self.viewers: list[subprocess.Popen[bytes]] = []
 
     def on_mount(self) -> None:
@@ -71,16 +80,56 @@ class RmmApp(App):
         else:
             self.show_main()
 
-    async def use_server(self, server_url: str) -> None:
+    def ca_for(self, server_url: str) -> Path | None:
+        """The CA to verify ``server_url`` against: the configured one, else
+        the one accepted for that server (``None``: the system trust store)."""
+        return self.config.ca_path or self.trust.pinned(server_url)
+
+    async def use_server(self, server_url: str, *, reconnect: bool = False) -> None:
         """Talk to ``server_url`` from now on (signed out there until the
-        caller signs in). Raises :class:`ApiError` if the client cannot be
-        set up, e.g. the CA certificate is unreadable."""
-        if server_url == self.config.server_url:
+        caller signs in). ``reconnect`` makes a new client even for the
+        current server, to pick up a newly accepted CA. Raises
+        :class:`ApiError` if the client cannot be set up, e.g. the CA
+        certificate is unreadable."""
+        if server_url == self.config.server_url and not reconnect:
             return
-        api = self._api_factory(server_url, self.config.ca_path)
+        api = self._api_factory(server_url, self.ca_for(server_url))
         old = self.session.switch_server(api)
         self.config = self.config.for_server(server_url)
         await old.aclose()
+
+    async def trust_server(self, server_url: str, pem: str) -> None:
+        """The user accepted ``pem`` as ``server_url``'s CA: verify that
+        server against it from now on."""
+        self.trust.pin(server_url, pem)
+        await self.use_server(server_url, reconnect=True)
+
+    async def viewer_config(self) -> Config:
+        """The config to launch a viewer with: the viewer binary and the CA
+        filled in from the server where the config names none."""
+        config, api = self.config, self.session.api
+        if config.viewer_path is None:
+            path = await provision.ensure_viewer(
+                api,
+                self.log_dir / "viewer",
+                on_download=lambda build: self.notify(f"Downloading viewer {build.version}…"),
+            )
+            if path is None and shutil.which("viewer") is None:
+                raise ViewerError(
+                    f"the server has no viewer for {provision.current_platform()}: ask an "
+                    "administrator to publish one, or set viewer_path in the config"
+                )
+            config = config.with_overrides(viewer_path=str(path) if path else "viewer")
+        ca_path = self.ca_for(config.server_url)
+        if ca_path is None:
+            # The API has a publicly trusted certificate; the viewer still
+            # needs the CA behind the QUIC listener and the agents.
+            pem = await api.ca_certificate()
+            try:
+                ca_path = self.trust.save_viewer_ca(config.server_url, pem)
+            except OSError as e:
+                raise ViewerError(f"cannot save the server's CA certificate: {e}") from e
+        return config.with_overrides(ca_path=ca_path)
 
     def remember_server(self) -> None:
         """Signed in: offer this server first next time."""

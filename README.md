@@ -513,7 +513,8 @@ it reports as `rmm_stream_viewer_delay_seconds`.
    # {"token":"…","expires_at":"…","agent_id":"agt-…","online":true}
    ```
 
-2. Start the viewer with it (the TUI will do both steps in Phase 8):
+2. Start the viewer with it (the TUI does both steps, and downloads the
+   viewer from the server: see [Setting staff up](#setting-staff-up)):
 
    ```sh
    viewer --server 203.0.113.10:4433 --server-name localhost \
@@ -1035,6 +1036,12 @@ Sessions are sent as `Authorization: Bearer <token>`. Errors come back as
 | GET | `/api/updates/{platform}/manifest` | none | `{platform, version, sha256, size}` |
 | GET | `/api/updates/{platform}/binary` | none | Agent build (signed, so public) |
 | GET | `/api/updates/{platform}/signature` | none | 64-byte detached ed25519 signature |
+| GET | `/api/ca` | none | The CA certificate (PEM) that signed the server's and agents' certificates. The TUI offers it for trust at first sign-in and gives it to the viewer. |
+| GET | `/api/viewer/{platform}/manifest` | none | `{platform, version, sha256, size}` of the published viewer build |
+| GET | `/api/viewer/{platform}/binary` | none | The viewer build the TUI downloads |
+| GET | `/install` | none | The [install page](#setting-staff-up) for staff (`/` redirects to it) |
+| GET | `/install/{wheel}` | none | The published TUI wheel, under its file name |
+| GET | `/install/viewer/{platform}` | none | The published viewer, as a download |
 | GET | `/api/me` | session | Current user |
 | GET | `/api/agents` | session | The agents the user can see (engineers: granted ones), with hostname, telemetry, `logged_in_users` / `local_ip` / `remote_ip` / `os` / `dns_servers` / `disks`, `classification` (and `classification_override`), `groups`, the user's `capabilities` on each, and live `online` / `transport` / `viewer_sessions` / `shell_sessions` |
 | GET | `/api/agents/{id}` | session; agent visible to the user | One agent, as listed above (the viewer's side panel) |
@@ -1187,6 +1194,45 @@ only to the server's HTTPS API:
   rename, delete and set members. The agent table filters by group.
 
 Install, configuration and usage: [tui/README.md](tui/README.md).
+
+### Setting staff up
+
+Staff need no config file, no certificate and no viewer build. Send a new
+member of staff to the server's install page, `https://<server>:8443/install`
+(the site root redirects there): it has the TUI download, the install
+commands for Linux and Windows, the server address to type, and the CA
+fingerprint the TUI will show. To fill it:
+
+```sh
+scripts/build-clients.sh            # viewers and the TUI wheel → ./updates
+```
+
+That builds the viewer for `linux-x86_64` and `windows-x86_64` in Docker
+(Linux against Debian 12's glibc, so it runs on current desktops; Windows
+with the agent's cross toolchain) and publishes both with `server
+publish-viewer`, next to the agent builds: `updates/<platform>/{viewer,
+viewer.json}`. It also builds the TUI as a wheel and publishes it with
+`server publish-tui` as `updates/tui/<wheel>`. The wheel holds nothing about
+your server. The running server picks all of it up without a restart.
+
+The page needs no sign-in (it holds nothing secret). With a private CA the
+browser warns about the certificate before showing it, so give staff the
+fingerprint yourself as well: `gen-certs` prints it, and the server logs it
+at start (`CA certificate fingerprint`).
+
+On first sign-in the TUI:
+- fetches the server's CA certificate (`GET /api/ca`) and asks the user to
+  accept its SHA-256 fingerprint, then pins it for that server, as SSH does
+  with host keys;
+- downloads the viewer for its platform (`GET /api/viewer/<platform>/…`),
+  checks it against the manifest's SHA-256, and re-downloads whenever a new
+  build is published, so viewers follow the server.
+
+Viewer builds are not signed with the update key (a signature valid for a
+viewer would also pass an agent's update check). They are trusted as the
+server is: over TLS verified against the accepted CA.
+
+The server certificate must cover the name staff type (`gen-certs --san`).
 
 ## Running without Docker
 

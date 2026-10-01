@@ -12,6 +12,7 @@ from .api import ApiClient, ApiError
 from .auth import SessionManager, TokenStore
 from .scripts import ScriptLibrary
 from .state import UiState
+from .trust import TrustStore
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -25,6 +26,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--quic-addr", help="server QUIC host:port for the viewer")
     parser.add_argument(
         "--logout", action="store_true", help="forget the saved session for this server and exit"
+    )
+    parser.add_argument(
+        "--forget-ca",
+        action="store_true",
+        help="forget the certificate authority trusted for this server and exit",
     )
     return parser.parse_args(argv)
 
@@ -69,8 +75,18 @@ def main(argv: list[str] | None = None) -> None:
         store.clear()
         return
 
+    trust = TrustStore(log_dir / "servers")
+    if args.forget_ca:
+        forgotten = trust.forget(config.server_url)
+        print(
+            f"Forgot the certificate authority for {config.server_url}."
+            if forgotten
+            else f"No certificate authority is trusted for {config.server_url}."
+        )
+        return
+
     try:
-        api = ApiClient(config.server_url, config.ca_path)
+        api = ApiClient(config.server_url, config.ca_path or trust.pinned(config.server_url))
     except ApiError as e:
         sys.exit(f"rmm-tui: {e.message}")
 
@@ -82,6 +98,7 @@ def main(argv: list[str] | None = None) -> None:
         library=ScriptLibrary(config.scripts_path),
         log_dir=log_dir,
         state=state,
+        trust=trust,
     )
     try:
         app.run()
