@@ -12,15 +12,16 @@
 # target/windows-x86_64/rmm-agent.exe.
 set -eu
 cd "$(dirname "$0")/.."
+. scripts/lib.sh
 
 publish=yes
 if [ "${1:-}" = "--no-publish" ]; then publish=no; shift; fi
-version=${1:-$(cargo pkgid -p agent | sed 's/.*[#@]//')}
+version=${1:-$(crate_version agent)}
 image=rmm-agent-windows-builder
 out=target/windows-x86_64
 
 if [ ! -f update-keys/update.pub ]; then
-    echo "update-keys/update.pub missing: run 'cargo run -p server -- gen-update-key' first" >&2
+    echo "update-keys/update.pub missing: run 'cargo run -p server -- gen-update-key' (or scripts/install.sh) first" >&2
     exit 1
 fi
 
@@ -41,10 +42,10 @@ docker run --rm \
         cp /target/x86_64-pc-windows-msvc/release/agent.exe /out/rmm-agent.exe &&
         chown "$HOST_IDS" /out/rmm-agent.exe'
 
-cargo run -q -p server -- sign-update "$out/rmm-agent.exe" \
+server sign-update "$out/rmm-agent.exe" \
     --platform windows-x86_64 --version "$version"
 if [ "$publish" = yes ]; then
-    cargo run -q -p server -- publish-update "$out/rmm-agent.exe" \
+    server publish-update "$out/rmm-agent.exe" \
         --platform windows-x86_64 --version "$version"
     echo "published windows-x86_64 $version"
 else

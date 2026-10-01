@@ -51,9 +51,157 @@ Migrations live in
 `crates/server/migrations/` and are embedded in the binary. They run
 automatically when the server starts.
 
+## Installing the server
+
+The server runs on a Linux x86_64 host under Docker Compose, next to its
+Postgres database. Before you start, decide the **name or IP address that
+agents and staff will reach it at**: it goes into the server certificate and
+into every download link, so changing it later means new certificates and
+re-enrolling agents. Use a DNS name if you have one.
+
+Allow these ports through the host's firewall:
+
+| Port | Used for |
+|---|---|
+| 8443/tcp | HTTPS API, downloads, the staff install page |
+| 4433/udp | Agents and viewers (QUIC) |
+| 4433/tcp | Agents and viewers on networks that block UDP (WebSocket fallback) |
+| 3478/udp | STUN, for direct agent-to-viewer connections |
+
+Budget about 10 GB of disk: the toolchain image that cross-compiles the
+Windows agent is 3.6 GB on its own.
+
+### With the install script
+
+The script needs only `curl` on the host. It installs git and Docker if
+they are missing (asking first), and needs no Rust or Python: everything is
+built in containers.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CHANGE-ME/RMMTool/main/scripts/install.sh -o install.sh
+bash install.sh --repo https://github.com/CHANGE-ME/RMMTool.git --host rmm.example.com
+```
+
+Run it as root, or as a user in the `docker` group. From a checkout, run
+`scripts/install.sh --host rmm.example.com` instead; it then installs in
+place. It:
+
+1. clones the repository to `/opt/rmmtool` (as root) or `~/rmmtool`;
+2. writes `.env` with a random database password, the public URL and your
+   uid/gid (see [Compose settings](#compose-settings));
+3. builds the server image;
+4. generates the CA and server certificate in `dev-certs/`, covering the
+   host you gave, and the update signing key in `update-keys/`;
+5. starts Postgres and the server, and waits for the server to be healthy;
+6. creates the first admin user: it asks for a username and password, or
+   generates a password if you leave it empty;
+7. builds, signs and publishes the Windows agent, the Linux and Windows
+   viewers and the TUI into `updates/` (see
+   [Publishing a signed update](#publishing-a-signed-update) and
+   [Setting staff up](#setting-staff-up)).
+
+It ends with a summary: the server URL, the CA fingerprint, and the admin's
+password (if generated), TOTP secret and `otpauth://` URL. **Those are shown
+once.** Add the TOTP secret to an authenticator app before closing the
+terminal.
+
+| Option | Env var | Purpose |
+|---|---|---|
+| `--host NAME` | `RMM_HOST` | Name or IP agents and staff use. Asked for if not given, suggesting the host's address. |
+| `--dir PATH` | `RMM_DIR` | Where to clone to |
+| `--repo URL` | `RMM_REPO` | Repository to clone |
+| `--branch NAME` | `RMM_BRANCH` | Branch or tag to check out |
+| `--admin NAME` | `RMM_ADMIN` | First admin's username (default `admin`) |
+| | `RMM_ADMIN_PASSWORD` | Admin password, instead of the prompt (12+ characters) |
+| `--no-admin` | | Don't create a user |
+| `--skip-clients` | | Don't build the agent, viewers and TUI |
+| `-y`, `--yes` | | Never ask: take the defaults and generate the admin password |
+
+Every step is skipped if it is already done, so re-running is safe: it keeps
+an existing `.env`, certificates, signing key and users. To upgrade, run
+`git pull && bash scripts/install.sh` in the install directory; that rebuilds
+the server, restarts it and publishes new client builds.
+
+Next: send staff to `https://<host>:8443/install`, and
+[enroll an agent](#enrolling-an-agent).
+
+### By hand
+
+These are the script's steps. They need Docker (with the Compose plugin)
+and git on the host, and nothing else. `HOST` is the name or IP from above.
+
+```sh
+git clone https://github.com/CHANGE-ME/RMMTool.git rmmtool && cd rmmtool
+HOST=rmm.example.com
+```
+
+1. **Settings.** Write `.env` (see [Compose settings](#compose-settings)):
+
+   ```sh
+   umask 077
+   cat > .env <<EOF
+   POSTGRES_PASSWORD=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+   RMM_PUBLIC_URL=https://$HOST:8443
+   RMM_UID=$(id -u)
+   RMM_GID=$(id -g)
+   EOF
+   ```
+
+2. **Build the server image.**
+
+   ```sh
+   docker compose build server
+   ```
+
+3. **Certificates and the update signing key.** The server binary in the
+   image generates both. Run it as yourself, in the repository:
+
+   ```sh
+   rmm() { docker run --rm -i -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work rmm-server:dev "$@"; }
+   rmm gen-certs --san "$HOST"     # ./dev-certs; prints the CA fingerprint
+   rmm gen-update-key              # ./update-keys
+   ```
+
+   With a Rust toolchain, `cargo run -p server -- gen-certs …` does the same.
+   Keep `dev-certs/ca.key` and `update-keys/update.key` private and backed
+   up. Agents trust exactly this CA and this signing key.
+
+4. **Start it.**
+
+   ```sh
+   mkdir -p updates
+   docker compose up -d
+   curl --cacert dev-certs/ca.crt https://localhost:8443/api/health
+   # {"status":"ok"}
+   ```
+
+   Both containers restart with Docker, so the server comes back after a
+   reboot as long as the Docker service is enabled.
+
+5. **Create the first admin.** The password (12+ characters) is read from
+   stdin. The command prints a TOTP secret and an `otpauth://` URL; add
+   either to an authenticator app.
+
+   ```sh
+   echo 'a long password here' | \
+     docker compose run --rm -T server create-user --username admin --role admin
+   ```
+
+6. **Build and publish the clients.** Both scripts build in containers and
+   publish into `./updates`, which the running server serves at once:
+
+   ```sh
+   scripts/build-windows-agent.sh   # Windows agent, signed with the update key
+   scripts/build-clients.sh         # Linux and Windows viewers, the TUI wheel
+   ```
+
+   Without a Rust toolchain on the host they sign and publish with the
+   server image from step 2 (`RMM_SERVER_CLI=docker` forces that).
+
 ## Quick start with Docker Compose
 
-Requires Docker and a Rust toolchain (for generating certs).
+For local development. Requires Docker and a Rust toolchain (for generating
+certs).
 
 ```sh
 cargo run -p server -- gen-certs          # 1. dev CA + server cert into ./dev-certs

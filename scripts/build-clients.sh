@@ -15,10 +15,11 @@
 # Build outputs and the cargo caches live in Docker volumes.
 set -eu
 cd "$(dirname "$0")/.."
+. scripts/lib.sh
 
 publish=yes
 if [ "${1:-}" = "--no-publish" ]; then publish=no; shift; fi
-version=${1:-$(cargo pkgid -p viewer | sed 's/.*[#@]//')}
+version=${1:-$(crate_version viewer)}
 out=target/clients
 mkdir -p "$out"
 
@@ -44,15 +45,28 @@ build rmm-agent-windows-builder agent-windows.Dockerfile rmm-xwin rmm-viewer.exe
     cp /target/x86_64-pc-windows-msvc/release/viewer.exe /out/rmm-viewer.exe'
 
 rm -f "$out"/rmm_tui-*.whl
-python3 -m pip wheel --quiet --no-deps --wheel-dir "$out" ./tui
+if python3 -m pip --version >/dev/null 2>&1; then
+    python3 -m pip wheel --quiet --no-deps --wheel-dir "$out" ./tui
+else
+    # No Python (or pip) on this host: build the wheel in a container, from
+    # a copy, since the build writes into the source directory.
+    docker run --rm \
+        -v "$PWD/tui":/src:ro \
+        -v "$(realpath "$out")":/out \
+        -e HOST_IDS="$(id -u):$(id -g)" \
+        python:3-slim sh -c '
+            cp -r /src /tmp/tui &&
+            pip wheel --quiet --no-deps --wheel-dir /out /tmp/tui &&
+            chown "$HOST_IDS" /out/rmm_tui-*.whl'
+fi
 wheel=$(ls "$out"/rmm_tui-*.whl)
 
 if [ "$publish" = yes ]; then
-    cargo run -q -p server -- publish-viewer "$out/rmm-viewer" \
+    server publish-viewer "$out/rmm-viewer" \
         --platform linux-x86_64 --version "$version"
-    cargo run -q -p server -- publish-viewer "$out/rmm-viewer.exe" \
+    server publish-viewer "$out/rmm-viewer.exe" \
         --platform windows-x86_64 --version "$version"
-    cargo run -q -p server -- publish-tui "$wheel"
+    server publish-tui "$wheel"
     echo "published viewer $version (linux-x86_64, windows-x86_64) and $(basename "$wheel")"
     echo "staff install from the server's /install page"
 else
