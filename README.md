@@ -1,7 +1,6 @@
 # RMMTool
 
-Remote monitoring and management tool. See [rmm-build-plan.md](rmm-build-plan.md)
-for the architecture and phase plan.
+Remote monitoring and management tool.
 
 ## Workspace layout
 
