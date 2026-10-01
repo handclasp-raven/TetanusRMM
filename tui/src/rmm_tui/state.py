@@ -1,6 +1,7 @@
 """What the TUI remembers between launches: the server last signed in to
-(the login screen's default), the agent-table columns and the remote
-viewer's command buttons.
+(the login screen's default), the agent-table columns, the remote
+viewer's command buttons, the colour theme and the themes made in the theme
+editor.
 
 A small JSON file in the data directory. It is only a convenience: if it is
 missing or unreadable the defaults apply, and failing to write it is logged,
@@ -12,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import commands
+from textual.theme import Theme
+
+from . import commands, themes
 from .commands import QuickCommand
 
 log = logging.getLogger(__name__)
@@ -30,6 +33,10 @@ class UiState:
     agent_columns: list[str] | None = None
     #: The viewer's command buttons. ``None``: the defaults.
     viewer_commands: list[QuickCommand] | None = None
+    #: Name of the colour theme. ``None``: the default.
+    theme: str | None = None
+    #: The themes made in the theme editor, by name.
+    custom_themes: dict[str, Theme] = field(default_factory=dict)
 
     @property
     def commands(self) -> list[QuickCommand]:
@@ -51,11 +58,14 @@ class UiState:
             return cls(path)
         server = raw.get("last_server")
         columns = raw.get("agent_columns")
+        theme = raw.get("theme")
         return cls(
             path,
             last_server=server if isinstance(server, str) else None,
             agent_columns=[str(c) for c in columns] if isinstance(columns, list) else None,
             viewer_commands=commands.from_json(raw.get("viewer_commands")),
+            theme=theme if isinstance(theme, str) else None,
+            custom_themes=themes.from_json(raw.get("custom_themes")),
         )
 
     def save(self) -> None:
@@ -67,6 +77,8 @@ class UiState:
                 if self.viewer_commands is None
                 else [c.to_json() for c in self.viewer_commands]
             ),
+            "theme": self.theme,
+            "custom_themes": {n: themes.to_json(t) for n, t in self.custom_themes.items()},
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

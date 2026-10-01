@@ -40,6 +40,7 @@ from .api import (
     derived_classification,
 )
 from .config import ConfigError, normalize_server_url
+from .menu import MenuBar
 from .trust import fingerprint
 from .viewer import FONT_FILE, ViewerError, build_command
 
@@ -328,29 +329,41 @@ class ClassifyScreen(ModalScreen[str | None]):
 
 class MainScreen(Screen):
     """Live table of agents, and the actions on the selected one. A search
-    box over it filters by hostname, and a list of groups beside it by
-    group."""
+    box over it filters by hostname, IP address and group name, and a list
+    of groups beside it by group."""
 
     app: RmmApp
 
+    # The footer shows the essentials; the menu bar has them all.
     BINDINGS = [
+        Binding("m,f10", "menu", "Menu"),
         Binding("d", "desktop", "Remote desktop"),
         Binding("s", "shell", "Shell"),
-        Binding("r", "scripts", "Scripts"),
-        Binding("n", "new_agent", "New agent"),
-        Binding("k", "classify", "Classify"),
-        Binding("g", "groups", "Groups"),
-        Binding("u", "users", "Users"),
+        Binding("r", "scripts", "Scripts", show=False),
+        Binding("n", "new_agent", "New agent", show=False),
+        Binding("k", "classify", "Classify", show=False),
+        Binding("g", "groups", "Groups", show=False),
+        Binding("u", "users", "Users", show=False),
         Binding("slash", "search", "Search"),
-        Binding("f", "filter", "Filter by group"),
-        Binding("a", "audit", "Audit log"),
-        Binding("c", "columns", "Columns"),
-        Binding("v", "viewer_commands", "Viewer buttons"),
-        Binding("f5", "refresh", "Refresh"),
-        Binding("l", "logout", "Sign out"),
+        Binding("f", "filter", "Filter by group", show=False),
+        Binding("a", "audit", "Audit log", show=False),
+        Binding("c", "columns", "Columns", show=False),
+        Binding("t", "app.change_theme", "Theme", show=False),
+        Binding("e", "themes", "Edit themes", show=False),
+        Binding("v", "viewer_commands", "Viewer buttons", show=False),
+        Binding("f5", "refresh", "Refresh", show=False),
+        Binding("l", "logout", "Sign out", show=False),
         Binding("q", "app.quit", "Quit"),
         Binding("escape", "clear_search", "Clear search", show=False),
     ]
+
+    #: The menu bar: each menu's name and the actions in it.
+    MENUS = {
+        "Agent": ["desktop", "shell", "scripts", "classify", "new_agent"],
+        "View": ["search", "filter", "columns", "app.change_theme", "themes", "refresh"],
+        "Manage": ["groups", "users", "audit", "viewer_commands"],
+        "Session": ["logout", "app.quit"],
+    }
 
     #: Actions on the selected agent, and the capability each needs there.
     AGENT_ACTIONS = {"desktop": DESKTOP, "shell": SHELL}
@@ -371,18 +384,20 @@ class MainScreen(Screen):
         #: prompt) pairs.
         self.filter_values: list[str] = []
         self.group_entries: list[tuple[str, str]] = []
-        #: Lower-cased search text; agents whose hostname contains it are shown.
+        #: Lower-cased search text; agents with it in their hostname, an IP
+        #: address or a group name are shown.
         self.search = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield MenuBar(self.MENUS, id="menu-bar")
         user = self.app.session.user
         role = user.role.replace("_", " ") if user else ""
         yield Static(
             f"{user.username if user else ''} ({role}) @ {self.app.config.server_url}",
             id="whoami",
         )
-        yield Input(placeholder="Search by hostname  ( / )", id="search")
+        yield Input(placeholder="Search by hostname, IP address or group  ( / )", id="search")
         with Horizontal(id="agent-body"):
             with Vertical(id="group-pane"):
                 yield Static("[b]Groups[/b]", id="group-title")
@@ -398,7 +413,7 @@ class MainScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "RMM support"
+        self.title = "TetanusRMM"
         self.set_columns(formatting.valid_columns(self.app.state.agent_columns))
         self.update_group_options()
         self.query_one("#agents", DataTable).focus()
@@ -452,8 +467,10 @@ class MainScreen(Screen):
 
     def matches(self, agent: Agent) -> bool:
         """Whether the search and the group list let ``agent`` through."""
-        if self.search and self.search not in agent.label.lower():
-            return False
+        if self.search:
+            searched = (agent.label, agent.local_ip, agent.remote_ip, *agent.groups)
+            if not any(self.search in text.lower() for text in searched if text):
+                return False
         if self.group_filter == self.ALL_GROUPS:
             return True
         if self.group_filter == self.NO_GROUP:
@@ -498,6 +515,9 @@ class MainScreen(Screen):
     @on(Input.Submitted, "#search")
     def search_submitted(self) -> None:
         self.query_one("#agents", DataTable).focus()
+
+    def action_menu(self) -> None:
+        self.query_one(MenuBar).open()
 
     def action_search(self) -> None:
         self.query_one("#search", Input).focus()
@@ -689,6 +709,11 @@ class MainScreen(Screen):
             )
 
         self.app.push_screen(CommandsScreen(self.app.state.commands), chosen)
+
+    def action_themes(self) -> None:
+        from .theme_editor import ThemeEditorScreen
+
+        self.app.push_screen(ThemeEditorScreen())
 
     def action_classify(self) -> None:
         agent = self.selected()

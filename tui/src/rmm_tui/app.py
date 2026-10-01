@@ -12,6 +12,7 @@ from pathlib import Path
 
 from textual import work
 from textual.app import App
+from textual.theme import Theme
 
 from . import provision
 from .api import ApiClient, ApiError
@@ -20,6 +21,7 @@ from .config import Config, data_dir
 from .screens import LoginScreen, MainScreen, SplashScreen
 from .scripts import ScriptLibrary
 from .state import UiState
+from .themes import DEFAULT_THEME, PREVIEW, THEMES
 from .trust import TrustStore, fetch_ca
 from .viewer import ViewerCommand, ViewerError, close_all
 from .viewer import launch as launch_process
@@ -33,7 +35,7 @@ CaFetcher = Callable[[str], Awaitable[str]]
 
 class RmmApp(App):
     CSS_PATH = "app.tcss"
-    TITLE = "RMM support"
+    TITLE = "TetanusRMM"
 
     def __init__(
         self,
@@ -58,8 +60,14 @@ class RmmApp(App):
         self.trust = trust or TrustStore(self.log_dir / "servers")
         self.fetch_ca = ca_fetcher
         self.viewers: list[subprocess.Popen[bytes]] = []
+        for theme in (*THEMES, *self.state.custom_themes.values()):
+            self.register_theme(theme)
 
     def on_mount(self) -> None:
+        # A theme saved by a newer version may not exist here: use the default.
+        saved = self.state.theme
+        self.theme = saved if saved in self.available_themes else DEFAULT_THEME
+        self.theme_changed_signal.subscribe(self, self.remember_theme)
         if sys.platform != "win32":
             # Closing the terminal or `kill` should still close the viewers.
             loop = asyncio.get_running_loop()
@@ -130,6 +138,14 @@ class RmmApp(App):
             except OSError as e:
                 raise ViewerError(f"cannot save the server's CA certificate: {e}") from e
         return config.with_overrides(ca_path=ca_path)
+
+    def remember_theme(self, theme: Theme) -> None:
+        """The theme was changed: start with it next time."""
+        if theme.name == PREVIEW:
+            return  # the theme editor's unsaved changes
+        if theme.name != (self.state.theme or DEFAULT_THEME):
+            self.state.theme = theme.name
+            self.state.save()
 
     def remember_server(self) -> None:
         """Signed in: offer this server first next time."""

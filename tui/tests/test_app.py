@@ -723,9 +723,9 @@ def serve_grouped(server: FakeServer, user=ADMIN) -> None:
         "GET",
         "/api/agents",
         body=[
-            agent_json("agt-1", hostname="WS-01", groups=["Accounts"]),
+            agent_json("agt-1", hostname="WS-01", groups=["Accounts"], local_ip="10.0.5.21"),
             agent_json("agt-2", hostname="SRV-01", groups=["Accounts", "Servers"]),
-            agent_json("agt-3", hostname="LONER", online=False),
+            agent_json("agt-3", hostname="LONER", online=False, remote_ip="203.0.113.9"),
         ],
     )
     server.on("GET", "/api/groups", body=GROUPS)
@@ -818,6 +818,15 @@ async def test_search_filters_by_hostname_with_the_group_list(tmp_path) -> None:
         search.value = "-0"
         await wait_for(pilot, lambda: shown() == {"agt-1", "agt-2"})
         search.value = "srv"
+        await wait_for(pilot, lambda: shown() == {"agt-2"})
+        # IP addresses (the agent's own and its public one) and group names too.
+        search.value = "10.0.5"
+        await wait_for(pilot, lambda: shown() == {"agt-1"})
+        search.value = "203.0.113.9"
+        await wait_for(pilot, lambda: shown() == {"agt-3"})
+        search.value = "accou"
+        await wait_for(pilot, lambda: shown() == {"agt-1", "agt-2"})
+        search.value = "servers"
         await wait_for(pilot, lambda: shown() == {"agt-2"})
         # Combined with the group list.
         search.value = "-0"
@@ -1400,3 +1409,173 @@ async def test_viewer_buttons_are_edited_saved_and_passed_to_the_viewer(tmp_path
         await wait_for(pilot, lambda: launched)
     assert "--no-default-commands" in launched[0].argv
     assert "--command" not in launched[0].argv
+
+
+async def test_the_menu_bar_runs_the_agent_tables_actions(tmp_path) -> None:
+    from rmm_tui.menu import MenuBar, MenuScreen
+
+    server = FakeServer()
+    app = signed_in_app(server, tmp_path, USER)
+    async with app.run_test(size=(160, 50)) as pilot:
+        screen = await main_screen(pilot, app)
+        # Every action in a menu has a binding to take its label and key from.
+        actions = {b.action for b in MainScreen.BINDINGS}
+        assert all(a in actions for menu in MainScreen.MENUS.values() for a in menu)
+
+        # The key opens the first menu; right walks to the others.
+        await pilot.press("m")
+        await wait_for(pilot, lambda: isinstance(app.screen, MenuScreen))
+        items = app.screen.query_one("#menu-list", OptionList)
+        assert [items.get_option_at_index(i).id for i in range(items.option_count)] == [
+            "desktop",
+            "shell",
+            "scripts",
+            "classify",
+            "new_agent",
+        ]
+        assert str(items.get_option_at_index(0).prompt).split() == ["Remote", "desktop", "d"]
+        # A support engineer may not classify.
+        assert items.get_option("classify").disabled
+        assert not items.get_option("desktop").disabled
+        await pilot.press("right")
+        assert items.get_option_at_index(0).id == "search"
+        assert not items.get_option("app.change_theme").disabled
+        await pilot.press("down", "down", "enter")
+        await wait_for(pilot, lambda: isinstance(app.screen, ColumnsScreen))
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: app.screen is screen)
+
+        # A click on a title opens that menu; Esc closes it and runs nothing.
+        titles = screen.query_one(MenuBar).titles
+        await pilot.click(titles[2])
+        await wait_for(pilot, lambda: isinstance(app.screen, MenuScreen))
+        assert titles[2].has_class("-open")
+        assert app.screen.query_one("#menu-list", OptionList).get_option("users").disabled
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: app.screen is screen)
+        assert not titles[2].has_class("-open")
+
+
+async def test_the_theme_is_kept_between_runs(tmp_path) -> None:
+    from rmm_tui.themes import THEMES
+
+    server = FakeServer()
+    app = signed_in_app(server, tmp_path)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await main_screen(pilot, app)
+        assert all(theme.name in app.available_themes for theme in THEMES)
+        # Ours is the default, and starting with it saves nothing.
+        assert app.theme == "tetanus"
+        assert UiState.load(tmp_path / "state.json").theme is None
+        app.theme = "nord"
+        await wait_for(pilot, lambda: UiState.load(tmp_path / "state.json").theme == "nord")
+
+    app = signed_in_app(server, tmp_path)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await main_screen(pilot, app)
+        assert app.theme == "nord"
+
+    # A saved theme that no longer exists is ignored.
+    state = UiState.load(tmp_path / "state.json")
+    state.theme = "gone"
+    state.save()
+    app = signed_in_app(server, tmp_path)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await main_screen(pilot, app)
+        assert app.theme == "tetanus"
+
+
+async def test_the_theme_editor_previews_saves_and_deletes_themes(tmp_path) -> None:
+    from textual.widgets import Button
+
+    from rmm_tui.groups import ConfirmScreen
+    from rmm_tui.theme_editor import ThemeEditorScreen
+    from rmm_tui.themes import PREVIEW
+
+    def saved() -> UiState:
+        return UiState.load(tmp_path / "state.json")
+
+    server = FakeServer()
+    app = signed_in_app(server, tmp_path)
+    async with app.run_test(size=(160, 50)) as pilot:
+        main = await main_screen(pilot, app)
+        await pilot.press("e")
+        await wait_for(pilot, lambda: isinstance(app.screen, ThemeEditorScreen))
+        editor = app.screen
+        name = editor.query_one("#te-name", Input)
+        primary = editor.query_one("#te-primary", Input)
+        # It opens on the theme in use, as the start of a new one.
+        assert name.value == "tetanus-custom" and primary.value == "#FF9000"
+        assert editor.query_one("#te-delete", Button).disabled
+
+        # A change shows at once, on the app itself, and is not saved.
+        primary.value = "#00FF00"
+        await wait_for(pilot, lambda: app.current_theme.primary == "#00FF00")
+        assert app.theme == PREVIEW
+        assert str(editor.query_one("#te-swatch-primary").styles.background.hex) == "#00FF00"
+        # Half-typed colours leave the preview as it was.
+        primary.value = "#00F"
+        await pilot.pause(0.1)
+        assert app.current_theme.primary == "#00FF00"
+        assert "Primary must be" in str(editor.query_one("#te-status", Static).render())
+        primary.value = "#00FF00"
+
+        # A built-in theme's name is refused; one of your own is saved and used.
+        name.value = "nord"
+        await pilot.press("ctrl+s")
+        await pilot.pause(0.1)
+        assert saved().custom_themes == {}
+        name.value = "Lime"
+        await pilot.press("ctrl+s")
+        await wait_for(pilot, lambda: "lime" in saved().custom_themes)
+        assert saved().theme == "lime" and saved().custom_themes["lime"].primary == "#00FF00"
+        assert saved().custom_themes["lime"].text_alpha == 1.0  # from tetanus
+        assert not editor.query_one("#te-delete", Button).disabled
+
+        # Looking at another theme and leaving puts the saved one on.
+        themes = editor.query_one("#te-themes", OptionList)
+        themes.highlighted = themes.get_option_index("nord")
+        await wait_for(pilot, lambda: app.current_theme.primary == "#88C0D0")
+        assert name.value == "nord-custom"
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: app.screen is main)
+        assert app.theme == "lime" and PREVIEW not in app.available_themes
+        await pilot.pause(0.1)
+        assert saved().theme == "lime"
+
+    # It is there on the next run, to edit or delete.
+    app = signed_in_app(server, tmp_path)
+    async with app.run_test(size=(160, 50)) as pilot:
+        main = await main_screen(pilot, app)
+        assert app.theme == "lime" and app.current_theme.primary == "#00FF00"
+        await pilot.press("e")
+        await wait_for(pilot, lambda: isinstance(app.screen, ThemeEditorScreen))
+        editor = app.screen
+        assert editor.query_one("#te-name", Input).value == "lime"
+        editor.query_one("#te-accent", Input).value = "#123456"
+        await pilot.press("ctrl+s")
+        await wait_for(pilot, lambda: saved().custom_themes["lime"].accent == "#123456")
+
+        await pilot.click("#te-delete")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        await pilot.click("#confirm-ok")
+        await wait_for(pilot, lambda: saved().custom_themes == {})
+        assert saved().theme is None and "lime" not in app.available_themes
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: app.screen is main)
+        assert app.theme == "tetanus"
+
+    # A cancelled visit changes nothing.
+    app = signed_in_app(server, tmp_path)
+    async with app.run_test(size=(160, 50)) as pilot:
+        main = await main_screen(pilot, app)
+        app.theme = "nord"
+        await pilot.press("e")
+        await wait_for(pilot, lambda: isinstance(app.screen, ThemeEditorScreen))
+        app.screen.query_one("#te-primary", Input).value = "#ABCDEF"
+        await wait_for(pilot, lambda: app.current_theme.primary == "#ABCDEF")
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: app.screen is main)
+        assert app.theme == "nord"
+        await pilot.pause(0.1)
+        assert saved().theme == "nord" and saved().custom_themes == {}

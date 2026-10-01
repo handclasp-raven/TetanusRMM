@@ -41,6 +41,34 @@ LoginScreen {
     color: $text-muted;
 }
 
+/* --- menu bar ------------------------------------------------------------ */
+
+#menu-bar {
+    height: 1;
+    background: $panel;
+}
+
+.menu-title {
+    width: auto;
+}
+
+.menu-title:hover, .menu-title.-open {
+    background: $primary;
+    color: $text;
+}
+
+/* The screen under an open menu stays as it is. */
+MenuScreen {
+    background: transparent;
+}
+
+#menu-list {
+    width: auto;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+}
+
 #agents, #audit {
     height: 1fr;
 }
@@ -367,6 +395,93 @@ RoleScreen, PasswordScreen, TotpScreen, GrantsScreen, GrantEditScreen, TrustScre
 
 #totp-box, #grants-box {
     width: 90;
+}
+
+/* --- theme editor ------------------------------------------------------------ */
+
+#te-list-pane {
+    width: 30;
+    border-right: vkey $primary;
+}
+
+#te-list-title {
+    padding: 0 1;
+}
+
+#te-themes {
+    height: 1fr;
+    border: none;
+}
+
+#te-main {
+    width: 1fr;
+    padding: 0 2;
+}
+
+.te-row {
+    height: 1;
+}
+
+.te-label {
+    width: 12;
+}
+
+#te-name {
+    width: 34;
+}
+
+.te-color {
+    width: 10;
+}
+
+.te-swatch {
+    width: 6;
+    margin-left: 1;
+}
+
+#te-dark {
+    margin-top: 1;
+}
+
+#te-buttons {
+    height: 3;
+    margin-top: 1;
+}
+
+#te-buttons > Button {
+    width: auto;
+    min-width: 8;
+    margin-right: 1;
+}
+
+#te-status {
+    height: auto;
+    min-height: 1;
+}
+
+#te-preview {
+    height: auto;
+    margin-top: 1;
+    border: round $primary;
+    background: $surface;
+    padding: 0 1;
+}
+
+#te-preview-panel {
+    background: $panel;
+    padding: 0 1;
+    margin: 1 0;
+}
+
+#te-preview-buttons {
+    height: 3;
+    margin-top: 1;
+}
+
+#te-preview-buttons > Button {
+    width: auto;
+    min-width: 8;
+    margin-right: 1;
 }
 
 /* --- viewer command buttons ------------------------------------------------ */

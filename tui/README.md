@@ -27,7 +27,8 @@ directly. What it does:
   straight into agent groups. The MSI can be saved from the TUI.
 - **Groups:** view groups and their members. Admins can also create, rename,
   delete and fill them. The group list beside the agent table filters it,
-  and the search box above it filters by hostname.
+  and the search box above it filters by hostname, IP address or group
+  name.
 - **Users** (admins only): add and remove users, change their role, choose
   which agents a support engineer may work on, and set their password or
   reset their TOTP secret.
@@ -149,8 +150,9 @@ TLS is always verified: against `ca_path` if set, otherwise against the CA
 accepted for the server at [first sign-in](#first-sign-in), otherwise
 against the system trust store. There is no option to turn verification off.
 
-The TUI also remembers the server you last signed in to and your agent-table
-columns, in `state.json` in the data directory.
+The TUI also remembers the server you last signed in to, your agent-table
+columns, your colour theme and the themes you made, in `state.json` in the
+data directory.
 
 Logs go to the data directory (`~/.local/share/rmm-tui/`,
 `~/Library/Application Support/rmm-tui/` or `%LOCALAPPDATA%\rmm-tui\`), never
@@ -189,23 +191,40 @@ server-side session then expires on its own.
 
 | Key | Action |
 |---|---|
+| `m` or `F10` | Open the menu bar (`←`/`→`: other menus, `Enter`: choose, `Esc`: close) |
 | `d` or `Enter` | Remote desktop: launch the viewer for the selected agent |
 | `s` | Shell console on the selected agent |
 | `r` | Script runner (the selected agent is pre-selected) |
 | `n` | New agent: download link / MSI (admins and support engineers) |
-| `/` | Search by hostname (`Enter`: back to the table, `Esc`: clear) |
+| `/` | Search by hostname, IP address or group name (`Enter`: back to the table, `Esc`: clear) |
 | `f` | Jump to the group list |
 | `k` | Classify the selected agent as server, desktop or other (admins) |
 | `g` | Groups |
 | `u` | Users: accounts, roles, access and passwords (admins; hidden otherwise) |
 | `a` | Audit log (admins and auditors) |
 | `c` | Choose columns |
+| `t` | Choose the colour theme (kept between runs; `tetanus` is the default) |
+| `e` | Theme editor: make, change and delete themes of your own |
 | `v` | Viewer buttons: the remote viewer's command buttons |
 | `F5` | Refresh now (the table also refreshes every `poll_interval`) |
 | `l` | Sign out |
 | `q` | Quit |
 
-The footer shows only the actions you may take on the **selected agent**. A
+The **menu bar** over the table groups the same actions into Agent, View,
+Manage and Session menus, each item with its key; click a menu or press `m`.
+
+The **theme editor** (`e`) lists every theme on the left. Pick one to start
+from, change its colours (`#RRGGBB`) and the whole screen takes them on as
+you type. **Save** (`Ctrl+S`) keeps it under the name in the form and makes
+it your theme; a built-in theme is never changed, so starting from one makes
+a copy under a new name. Your own themes are marked "yours" and can be
+edited again or deleted. `Esc` leaves, putting back the theme you last saved
+there or else the one you had.
+
+The footer shows only the essentials (menu, remote desktop, shell, search,
+quit); the other keys still work and are listed in the menus. Remote desktop
+and shell are only offered where you may use them on the **selected agent**
+(the menus grey out what you may not do). A
 **support engineer** only sees the agents an admin has granted them, and
 only gets remote desktop, shell or scripts where their grant covers that
 (the server says so per agent). An **auditor** sees the agent table and the
@@ -239,7 +258,8 @@ values are stale. Logged-in user, IP address and OS need agents at protocol 9;
 older agents show `–` until they update.
 
 **Search:** type in the box above the table (`/` jumps to it) to show only
-agents whose hostname contains the text, ignoring case.
+agents with the text in their hostname, IP address (their own or their
+public one) or the name of a group they are in, ignoring case.
 
 **Group list:** the list beside the table (`f` jumps to it) shows all
 agents, those in no group, or one group's members, each with its agent
