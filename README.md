@@ -4,6 +4,18 @@
 
 Terminal based remote monitoring and management tool.
 
+## Table of Contents
+- [About](#-about)
+- [Features](#-features)
+- [Quick Install](#-quick-install)
+- [Still To Come](#-still-to-come)
+- [Quick Assist](#-quick-assist)
+- [Documentation](#-documentation)
+- [Development Quick Start](#-development-quick-start)
+
+
+## 🚀 About
+
 - **Support TUI** (Python + Textual): Runs anywhere you can run python. Sign in, administrate accounts, add agents, launch the viewer, shell console and script runner.
 - **Viewer** (Linux, macOS, Windows): end-to-end encrypted remote desktop, relayed through the server or direct when NAT allows.
 - **Server** (Rust): Runs in Docker, maintains connection to agents and acts as a direct connection broker or fallback relay if necessary.
@@ -12,7 +24,8 @@ Terminal based remote monitoring and management tool.
 
 Full documentation is in the **[wiki](https://github.com/handclasp-raven/TetanusRMM/wiki)**.
 
-## Quick install
+
+## ⚡ Quick Install
 
 On a Linux x86_64 host with `curl`:
 
@@ -20,12 +33,40 @@ On a Linux x86_64 host with `curl`:
 curl -fsSL https://raw.githubusercontent.com/handclasp-raven/TetanusRMM/main/scripts/install.sh -o install.sh
 bash install.sh --host rmm.example.com
 ```
+> [!TIP]
+> If the server is reached at more than one name or address, list them all (`--host rmm.example.com,10.0.0.5`, or `--host` again for each): every one goes into the server certificate, and the first is the public address.
 
-If the server is reached at more than one name or address, list them all (`--host rmm.example.com,10.0.0.5`, or `--host` again for each): every one goes into the server certificate, and the first is the public address.
+> [!NOTE]
+>Open ports 8443/tcp, 4433/udp, 4433/tcp and 3478/udp. The script prints the admin's TOTP secret once, so add it to an authenticator app before closing the terminal. Then send staff to `https://<host>:8443/install` and [enroll an agent](https://github.com/handclasp-raven/TetanusRMM/wiki/Enrolling-an-Agent).
 
-Open ports 8443/tcp, 4433/udp, 4433/tcp and 3478/udp. The script prints the admin's TOTP secret once, so add it to an authenticator app before closing the terminal. Then send staff to `https://<host>:8443/install` and [enroll an agent](https://github.com/handclasp-raven/TetanusRMM/wiki/Enrolling-an-Agent).
 
-## Quick assist
+## 💎 Features
+-  **TUI Built with Textual (so you know it's good):** Fast, keyboard shortcuts for everything, built in themes and a theme editor.
+-  **Speed:** Remote access sessions are built in Rust and use the newer Windows.Graphics.Capture API (for Win 10 and Win 11) so the FPS is great.
+-  **Speeeeed:** If your NAT allows for it, the server will broker a direct connection from your viewer to the agent so there is no middle man to slow things down.
+-  **User management and RBAC:** Create and administrate users, give them access to certain functions for certain groups.
+-  **Painless Agent Install:** Generate a URL, open it on the remote PC, Download an MSI, Install - done.
+-  **Quick Support:** For when you just need to fix something for someone but don't need an agent. Give them a link, Give them a code and you're connected!
+-  **Remote Shell:** Need to just fire some commands without bugging the user? Say less.
+-  **Scripts:** Add scripts, choose target devices or a group and hit run. Easy.
+-  **Quick Commands:** In your remove viewer, you can add your own quick command buttons to save you having to hit Win+R.
+-  **Audit Logging** The server keeps an audit of who did what and where
+
+
+## 🤔 Still To Come
+- [ ] **Handle Login Screens and UAC:** currently you can interact with elevated windows, however the user still needs to handle the login screen and UAC prompts.
+- [ ] **Password Manager Integration:** Integrate a password manager into the Remote Session Viewer to save you having to copy/paste everything
+- [ ] **Mass Agent Deployment:** An MSI that can be reused for Intune or GPOs for mass deployment.
+- [ ] **Cred Cache:** Prompt users for a credential so you can log into things without them, all without them actually giving you the credential!
+- [ ] **Better Monitoring:** Sysmon and a sane config by default + log shipping.
+- [ ] **Tunnelling and Remote Apps:** Create temporary tunnels and access devices within the customer's network like admin pages, printers, etc from your local browser.
+- [ ] **More Agent Platform Support:** Linux (X and Wayland), MacOS and older versions of Windows (Currently untested but may work).
+- [ ] **E-mail password reset self service:** Currently all administration is performed on the platform itself through the TUI and no E-mails are tied to user accounts.
+- [ ] **Tailscale Integration:** build the server with Docker Tailscale integration so the server can hide on your mesh and you can minimize external exposure
+- [ ] **Serve the TUI over the web** Access a TUI from a browser using Textual
+
+
+## 💻 Quick Assist
 
 To help someone whose computer has no agent, once:
 
@@ -36,7 +77,8 @@ To help someone whose computer has no agent, once:
 
 You get remote desktop (screen, input, clipboard) and file transfer, running as the user. There is no shell, no scripts and no command buttons, for admins too. Only the technician who made the code, and admins, can use the session. While the program stays open the machine is in the agent table, so a closed viewer can be reopened with `d`; the server forgets the machine two minutes after the program is closed. Codes, their use and the end of each session are in the audit log (`assist.create`, `assist.redeem`, `assist.end`).
 
-Limits: Windows only. UAC prompts and the lock screen cannot be seen or controlled. With the installer's own CA the user's browser warns about the page's certificate, and Windows SmartScreen warns about the unsigned program; a publicly trusted certificate on the API and a code-signing certificate remove those warnings.
+> [!IMPORTANT]
+> Windows only. UAC prompts and the lock screen cannot be seen or controlled. With the installer's own CA the user's browser warns about the page's certificate, and Windows SmartScreen warns about the unsigned program; a publicly trusted certificate on the API and a code-signing certificate remove those warnings.
 
 The script installs the newest release: a server image from `ghcr.io/handclasp-raven/tetanusrmm` and the agent, viewer and TUI builds from the [releases page](https://github.com/handclasp-raven/TetanusRMM/releases). Nothing is compiled on the host. To upgrade later, run this in the install directory; it backs the database up to `backups/` first:
 
@@ -46,7 +88,8 @@ bash scripts/install.sh --upgrade
 
 See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/Installing-the-Server) for options and the manual steps.
 
-## Documentation
+
+## 📚 Documentation
 
 **Getting started:** [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/Installing-the-Server) · [Enrolling an Agent](https://github.com/handclasp-raven/TetanusRMM/wiki/Enrolling-an-Agent) · [MSI Installer](https://github.com/handclasp-raven/TetanusRMM/wiki/MSI-Installer) · [Windows Agent Service](https://github.com/handclasp-raven/TetanusRMM/wiki/Windows-Agent-Service) · [Support TUI](https://github.com/handclasp-raven/TetanusRMM/wiki/Support-TUI)
 
@@ -56,7 +99,10 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 
 **Development:** [Architecture](https://github.com/handclasp-raven/TetanusRMM/wiki/Architecture) · [Development Setup](https://github.com/handclasp-raven/TetanusRMM/wiki/Development-Setup) · [Testing](https://github.com/handclasp-raven/TetanusRMM/wiki/Testing)
 
-## Development quick start
+The support TUI has its own README: [tui/README.md](tui/README.md).
+
+
+## ⚡ Development Quick Start
 
 Requires Docker and a Rust toolchain.
 
@@ -74,5 +120,3 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace        # needs a running Docker daemon
 ```
-
-The support TUI has its own README: [tui/README.md](tui/README.md).
