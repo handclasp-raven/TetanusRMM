@@ -284,6 +284,28 @@ backup() {
     note "wrote $BACKUP"
 }
 
+# Postgres sets its password only when it creates the database, so a volume
+# left by an earlier install (`docker compose down` keeps it) cannot be
+# opened with the new password a fresh .env gets.
+leftover_database() {
+    local volume answer=
+    volume=$(docker compose config 2>/dev/null | sed -n 's/^name: //p' | head -n 1)_pgdata
+    docker volume inspect "$volume" >/dev/null 2>&1 || return 0
+    note "A database from an earlier install is still here (Docker volume $volume),"
+    note "but the .env with its password is gone, so the server cannot open it."
+    if interactive; then
+        read -r -p "    Delete that database and start fresh? [y/N]: " answer </dev/tty
+    fi
+    case $answer in
+        [yY]*) ;;
+        *) die "to keep the old database, put its .env back in $DIR and run this again;
+to discard it: (cd $DIR && docker compose down) && docker volume rm $volume" ;;
+    esac
+    docker compose down >/dev/null 2>&1 || true
+    docker volume rm "$volume" >/dev/null
+    note "deleted $volume"
+}
+
 detect_address() {
     local ip
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
@@ -317,6 +339,7 @@ configure() {
     HOST=${HOSTS[0]}
 
     if [ ! -f .env ]; then
+        leftover_database
         (
             umask 077
             cat >.env <<EOF
