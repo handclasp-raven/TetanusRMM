@@ -18,7 +18,15 @@ curl -fsSL https://raw.githubusercontent.com/handclasp-raven/TetanusRMM/main/scr
 bash install.sh --host rmm.example.com
 ```
 
+If the server is reached at more than one name or address, list them all (`--host rmm.example.com,10.0.0.5`, or `--host` again for each): every one goes into the server certificate, and the first is the public address.
+
 Open ports 8443/tcp, 4433/udp, 4433/tcp and 3478/udp. The script prints the admin's TOTP secret once, so add it to an authenticator app before closing the terminal. Then send staff to `https://<host>:8443/install` and [enroll an agent](https://github.com/handclasp-raven/TetanusRMM/wiki/Enrolling-an-Agent).
+
+The script installs the newest release: a server image from `ghcr.io/handclasp-raven/tetanusrmm` and the agent, viewer and TUI builds from the [releases page](https://github.com/handclasp-raven/TetanusRMM/releases). Nothing is compiled on the host. To upgrade later, run this in the install directory; it backs the database up to `backups/` first:
+
+```bash
+bash scripts/install.sh --upgrade
+```
 
 See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/Installing-the-Server) for options and the manual steps.
 

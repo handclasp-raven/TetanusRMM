@@ -7,29 +7,48 @@
 #
 # or, from a checkout: scripts/install.sh --host rmm.example.com
 #
+# To upgrade an installed server to the newest release, from its directory:
+#
+#   bash scripts/install.sh --upgrade
+#
 # What it does (each step is skipped if already done, so it is safe to re-run):
-#   1. installs git and Docker if missing (asks first);
-#   2. clones the repository, unless run from a checkout;
-#   3. writes .env: a random database password, the public URL, your uid/gid;
-#   4. builds the server image;
+#   1. installs Docker if missing (asks first);
+#   2. downloads the release: the compose file, these scripts and the agent,
+#      viewer and TUI builds, checked against the release's SHA256SUMS;
+#   3. writes .env: a random database password, the public URL, your uid/gid
+#      and the server image of that release;
+#   4. pulls the server image (an upgrade backs the database up first, into
+#      ./backups);
 #   5. generates the CA and server certificate (./dev-certs) and the update
 #      signing key (./update-keys);
 #   6. starts Postgres and the server with Docker Compose;
 #   7. creates the first admin user;
-#   8. builds, signs and publishes the Windows agent, the viewers and the TUI.
+#   8. signs the Windows agent with your update key and publishes it, the
+#      viewers and the TUI.
 #
 # Only Docker is needed on the host: there is no Rust or Python to install.
 #
+# Run from a git checkout, or with --from-source, it builds everything from
+# the source tree instead of using a release (steps 2, 4 and 8; this takes
+# a while, and the first agent build downloads a ~3.6 GB toolchain image).
+#
 # Options (or the environment variable in brackets):
 #   --host NAME       name or IP that agents and staff reach this server at
-#                     [RMM_HOST]; default: asks, suggesting this host's address
-#   --dir PATH        where to clone to [RMM_DIR]; default /opt/tetanusrmm as
+#                     [RMM_HOST]; default: asks, suggesting this host's address.
+#                     Repeat it, or separate names with commas, to put more
+#                     names in the server certificate: the first is the one
+#                     in the public URL and the download links
+#   --dir PATH        where to install [RMM_DIR]; default /opt/tetanusrmm as
 #                     root, ~/tetanusrmm otherwise
-#   --repo URL        git repository to clone [RMM_REPO]
-#   --branch NAME     branch or tag to check out [RMM_BRANCH]
+#   --upgrade         move to the newest release (without it, a re-run keeps
+#                     the installed version)
+#   --version X.Y.Z   install or move to this release [RMM_VERSION]
+#   --from-source     clone the repository and build from source
+#   --repo URL        git repository, and where its releases are [RMM_REPO]
+#   --branch NAME     branch or tag to check out, with --from-source [RMM_BRANCH]
 #   --admin NAME      first admin's username [RMM_ADMIN]; default admin
 #   --no-admin        do not create a user
-#   --skip-clients    do not build the agent, viewers and TUI (step 8)
+#   --skip-clients    do not publish the agent, viewers and TUI (step 8)
 #   -y, --yes         never ask: take the defaults, generate the admin password
 #   -h, --help        show this text
 #
@@ -38,7 +57,11 @@ set -euo pipefail
 
 REPO=${RMM_REPO:-https://github.com/handclasp-raven/TetanusRMM.git}
 BRANCH=${RMM_BRANCH:-}
+IMAGE_REPO=${RMM_IMAGE_REPO:-ghcr.io/handclasp-raven/tetanusrmm}
+VERSION=${RMM_VERSION:-}
 DIR=${RMM_DIR:-}
+# Comma-separated until configure splits it: then HOST is the first name, the
+# public one, and HOSTS is all of them.
 HOST=${RMM_HOST:-}
 ADMIN=${RMM_ADMIN:-admin}
 ADMIN_PASSWORD=${RMM_ADMIN_PASSWORD:-}
@@ -46,6 +69,10 @@ MIN_PASSWORD_LEN=12
 create_admin=yes
 build_clients=yes
 assume_yes=no
+upgrade=no
+from_source=no
+# "release": run a published release. "source": build this tree. See locate.
+mode=
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
@@ -76,6 +103,14 @@ random_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
 # env_get KEY: the value in .env, or nothing.
 env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -n 1 || true; }
+
+# env_set KEY VALUE: replace or add the line in .env.
+env_set() {
+    env_unset "$1"
+    echo "$1=$2" >>.env
+}
+
+env_unset() { sed -i "/^$1=/d" .env; }
 
 as_root() {
     if [ "$(id -u)" = 0 ]; then "$@"
@@ -111,7 +146,6 @@ prerequisites() {
     [ "$(uname -m)" = x86_64 ] \
         || note "warning: only x86_64 hosts are tested (this is $(uname -m))"
     command -v curl >/dev/null 2>&1 || die "curl is required"
-    command -v git >/dev/null 2>&1 || install_git
     command -v docker >/dev/null 2>&1 || install_docker
     docker compose version >/dev/null 2>&1 \
         || die "the Docker Compose plugin is missing: https://docs.docker.com/compose/install/"
@@ -120,20 +154,30 @@ prerequisites() {
 either run this script as root, or add yourself to the docker group
 (sudo usermod -aG docker $(id -un)), log in again and re-run."
     fi
-    note "git, Docker $(docker version -f '{{.Server.Version}}') and Compose are ready"
+    note "Docker $(docker version -f '{{.Server.Version}}') and Compose are ready"
+}
+
+# Sets DIR (where the server is, or goes) and mode.
+locate() {
+    HERE=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")/.." 2>/dev/null && pwd || true)
+    if [ -z "$DIR" ] && [ -f "$HERE/docker-compose.yml" ] && [ -f "$HERE/scripts/lib.sh" ]; then
+        DIR=$HERE
+    elif [ -z "$DIR" ]; then
+        if [ "$(id -u)" = 0 ]; then DIR=/opt/tetanusrmm; else DIR=$HOME/tetanusrmm; fi
+    fi
+    if [ "$from_source" = yes ]; then mode=source
+    elif [ "$upgrade" = yes ] || [ -n "$VERSION" ]; then mode=release
+    elif grep -q '^RMM_IMAGE=' "$DIR/.env" 2>/dev/null; then mode=release
+    elif [ -d "$DIR/crates/server" ]; then mode=source
+    else mode=release; fi
 }
 
 # Leaves the shell in the repository root.
 fetch_source() {
-    local here
-    here=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")/.." 2>/dev/null && pwd || true)
-    if [ -z "$DIR" ] && [ -f "$here/docker-compose.yml" ] && [ -d "$here/crates/server" ]; then
-        DIR=$here
+    if [ "$DIR" = "$HERE" ] && [ -d "$DIR/crates/server" ]; then
         say "Using the checkout in $DIR"
     else
-        if [ -z "$DIR" ]; then
-            if [ "$(id -u)" = 0 ]; then DIR=/opt/tetanusrmm; else DIR=$HOME/tetanusrmm; fi
-        fi
+        command -v git >/dev/null 2>&1 || install_git
         if [ -d "$DIR/.git" ]; then
             say "Updating $DIR"
             git -C "$DIR" pull --ff-only
@@ -143,6 +187,101 @@ fetch_source() {
         fi
     fi
     cd "$DIR"
+}
+
+# The release the server image in .env belongs to, or nothing.
+installed_version() {
+    local image
+    image=$(env_get RMM_IMAGE)
+    case $image in "$IMAGE_REPO":*) echo "${image##*:}" ;; esac
+}
+
+# Settles VERSION: the one asked for, else the installed one (unless
+# upgrading), else the newest release.
+resolve_version() {
+    VERSION=${VERSION#v}
+    [ -n "$VERSION" ] || [ "$upgrade" = yes ] || VERSION=$OLD_VERSION
+    [ -z "$VERSION" ] || return 0
+    local url
+    # The "latest" page redirects to the newest release's tag.
+    url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${REPO%.git}/releases/latest") \
+        || die "cannot reach ${REPO%.git}/releases"
+    case $url in
+        */releases/tag/v*) VERSION=${url##*/releases/tag/v} ;;
+        *) die "${REPO%.git} has no release yet: pass --version, or build with --from-source" ;;
+    esac
+}
+
+release_url() { echo "${REPO%.git}/releases/download/v$VERSION/$1"; }
+
+# install_file NAME DEST: put a release file in place. Moved into place, not
+# written over, because DEST may be this very script, still running.
+install_file() {
+    cp "releases/$VERSION/$1" "$2.new"
+    mv "$2.new" "$2"
+}
+
+# Download the release into ./releases/VERSION and put its compose file and
+# scripts in place. Leaves the shell in DIR.
+fetch_release() {
+    mkdir -p "$DIR"
+    cd "$DIR"
+    OLD_VERSION=$(installed_version)
+    resolve_version
+    local rel=releases/$VERSION file
+    if (cd "$rel" 2>/dev/null && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1); then
+        say "Using release $VERSION (already downloaded)"
+    else
+        say "Downloading release $VERSION"
+        mkdir -p "$rel"
+        curl -fsSL -o "$rel/SHA256SUMS" "$(release_url SHA256SUMS)" \
+            || die "there is no release $VERSION at ${REPO%.git}/releases"
+        while read -r _ file; do
+            file=${file#\*}
+            case $file in */*|.*|'') die "unexpected file name in SHA256SUMS: '$file'" ;; esac
+            note "$file"
+            curl -fsSL -o "$rel/$file" "$(release_url "$file")" || die "downloading $file failed"
+        done <"$rel/SHA256SUMS"
+        (cd "$rel" && sha256sum -c --quiet SHA256SUMS) \
+            || die "the downloaded files do not match the release's SHA256SUMS"
+    fi
+
+    if [ -d .git ]; then
+        # A git checkout moving to releases keeps its tracked files; it only
+        # needs a compose file that takes the image from .env.
+        if ! grep -q RMM_IMAGE docker-compose.yml; then
+            note "updating the checkout"
+            git pull --ff-only
+        fi
+        return 0
+    fi
+    local same=no
+    ! cmp -s "${BASH_SOURCE[0]}" "$rel/install.sh" || same=yes
+    mkdir -p scripts
+    install_file docker-compose.yml docker-compose.yml
+    install_file lib.sh scripts/lib.sh
+    install_file install.sh scripts/install.sh
+    # Carry on with the release's own copy of this script, once.
+    if [ "$same" = no ] && [ -z "${RMM_INSTALL_REEXEC:-}" ]; then
+        RMM_INSTALL_REEXEC=1 exec bash scripts/install.sh \
+            ${ARGS[@]+"${ARGS[@]}"} --dir "$DIR" --version "$VERSION"
+    fi
+}
+
+# Before an upgrade changes anything: migrations cannot be undone.
+backup() {
+    [ "$mode" = release ] && [ "$upgrade" = yes ] || return 0
+    [ "${OLD_VERSION:-source}" != "$VERSION" ] || return 0
+    [ -n "$(docker compose ps -q db 2>/dev/null)" ] || return 0
+    say "Backing up the database"
+    mkdir -p backups
+    BACKUP=backups/$(date +%Y%m%d-%H%M%S)-${OLD_VERSION:-source}.sql.gz
+    (
+        umask 077
+        docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
+            | gzip >"$BACKUP"
+    ) || die "the database backup failed; the server has not been changed"
+    note "wrote $BACKUP"
 }
 
 detect_address() {
@@ -165,9 +304,17 @@ configure() {
         note "Agents and staff reach the server at one name or IP address. It goes"
         note "into the server certificate and every download link, so use the"
         note "address they can really reach (a public DNS name, if you have one)."
+        note "To put more names in the certificate, list them after it, separated"
+        note "by commas."
         HOST=$(ask "Server name or IP" "$(detect_address)")
     fi
-    case $HOST in *[!A-Za-z0-9.:-]*|'') die "not a host name or IP address: '$HOST'" ;; esac
+    IFS=', ' read -r -a HOSTS <<<"$HOST"
+    [ "${#HOSTS[@]}" -gt 0 ] || die "no host name or IP address given"
+    local name
+    for name in "${HOSTS[@]}"; do
+        case $name in *[!A-Za-z0-9.:-]*|'') die "not a host name or IP address: '$name'" ;; esac
+    done
+    HOST=${HOSTS[0]}
 
     if [ ! -f .env ]; then
         (
@@ -182,29 +329,52 @@ EOF
         )
         note "wrote .env (random database password, mode 0600)"
     fi
+    if [ "$mode" = release ]; then
+        export RMM_IMAGE=$IMAGE_REPO:$VERSION
+        [ "$(env_get RMM_IMAGE)" = "$RMM_IMAGE" ] || env_set RMM_IMAGE "$RMM_IMAGE"
+        note "server image: $RMM_IMAGE"
+    elif [ -n "$(env_get RMM_IMAGE)" ]; then
+        env_unset RMM_IMAGE
+        note "removed RMM_IMAGE from .env: the server image is built here"
+    fi
     API_PORT=${RMM_API_PORT:-$(env_get RMM_API_PORT)}
     API_PORT=${API_PORT:-8443}
     note "public address: https://$HOST:$API_PORT"
 }
 
-# Does the server certificate cover $HOST? Unknown (no openssl) counts as yes.
+image() {
+    if [ "$mode" = source ]; then
+        say "Building the server image (several minutes the first time)"
+        docker compose build server
+    else
+        say "Pulling the server image"
+        docker compose pull server
+    fi
+}
+
+# cert_covers_host NAME: does the server certificate cover it? Unknown (no
+# openssl) counts as yes.
 cert_covers_host() {
     command -v openssl >/dev/null 2>&1 || return 0
     local check=-checkhost
-    case $HOST in *:*) check=-checkip ;; *[!0-9.]*) ;; *) check=-checkip ;; esac
-    { openssl x509 -in dev-certs/server.crt -noout "$check" "$HOST" 2>/dev/null || true; } \
+    case $1 in *:*) check=-checkip ;; *[!0-9.]*) ;; *) check=-checkip ;; esac
+    { openssl x509 -in dev-certs/server.crt -noout "$check" "$1" 2>/dev/null || true; } \
         | grep -q 'does match'
 }
 
 certificates() {
     say "Certificates and keys"
+    local name sans=()
     if [ -f dev-certs/ca.crt ]; then
         note "keeping the existing CA and server certificate in dev-certs/"
-        cert_covers_host || note "warning: the server certificate does not cover '$HOST'.
+        for name in "${HOSTS[@]}"; do
+            cert_covers_host "$name" || note "warning: the server certificate does not cover '$name'.
     Clients will refuse it. Replacing it replaces the CA too, so agents must
     re-enroll: see 'gen-certs --force --san' in the README."
+        done
     else
-        server gen-certs --san "$HOST"
+        for name in "${HOSTS[@]}"; do sans+=(--san "$name"); done
+        server gen-certs "${sans[@]}"
     fi
     if [ -f update-keys/update.pub ]; then
         note "keeping the existing update signing key in update-keys/"
@@ -272,10 +442,36 @@ $ADMIN_SUMMARY"
     note "created '$ADMIN'; its sign-in details are in the summary below"
 }
 
+# The release's agent is the same for every server: it is signed here, with
+# this server's update key, which agents pin the first time they connect.
+publish_release() {
+    say "Signing and publishing the agent, the viewers and the TUI ($VERSION)"
+    local rel=releases/$VERSION
+    server sign-update "$rel/rmm-agent-windows-x86_64.exe" \
+        --platform windows-x86_64 --version "$VERSION"
+    server publish-update "$rel/rmm-agent-windows-x86_64.exe" \
+        --platform windows-x86_64 --version "$VERSION"
+    server publish-viewer "$rel/rmm-viewer-linux-x86_64" \
+        --platform linux-x86_64 --version "$VERSION"
+    server publish-viewer "$rel/rmm-viewer-windows-x86_64.exe" \
+        --platform windows-x86_64 --version "$VERSION"
+    server publish-tui "$rel"/rmm_tui-*.whl
+    # Downloads of earlier releases are not needed again.
+    find releases -mindepth 1 -maxdepth 1 ! -name "$VERSION" -exec rm -rf {} +
+}
+
 clients() {
-    if [ "$build_clients" = no ]; then
+    if [ "$build_clients" = no ] && [ "$mode" = release ]; then
+        CLIENTS_NOTE="The agent, viewers and TUI were not published. Publish them by
+  running this again without --skip-clients."
+        return 0
+    elif [ "$build_clients" = no ]; then
         CLIENTS_NOTE="Agent, viewer and TUI builds were skipped. Build them with
   scripts/build-windows-agent.sh && scripts/build-clients.sh"
+        return 0
+    fi
+    if [ "$mode" = release ]; then
+        publish_release
         return 0
     fi
     say "Building the Windows agent (the first build downloads a ~3.6 GB toolchain image)"
@@ -291,6 +487,7 @@ summary() {
   Server:        https://$HOST:$API_PORT
   Staff install: https://$HOST:$API_PORT/install   (TUI download and instructions)
   Installed in:  $DIR
+  Version:       $(version_summary)
   CA fingerprint (staff confirm it at first sign-in):
     $(server_fingerprint)
 
@@ -314,8 +511,26 @@ EOF
   Manage it from $DIR:
     docker compose logs -f server      # logs
     docker compose down                # stop (data is kept)
-    git pull && bash scripts/install.sh  # upgrade
+    $(upgrade_command)
 EOF
+}
+
+version_summary() {
+    if [ "$mode" = source ]; then
+        echo "built from source"
+    elif [ -n "${BACKUP:-}" ]; then
+        echo "$VERSION (was ${OLD_VERSION:-built from source}; database backup in $BACKUP)"
+    else
+        echo "$VERSION"
+    fi
+}
+
+upgrade_command() {
+    if [ "$mode" = source ]; then
+        echo "git pull && bash scripts/install.sh  # upgrade"
+    else
+        echo "bash scripts/install.sh --upgrade  # upgrade to the newest release"
+    fi
 }
 
 server_fingerprint() {
@@ -327,12 +542,17 @@ server_fingerprint() {
 }
 
 main() {
+    ARGS=("$@")
+    local host_args=
     while [ $# -gt 0 ]; do
         case $1 in
-            --host) HOST=${2:?--host needs a value}; shift ;;
+            --host) host_args=${host_args:+$host_args,}${2:?--host needs a value}; shift ;;
             --dir) DIR=${2:?--dir needs a value}; shift ;;
             --repo) REPO=${2:?--repo needs a value}; shift ;;
             --branch) BRANCH=${2:?--branch needs a value}; shift ;;
+            --version) VERSION=${2:?--version needs a value}; shift ;;
+            --upgrade) upgrade=yes ;;
+            --from-source) from_source=yes ;;
             --admin) ADMIN=${2:?--admin needs a value}; shift ;;
             --no-admin) create_admin=no ;;
             --skip-clients) build_clients=no ;;
@@ -342,19 +562,25 @@ main() {
         esac
         shift
     done
+    [ -z "$host_args" ] || HOST=$host_args
     if [ -n "$ADMIN_PASSWORD" ] && [ "${#ADMIN_PASSWORD}" -lt "$MIN_PASSWORD_LEN" ]; then
         die "RMM_ADMIN_PASSWORD must be at least $MIN_PASSWORD_LEN characters"
     fi
 
+    if [ "$from_source" = yes ] && { [ "$upgrade" = yes ] || [ -n "$VERSION" ]; }; then
+        die "--from-source builds the source tree: it cannot take --upgrade or --version"
+    fi
+
+    locate
     prerequisites
-    fetch_source
-    # The server CLI runs from the image built below, not from a host toolchain.
+    if [ "$mode" = source ]; then fetch_source; else fetch_release; fi
+    # The server CLI runs from the server image, not from a host toolchain.
     export RMM_SERVER_CLI=docker
     # shellcheck source=scripts/lib.sh
     . scripts/lib.sh
+    backup
     configure
-    say "Building the server image (several minutes the first time)"
-    docker compose build server
+    image
     certificates
     start
     admin_user
@@ -364,3 +590,4 @@ main() {
 
 # Everything is inside main so that a truncated download runs nothing.
 main "$@"
+exit

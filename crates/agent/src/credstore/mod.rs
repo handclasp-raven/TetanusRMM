@@ -36,6 +36,10 @@ pub struct Credential {
     /// WebSocket fallback existed get the default (auto, same port).
     #[serde(default)]
     pub transport: transport::TransportSettings,
+    /// Hex update signing key learned from the server and pinned, for
+    /// builds with none baked in (see `crate::core::update_key`).
+    #[serde(default)]
+    pub update_pubkey: Option<String>,
 }
 
 // Keep the private key out of logs and panic messages.
@@ -181,6 +185,7 @@ mod tests {
             server_name: "localhost".into(),
             api_url: "https://localhost:8443".into(),
             transport: Default::default(),
+            update_pubkey: None,
         }
     }
 

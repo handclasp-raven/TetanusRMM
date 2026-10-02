@@ -12,6 +12,10 @@
 //!
 //! Layout: `<updates_dir>/<platform>/{manifest.json, agent, agent.sig}`.
 //!
+//! Agents built without `RMM_UPDATE_PUBKEY` (the released builds, which are
+//! the same for every server) fetch the public key from the API once and pin
+//! it. `publish_public_key` puts it at `<updates_dir>/update.pub` for that.
+//!
 //! Viewer builds are published next to them (`publish_viewer`), as
 //! `<updates_dir>/<platform>/{viewer.json, viewer}`, for the support TUI to
 //! download. They are not signed with the update key: a signature made for a
@@ -186,6 +190,34 @@ pub fn publish(
         ],
     )?;
     Ok(manifest)
+}
+
+/// Copy the public key file `key_file` (`update.pub`) into `updates_dir`,
+/// where the API serves it to agents that have no key baked in.
+pub fn publish_public_key(updates_dir: &Path, key_file: &Path) -> Result<(), UpdateError> {
+    let text = fs::read_to_string(key_file).map_err(io_err(key_file))?;
+    let key = parse_public_key(&text).ok_or(UpdateError::InvalidKey)?;
+    write_release(
+        updates_dir,
+        &[(PUBLIC_KEY_FILE, public_key_hex(&key).as_bytes())],
+    )
+}
+
+/// The published public key (hex), if any.
+pub fn load_public_key(updates_dir: &Path) -> Result<Option<String>, UpdateError> {
+    let path = updates_dir.join(PUBLIC_KEY_FILE);
+    match fs::read_to_string(&path) {
+        Ok(text) => parse_public_key(&text)
+            .map(|key| Some(public_key_hex(&key)))
+            .ok_or(UpdateError::InvalidKey),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(&path)(e)),
+    }
+}
+
+fn parse_public_key(text: &str) -> Option<VerifyingKey> {
+    let bytes: [u8; 32] = hex::decode(text.trim()).ok()?.try_into().ok()?;
+    VerifyingKey::from_bytes(&bytes).ok()
 }
 
 /// Write `files` into `dir` in order, each through a temporary file.

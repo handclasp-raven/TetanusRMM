@@ -247,6 +247,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let options = CoreOptions {
         heartbeat_interval: Duration::from_secs(args.heartbeat_secs.max(1)),
         update_interval: Duration::from_secs(args.update_interval_secs),
+        store: Some(store),
         telemetry: Some(Arc::new(SystemTelemetry::new())),
         media: None,
         // Console mode has no helper: no consent prompt can be shown, so

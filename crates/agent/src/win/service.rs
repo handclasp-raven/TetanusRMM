@@ -345,6 +345,7 @@ async fn service_body(
         let options = CoreOptions {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             update_interval: UPDATE_INTERVAL,
+            store: Some(CredentialStore::new(state_dir)),
             telemetry: Some(Arc::new(SystemTelemetry::new())),
             media: Some(Arc::new(media_link)),
             desktop: Some(Arc::new(desktop_link)),

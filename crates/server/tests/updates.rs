@@ -6,6 +6,8 @@ mod support;
 
 use std::path::Path;
 
+use agent::core::update_key;
+use agent::credstore::{Credential, CredentialStore};
 use agent::update::{CheckOutcome, UpdateClient, UpdateError};
 use agent::updater::{self, UpdatePaths};
 use common::devcerts::DevCerts;
@@ -196,6 +198,106 @@ async fn old_signed_release_cannot_be_replayed_as_newer() {
     assert!(
         matches!(result, Err(UpdateError::BadSignature)),
         "{result:?}"
+    );
+}
+
+fn credential(f: &Fixture) -> Credential {
+    Credential {
+        agent_id: "agt-test".into(),
+        cert_pem: f.certs.agent_cert.clone(),
+        key_pem: f.certs.agent_key.clone(),
+        ca_pem: f.certs.ca_cert.clone(),
+        server_addr: "127.0.0.1:4433".parse().unwrap(),
+        server_name: "localhost".into(),
+        api_url: f.api.base.clone(),
+        transport: Default::default(),
+        update_pubkey: None,
+    }
+}
+
+// These run against agent builds without a baked-in key, as released
+// builds are (RMM_UPDATE_PUBKEY must be unset when the tests are built).
+#[tokio::test]
+async fn an_agent_without_a_key_pins_the_published_one() {
+    let f = Fixture::new().await;
+    let store = CredentialStore::new(f.dir.path().join("state"));
+    let enrolled = credential(&f);
+    store.save(&enrolled).unwrap();
+
+    // Nothing published yet, and nothing pinned.
+    assert_eq!(
+        agent::update::fetch_public_key(&f.api.base, &f.certs.ca_cert)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(update_key(&enrolled, Some(&store)).await.unwrap(), None);
+    assert_eq!(store.load().unwrap().update_pubkey, None);
+
+    let public = f.dir.path().join("keys").join(updates::PUBLIC_KEY_FILE);
+    updates::publish_public_key(&f.updates_dir(), &public).unwrap();
+    // Nowhere to pin it: not used.
+    assert_eq!(update_key(&enrolled, None).await.unwrap(), None);
+    let key = update_key(&enrolled, Some(&store)).await.unwrap().unwrap();
+    assert_eq!(key, f.key.verifying_key());
+    let pinned = store.load().unwrap();
+    assert_eq!(
+        pinned.update_pubkey,
+        Some(updates::public_key_hex(&f.key.verifying_key()))
+    );
+
+    // The pinned key verifies a release signed by the server's key.
+    f.publish("0.2.0", b"agent v0.2.0");
+    let client = UpdateClient::new(
+        &f.api.base,
+        &f.certs.ca_cert,
+        key,
+        PLATFORM.into(),
+        "0.1.0".parse().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        client.check().await.unwrap(),
+        CheckOutcome::Available(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_pinned_key_is_not_replaced_by_what_the_server_serves_later() {
+    let f = Fixture::new().await;
+    let store = CredentialStore::new(f.dir.path().join("state"));
+    let public = f.dir.path().join("keys").join(updates::PUBLIC_KEY_FILE);
+    updates::publish_public_key(&f.updates_dir(), &public).unwrap();
+    store.save(&credential(&f)).unwrap();
+    update_key(&credential(&f), Some(&store))
+        .await
+        .unwrap()
+        .unwrap();
+    let pinned = store.load().unwrap();
+
+    // The server now serves another key.
+    let other = f.dir.path().join("other-keys");
+    updates::write_key_pair(&other, &updates::generate_key()).unwrap();
+    updates::publish_public_key(&f.updates_dir(), &other.join(updates::PUBLIC_KEY_FILE)).unwrap();
+
+    let key = update_key(&pinned, Some(&store)).await.unwrap().unwrap();
+    assert_eq!(key, f.key.verifying_key());
+    assert_eq!(store.load().unwrap(), pinned);
+}
+
+#[tokio::test]
+async fn a_malformed_published_key_is_not_served_or_published() {
+    let f = Fixture::new().await;
+    let bad = f.dir.path().join("bad.pub");
+    std::fs::write(&bad, "not a key").unwrap();
+    assert!(updates::publish_public_key(&f.updates_dir(), &bad).is_err());
+
+    std::fs::create_dir_all(f.updates_dir()).unwrap();
+    std::fs::write(f.updates_dir().join(updates::PUBLIC_KEY_FILE), "not a key").unwrap();
+    assert!(
+        agent::update::fetch_public_key(&f.api.base, &f.certs.ca_cert)
+            .await
+            .is_err()
     );
 }
 

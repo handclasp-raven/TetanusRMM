@@ -42,6 +42,7 @@
 //! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
 //! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
 //! | GET    | /api/updates/{platform}/signature| none |
+//! | GET    | /api/updates/pubkey         | none (agents pin it on first use) |
 //! | GET    | /api/ca                     | none (the CA certificate is public) |
 //! | GET    | /api/viewer/{platform}/manifest | none |
 //! | GET    | /api/viewer/{platform}/binary   | none |
@@ -137,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/updates/{platform}/manifest", get(update_manifest))
         .route("/api/updates/{platform}/binary", get(update_binary))
         .route("/api/updates/{platform}/signature", get(update_signature))
+        .route("/api/updates/pubkey", get(update_public_key))
         .route("/api/ca", get(ca_certificate))
         .route("/api/viewer/{platform}/manifest", get(viewer_manifest))
         .route("/api/viewer/{platform}/binary", get(viewer_binary))
@@ -839,6 +841,14 @@ async fn update_signature(
     Path(platform): Path<String>,
 ) -> Result<Response, ApiError> {
     serve_update_file(&state.updates_dir, &platform, updates::SIGNATURE_FILE).await
+}
+
+/// The update signing key's public half (hex). Agents built without one
+/// fetch it over this CA-verified connection and pin it.
+async fn update_public_key(State(state): State<AppState>) -> Result<String, ApiError> {
+    updates::load_public_key(&state.updates_dir)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound)
 }
 
 /// The CA certificate that signed the server's and the agents' certificates

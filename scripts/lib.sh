@@ -2,15 +2,15 @@
 
 # The server CLI (gen-certs, sign-update, publish-*, ...). With a Rust
 # toolchain it runs from source. Without one, or with RMM_SERVER_CLI=docker,
-# it runs from the compose image (`docker compose build server`) as the
-# calling user, so the files it writes belong to them. Paths must be
-# relative to the repository root.
+# it runs from the compose image (RMM_IMAGE if set, else the one from
+# `docker compose build server`) as the calling user, so the files it writes
+# belong to them. Paths must be relative to the repository root.
 server() {
     if [ "${RMM_SERVER_CLI:-}" != docker ] && command -v cargo >/dev/null 2>&1; then
         cargo run -q -p server -- "$@"
     else
         docker run --rm -i -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work \
-            "${RMM_SERVER_IMAGE:-rmm-server:dev}" "$@"
+            "${RMM_IMAGE:-${RMM_SERVER_IMAGE:-rmm-server:dev}}" "$@"
     fi
 }
 

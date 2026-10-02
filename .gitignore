@@ -2,6 +2,8 @@
 /dev-certs
 /updates
 /update-keys
+/releases
+/backups
 /agent-state
 /.env
 /tui/.venv

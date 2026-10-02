@@ -1,7 +1,8 @@
 //! Checking for, downloading and verifying signed agent updates.
 //!
 //! Nothing is written to disk until the signature has been verified against
-//! the public key baked into this binary at build time.
+//! the update public key: the one baked into this binary at build time, or
+//! else the one pinned from the server (see `crate::core::update_key`).
 
 use std::sync::Arc;
 
@@ -46,6 +47,8 @@ pub enum UpdateError {
     MalformedSignature,
     #[error("signature verification failed")]
     BadSignature,
+    #[error("the server's update public key is malformed")]
+    BadPublicKey,
 }
 
 /// Check a downloaded release. Succeeds only if the signature over
@@ -77,6 +80,37 @@ pub fn verify_release(
         &Signature::from_bytes(&signature),
     )
     .map_err(|_| UpdateError::BadSignature)
+}
+
+/// An HTTPS client that trusts only `ca_pem`.
+fn http_client(ca_pem: &str) -> Result<reqwest::Client, UpdateError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in common::tls::certs_from_pem(ca_pem)? {
+        roots.add(cert).map_err(common::TlsError::from)?;
+    }
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(common::TlsError::from)?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()?)
+}
+
+/// The update public key the server publishes (hex), or `None` if it has
+/// none. `ca_pem` is the CA the HTTPS API's certificate must chain to.
+pub async fn fetch_public_key(api_url: &str, ca_pem: &str) -> Result<Option<String>, UpdateError> {
+    let url = format!("{}/api/updates/pubkey", api_url.trim_end_matches('/'));
+    let resp = http_client(ca_pem)?.get(url).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let text = resp.error_for_status()?.text().await?;
+    let key = parse_public_key(&text).ok_or(UpdateError::BadPublicKey)?;
+    Ok(Some(hex::encode(key.to_bytes())))
 }
 
 /// A downloaded, verified update, ready to install.
@@ -119,21 +153,8 @@ impl UpdateClient {
         platform: String,
         current: Version,
     ) -> Result<Self, UpdateError> {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in common::tls::certs_from_pem(ca_pem)? {
-            roots.add(cert).map_err(common::TlsError::from)?;
-        }
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(common::TlsError::from)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
         Ok(Self {
-            http: reqwest::Client::builder()
-                .tls_backend_preconfigured(tls)
-                .build()?,
+            http: http_client(ca_pem)?,
             api_url: api_url.trim_end_matches('/').to_owned(),
             platform,
             current,

@@ -24,7 +24,9 @@ services:
 
   server:
     build: .
-    image: rmm-server:dev
+    # An installed server sets RMM_IMAGE in .env to a released image
+    # (scripts/install.sh), which `docker compose pull` then fetches.
+    image: ${RMM_IMAGE:-rmm-server:dev}
     restart: unless-stopped
     depends_on:
       db:

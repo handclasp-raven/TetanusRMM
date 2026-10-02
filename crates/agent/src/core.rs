@@ -9,11 +9,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use ed25519_dalek::VerifyingKey;
 use protocol::ipc::AgentStatus;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::credstore::Credential;
+use crate::credstore::{Credential, CredentialStore};
 use crate::telemetry::TelemetrySource;
 use crate::update::{CheckOutcome, UpdateClient, VerifiedUpdate};
 
@@ -24,6 +26,9 @@ pub struct CoreOptions {
     pub heartbeat_interval: Duration,
     /// Zero disables update checks.
     pub update_interval: Duration,
+    /// Where the credential is kept, to pin the update key in. Without it,
+    /// only a build with a baked-in key updates itself.
+    pub store: Option<CredentialStore>,
     pub telemetry: Option<Arc<dyn TelemetrySource>>,
     /// Screen source for streaming (Windows service: the session helper).
     pub media: Option<Arc<crate::media::source::MediaLink>>,
@@ -56,7 +61,7 @@ pub async fn run(
     config.desktop = options.desktop;
     tokio::select! {
         () = connect_forever(&config, &status) => unreachable!("connect_forever never returns"),
-        update = update_loop(credential, options.update_interval) => Ok(update),
+        update = update_loop(credential, options.update_interval, options.store.as_ref()) => Ok(update),
     }
 }
 
@@ -96,17 +101,58 @@ async fn connect_forever(config: &crate::AgentConfig, status: &watch::Sender<Age
     }
 }
 
+/// The key updates must be signed with: the one baked into this build, else
+/// the one pinned in the credential, else the one the server publishes,
+/// which is then pinned in `store` so that it is asked for only once. The
+/// request is verified against the credential's CA, like enrollment was.
+/// `None` if the server has no key (or there is nowhere to pin one).
+pub async fn update_key(
+    credential: &Credential,
+    store: Option<&CredentialStore>,
+) -> anyhow::Result<Option<VerifyingKey>> {
+    if let Some(key) = crate::update::baked_public_key() {
+        return Ok(Some(key));
+    }
+    if let Some(pinned) = &credential.update_pubkey {
+        let key = crate::update::parse_public_key(pinned)
+            .context("the pinned update key is malformed")?;
+        return Ok(Some(key));
+    }
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let Some(fetched) =
+        crate::update::fetch_public_key(&credential.api_url, &credential.ca_pem).await?
+    else {
+        return Ok(None);
+    };
+    let key = crate::update::parse_public_key(&fetched).context("malformed update key")?;
+    let mut pinned = credential.clone();
+    pinned.update_pubkey = Some(fetched.clone());
+    store.save(&pinned).context("pinning the update key")?;
+    info!(key = %fetched, "pinned the server's update key");
+    Ok(Some(key))
+}
+
 /// Poll for updates. Returns once a verified update is ready; never returns
 /// if updates are disabled or cannot be configured.
-async fn update_loop(credential: &Credential, interval: Duration) -> VerifiedUpdate {
-    let Some(key) = crate::update::baked_public_key() else {
-        warn!("auto-update disabled: this build has no RMM_UPDATE_PUBKEY");
-        return std::future::pending().await;
-    };
+async fn update_loop(
+    credential: &Credential,
+    interval: Duration,
+    store: Option<&CredentialStore>,
+) -> VerifiedUpdate {
     if interval.is_zero() {
         info!("auto-update disabled by configuration");
         return std::future::pending().await;
     }
+    let key = loop {
+        match update_key(credential, store).await {
+            Ok(Some(key)) => break key,
+            Ok(None) => debug!("no update key yet: the server has not published one"),
+            Err(e) => warn!("could not get the update key: {e:#}"),
+        }
+        tokio::time::sleep(interval).await;
+    };
     let client = match UpdateClient::new(
         &credential.api_url,
         &credential.ca_pem,

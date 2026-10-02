@@ -10,7 +10,7 @@ use server::config::ServeConfig;
 use server::updates;
 use server::users::{self, Role};
 use server::{Registry, Server, ServerConfig};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(about = "RMM central server")]
@@ -82,6 +82,10 @@ struct PublishUpdateArgs {
     release: Release,
     #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
     updates_dir: PathBuf,
+    /// Public key from `gen-update-key`, published for agents built without
+    /// one to pin.
+    #[arg(long, default_value = "update-keys/update.pub")]
+    pubkey: PathBuf,
 }
 
 #[derive(Args)]
@@ -146,6 +150,14 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::PublishUpdate(args) => {
+            if args.pubkey.exists() {
+                updates::publish_public_key(&args.updates_dir, &args.pubkey)?;
+            } else {
+                warn!(
+                    pubkey = %args.pubkey.display(),
+                    "no public key to publish: only agents built with RMM_UPDATE_PUBKEY will update"
+                );
+            }
             let manifest = updates::publish(
                 &args.updates_dir,
                 &args.file,

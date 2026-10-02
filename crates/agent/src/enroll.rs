@@ -81,6 +81,7 @@ pub async fn enroll(opts: &EnrollOptions) -> Result<Credential, AgentError> {
                 server_name: opts.server_name.clone(),
                 api_url,
                 transport: opts.transport,
+                update_pubkey: None,
             })
         }
         Ok(Some(other)) => Err(AgentError::Unexpected(other)),
