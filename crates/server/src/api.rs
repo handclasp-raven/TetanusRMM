@@ -46,6 +46,10 @@
 //! | GET    | /api/ca                     | none (the CA certificate is public) |
 //! | GET    | /api/viewer/{platform}/manifest | none |
 //! | GET    | /api/viewer/{platform}/binary   | none |
+//! | POST   | /api/assist-sessions        | session (admin, support_engineer): a quick assist code |
+//! | GET    | /api/assist-sessions/{id}   | session (whoever made it; admin) |
+//! | GET    | /assist                     | none: the quick assist page (`assist`) |
+//! | GET    | /assist/download            | none: the quick assist client, set up for this server |
 //! | GET    | /install                    | none: the staff install page (`install`) |
 //! | GET    | /install/{wheel}            | none: the published TUI wheel |
 //! | GET    | /install/viewer/{platform}  | none: the published viewer |
@@ -78,6 +82,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use tracing::error;
 
+mod assist;
 mod install;
 mod rbac;
 
@@ -144,6 +149,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/viewer/{platform}/manifest", get(viewer_manifest))
         .route("/api/viewer/{platform}/binary", get(viewer_binary))
         .merge(rbac::routes())
+        .merge(assist::routes())
         .merge(install::routes())
         // Per route, so the route template is known (unmatched requests
         // are not counted).
@@ -398,6 +404,12 @@ async fn list_agents(
         agents
             .into_iter()
             .filter(|agent| visibility.sees(&agent.id))
+            // A quick assist agent is listed only while it is there: it is
+            // deleted soon after it goes.
+            .filter(|agent| {
+                agent.assist_session_id.is_none()
+                    || state.hub.as_ref().is_some_and(|h| h.is_online(&agent.id))
+            })
             .map(|agent| {
                 let groups = groups.remove(&agent.id).unwrap_or_default();
                 agent_view(&state, &visibility, agent, groups)
@@ -416,7 +428,10 @@ fn agent_view(
     AgentView {
         groups,
         classification: agent.effective_classification(),
-        capabilities: visibility.capabilities(&agent.id).into_iter().collect(),
+        capabilities: visibility
+            .capabilities(&agent.id, agent.assist_session_id.is_some())
+            .into_iter()
+            .collect(),
         online: link.is_some(),
         transport: link.as_ref().and_then(|l| l.transport()),
         viewer_sessions: link.as_ref().map_or(0, |l| l.viewers()),
@@ -656,7 +671,7 @@ struct EnrollmentLinkResponse {
 const DEFAULT_AGENT_PORT: u16 = 4433;
 
 /// The platform whose builds can be packaged as an MSI.
-const MSI_PLATFORM: &str = "windows-x86_64";
+pub(crate) const MSI_PLATFORM: &str = "windows-x86_64";
 
 /// The host part of this server's public URL.
 fn public_host(public_url: &str) -> String {

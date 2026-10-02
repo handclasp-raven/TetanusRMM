@@ -1,0 +1,19 @@
+[package]
+name = "assist"
+description = "Quick assist: a portable client for one-time support sessions, started with a six-digit code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent.workspace = true
+anyhow.workspace = true
+common.workspace = true
+protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+transport.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

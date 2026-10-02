@@ -49,6 +49,7 @@ fn agent_config(server_addr: SocketAddr, trust: &DevCerts, client: &DevCerts) ->
         device_kind: protocol::consent::DeviceKind::Workstation,
         hostname: Some("test-host".into()),
         direct: Default::default(),
+        remote: Default::default(),
     }
 }
 

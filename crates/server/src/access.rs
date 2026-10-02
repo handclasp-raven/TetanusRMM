@@ -11,6 +11,11 @@
 //! adding an agent to a group extends every grant on the group), or on all
 //! agents. Grants add up; there are no deny rules.
 //!
+//! Quick assist agents (`crate::assist`) stand apart: no grant covers them,
+//! not even one on all agents. The support engineer who made the session's
+//! code may use [`assist_capabilities`] on its agent, and that is also the
+//! most an admin may do there.
+//!
 //! Every enforcement point (viewer tokens, viewer connect, shells, scripts,
 //! file transfer, the agent list and policies) asks this module, and a
 //! refusal of a remote operation is audited as `permission.denied`.
@@ -32,6 +37,23 @@ pub fn all_capabilities() -> Capabilities {
     Capability::ALL.into_iter().collect()
 }
 
+/// What may be done on a quick assist agent, by anyone: remote desktop and
+/// file transfer. The user agreed to be helped, not to be administered.
+pub fn assist_capabilities() -> Capabilities {
+    Capabilities::from([Capability::Desktop, Capability::FileTransfer])
+}
+
+/// Which of `agents` are quick assist agents.
+async fn assist_agents<'e>(
+    db: impl PgExecutor<'e>,
+    agents: &[String],
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT id FROM agents WHERE id = ANY($1) AND assist_session_id IS NOT NULL")
+        .bind(agents)
+        .fetch_all(db)
+        .await
+}
+
 /// Which agents a user can see, and what they may do on each.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visibility {
@@ -51,10 +73,17 @@ impl Visibility {
     }
 
     /// What the user may do on `agent_id` (empty if nothing, or unseen).
-    pub fn capabilities(&self, agent_id: &str) -> Capabilities {
-        match self {
+    /// `assist`: it is a quick assist agent, where nobody may do more than
+    /// [`assist_capabilities`].
+    pub fn capabilities(&self, agent_id: &str, assist: bool) -> Capabilities {
+        let caps = match self {
             Visibility::All(caps) => caps.clone(),
             Visibility::Only(agents) => agents.get(agent_id).cloned().unwrap_or_default(),
+        };
+        if assist {
+            caps.intersection(&assist_capabilities()).copied().collect()
+        } else {
+            caps
         }
     }
 }
@@ -64,7 +93,7 @@ fn parse_capabilities(names: &[String]) -> Capabilities {
 }
 
 /// Capabilities an engineer's grants give on agents (all agents, or those
-/// in `only`).
+/// in `only`), and on the quick assist agents of their own sessions.
 async fn granted<'e>(
     db: impl PgExecutor<'e>,
     user_id: i64,
@@ -78,10 +107,21 @@ async fn granted<'e>(
              WHERE m.group_id = g.group_id AND m.agent_id = a.id)
          CROSS JOIN LATERAL unnest(g.capabilities) AS c
          WHERE g.user_id = $1 AND ($2::text[] IS NULL OR a.id = ANY($2))
-         GROUP BY a.id",
+           AND a.assist_session_id IS NULL
+         GROUP BY a.id
+         UNION ALL
+         SELECT a.id, $3::text[]
+         FROM agents a JOIN assist_sessions s ON s.id = a.assist_session_id
+         WHERE s.user_id = $1 AND ($2::text[] IS NULL OR a.id = ANY($2))",
     )
     .bind(user_id)
     .bind(only)
+    .bind(
+        assist_capabilities()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+    )
     .fetch_all(db)
     .await?;
     Ok(rows
@@ -106,7 +146,13 @@ pub async fn agent_capabilities<'e>(
     agent_id: &str,
 ) -> sqlx::Result<Capabilities> {
     Ok(match user.role {
-        Role::Admin => all_capabilities(),
+        Role::Admin => {
+            if assist_agents(db, &[agent_id.to_owned()]).await?.is_empty() {
+                all_capabilities()
+            } else {
+                assist_capabilities()
+            }
+        }
         Role::Auditor => Capabilities::new(),
         Role::SupportEngineer => granted(db, user.id, Some(&[agent_id.to_owned()]))
             .await?
@@ -124,7 +170,8 @@ pub async fn refused<'e>(
     agents: &[String],
 ) -> sqlx::Result<Vec<String>> {
     Ok(match user.role {
-        Role::Admin => Vec::new(),
+        Role::Admin if assist_capabilities().contains(&capability) => Vec::new(),
+        Role::Admin => assist_agents(db, agents).await?,
         Role::Auditor => agents.to_vec(),
         Role::SupportEngineer => {
             let granted = granted(db, user.id, Some(agents)).await?;
@@ -352,11 +399,13 @@ mod tests {
     fn visibility_answers_per_agent() {
         let admin = Visibility::All(all_capabilities());
         assert!(admin.sees("any"));
-        assert_eq!(admin.capabilities("any").len(), 4);
+        assert_eq!(admin.capabilities("any", false).len(), 4);
+        assert_eq!(admin.capabilities("any", true), assist_capabilities());
 
         let auditor = Visibility::All(Capabilities::new());
         assert!(auditor.sees("any"));
-        assert!(auditor.capabilities("any").is_empty());
+        assert!(auditor.capabilities("any", false).is_empty());
+        assert!(auditor.capabilities("any", true).is_empty());
 
         let engineer = Visibility::Only(HashMap::from([(
             "agt-1".to_owned(),
@@ -364,10 +413,10 @@ mod tests {
         )]));
         assert!(engineer.sees("agt-1") && !engineer.sees("agt-2"));
         assert_eq!(
-            engineer.capabilities("agt-1"),
+            engineer.capabilities("agt-1", false),
             Capabilities::from([Capability::Desktop])
         );
-        assert!(engineer.capabilities("agt-2").is_empty());
+        assert!(engineer.capabilities("agt-2", false).is_empty());
     }
 
     #[test]

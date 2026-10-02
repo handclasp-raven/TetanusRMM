@@ -243,6 +243,46 @@ async def test_enrollment_link_sends_only_what_was_chosen(
     assert server.body() == {"platform": "linux-x86_64"}
 
 
+async def test_quick_assist_codes_and_their_status(api: ApiClient, server: FakeServer) -> None:
+    api.token = "sess"
+    server.on(
+        "POST",
+        "/api/assist-sessions",
+        body={
+            "id": 7,
+            "code": "482913",
+            "expires_at": "2026-10-03T10:10:00Z",
+            "url": "https://rmm:8443/assist",
+        },
+    )
+    code = await api.create_assist_code()
+    assert (code.id, code.code, code.spaced) == (7, "482913", "482 913")
+    assert code.url == "https://rmm:8443/assist"
+
+    server.on("GET", "/api/assist-sessions/7", body={"id": 7, "status": "waiting"})
+    waiting = await api.assist_status(7)
+    assert (waiting.status, waiting.agent_id) == ("waiting", None)
+    assert waiting.label == "the user's computer"
+    server.on(
+        "GET",
+        "/api/assist-sessions/7",
+        body={"id": 7, "status": "connected", "agent_id": "qa-1", "hostname": "HOME-PC"},
+    )
+    connected = await api.assist_status(7)
+    assert (connected.status, connected.agent_id, connected.label) == (
+        "connected",
+        "qa-1",
+        "HOME-PC",
+    )
+    # Quick assist agents are marked as such in the agent list.
+    server.on(
+        "GET",
+        "/api/agents",
+        body=[agent_json("qa-1", assist_session_id=7), agent_json("agt-1")],
+    )
+    assert [a.quick_assist for a in await api.list_agents()] == [True, False]
+
+
 async def test_download_goes_to_this_server_and_leaves_nothing_on_failure(
     api: ApiClient, server: FakeServer, tmp_path
 ) -> None:

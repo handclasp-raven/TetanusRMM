@@ -73,6 +73,17 @@ impl AgentCa {
     /// key usage and extensions all come from this template, so an agent
     /// cannot request a CA certificate or another agent's name.
     pub fn issue(&self, agent_id: &str, csr_der: &[u8]) -> Result<String, CaError> {
+        self.issue_for(agent_id, csr_der, AGENT_CERT_VALIDITY)
+    }
+
+    /// [`AgentCa::issue`] with a certificate valid for `validity` (quick
+    /// assist clients get short-lived ones, see `crate::assist`).
+    pub fn issue_for(
+        &self,
+        agent_id: &str,
+        csr_der: &[u8],
+        validity: Duration,
+    ) -> Result<String, CaError> {
         let csr =
             CertificateSigningRequestParams::from_der(&CertificateSigningRequestDer::from(csr_der))
                 .map_err(CaError::BadCsr)?;
@@ -90,7 +101,7 @@ impl AgentCa {
         params.serial_number = Some(random_serial().into());
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::minutes(5);
-        params.not_after = now + AGENT_CERT_VALIDITY;
+        params.not_after = now + validity;
 
         CertificateSigningRequestParams {
             params,

@@ -346,6 +346,40 @@ ColumnsScreen, NewScriptScreen, CommandsScreen {
     min-width: 8;
 }
 
+/* --- quick assist ----------------------------------------------------------- */
+
+#quick-assist {
+    padding: 0 2;
+}
+
+#quick-assist > Label {
+    margin-top: 1;
+}
+
+#qa-intro {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#qa-code {
+    width: 24;
+    height: 3;
+    margin: 1 0;
+    content-align: center middle;
+    text-style: bold;
+    border: round $success;
+}
+
+#qa-status {
+    height: auto;
+    min-height: 2;
+}
+
+#qa-actions {
+    height: 3;
+    margin-top: 1;
+}
+
 /* --- groups ----------------------------------------------------------------- */
 
 #groups-table {

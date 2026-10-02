@@ -10,6 +10,12 @@
 //! - consent prompts (`require` mode) and "technician connected" toasts;
 //! - input injection, clipboard sync, and (in `stream`) screen capture.
 //!
+//! The parts that do not depend on the pipe are shared with the quick
+//! assist client, which has no service and does all of this in one process
+//! (see [`super::local`]): [`DesktopCommands`] carries out what is asked of
+//! the desktop, and [`DesktopUi`] is the kill switch, the clipboard and the
+//! indicator on a UI thread.
+//!
 //! Threads: the UI thread runs the tray, the hotkey and the clipboard
 //! listener (all need its message loop); the pipe thread talks to the
 //! service and injects input; capture, prompts and toasts have their own.
@@ -57,7 +63,8 @@ const ERROR_PIPE_BUSY: i32 = 231;
 /// Id of the Ctrl+F12 hotkey registration.
 const KILL_SWITCH_HOTKEY: i32 = 1;
 
-enum UiEvent {
+/// For the UI thread, from the thread that talks to the service.
+pub enum UiEvent {
     Status(AgentStatus),
     Technicians(Vec<String>),
     SetClipboard(ClipboardData),
@@ -125,6 +132,7 @@ async fn pipe_client(
     let pipe = connect().await?;
     let (mut reader, mut writer) = tokio::io::split(pipe);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<IpcMessage>(OUT_QUEUE);
+    let mut commands = DesktopCommands::new(ui.clone(), ctl_tx, out_tx);
     write_frame(
         &mut writer,
         &IpcMessage::HelperHello {
@@ -135,7 +143,6 @@ async fn pipe_client(
     )
     .await
     .map_err(std::io::Error::other)?;
-    let worker = stream::spawn(out_tx);
     info!("connected to service");
 
     let write = async {
@@ -154,75 +161,11 @@ async fn pipe_client(
         Ok::<(), std::io::Error>(())
     };
     let read = async {
-        let mut injector = Injector::default();
-        // Open prompts by request id, so they can be withdrawn.
-        let mut prompts: HashMap<u64, consent::Prompt> = HashMap::new();
         while let Some(message) = read_frame::<_, IpcMessage>(&mut reader)
             .await
             .map_err(std::io::Error::other)?
         {
-            let command = match message {
-                IpcMessage::Status(status) => {
-                    info!(tooltip = %status.tooltip(), "status from service");
-                    if ui.send(UiEvent::Status(status)).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                IpcMessage::Technicians(list) => {
-                    info!(technicians = ?list, "connected technicians");
-                    let _ = ui.send(UiEvent::Technicians(list));
-                    continue;
-                }
-                IpcMessage::Input(event) => {
-                    injector.inject(event);
-                    continue;
-                }
-                IpcMessage::SetClipboard(data) => {
-                    let _ = ui.send(UiEvent::SetClipboard(data));
-                    continue;
-                }
-                IpcMessage::Toast { technician } => {
-                    toast::technician_connected(&technician);
-                    continue;
-                }
-                IpcMessage::ConsentPrompt {
-                    request_id,
-                    technician,
-                    timeout_secs,
-                } => {
-                    info!(request_id, %technician, timeout_secs, "showing consent prompt");
-                    let ctl = ctl_tx.clone();
-                    let prompt = consent::show(
-                        &technician,
-                        Duration::from_secs(timeout_secs.into()),
-                        move |answer| {
-                            info!(request_id, ?answer, "consent answered");
-                            let _ = ctl.send(IpcMessage::ConsentAnswer { request_id, answer });
-                        },
-                    );
-                    prompts.insert(request_id, prompt);
-                    continue;
-                }
-                IpcMessage::ConsentCancel { request_id } => {
-                    if let Some(prompt) = prompts.remove(&request_id) {
-                        info!(request_id, "consent prompt withdrawn");
-                        prompt.cancel();
-                    }
-                    continue;
-                }
-                IpcMessage::ListMonitors => WorkerCommand::ListMonitors,
-                IpcMessage::StartCapture { monitor } => WorkerCommand::Start { monitor },
-                IpcMessage::StopCapture => WorkerCommand::Stop,
-                IpcMessage::ForceKeyframe => WorkerCommand::ForceKeyframe,
-                IpcMessage::SetBitrate { bps } => WorkerCommand::SetBitrate(bps),
-                IpcMessage::SetFrameRate { fps } => WorkerCommand::SetFrameRate(fps),
-                other => {
-                    debug!(?other, "ignoring message from service");
-                    continue;
-                }
-            };
-            if worker.send(command).is_err() {
+            if !commands.handle(message) {
                 break;
             }
         }
@@ -231,6 +174,222 @@ async fn pipe_client(
     tokio::select! {
         r = write => r,
         r = read => r,
+    }
+}
+
+/// Carries out what the service asks of the user's desktop: input, consent
+/// prompts, toasts and screen capture. Tray and clipboard changes are
+/// passed on to the UI thread.
+pub struct DesktopCommands {
+    injector: Injector,
+    /// Open prompts by request id, so they can be withdrawn.
+    prompts: HashMap<u64, consent::Prompt>,
+    worker: mpsc::Sender<WorkerCommand>,
+    ui: mpsc::Sender<UiEvent>,
+    /// Answers, to the service.
+    ctl: UnboundedSender<IpcMessage>,
+}
+
+impl DesktopCommands {
+    /// Starts the capture worker; its frames and monitor lists go to `out`.
+    pub fn new(
+        ui: mpsc::Sender<UiEvent>,
+        ctl: UnboundedSender<IpcMessage>,
+        out: tokio::sync::mpsc::Sender<IpcMessage>,
+    ) -> Self {
+        Self {
+            injector: Injector::default(),
+            prompts: HashMap::new(),
+            worker: stream::spawn(out),
+            ui,
+            ctl,
+        }
+    }
+
+    /// Act on one message from the service. `false` once the UI thread or
+    /// the capture worker has gone, and there is nothing left to serve.
+    pub fn handle(&mut self, message: IpcMessage) -> bool {
+        let command = match message {
+            IpcMessage::Status(status) => {
+                info!(tooltip = %status.tooltip(), "status from service");
+                return self.ui.send(UiEvent::Status(status)).is_ok();
+            }
+            IpcMessage::Technicians(list) => {
+                info!(technicians = ?list, "connected technicians");
+                let _ = self.ui.send(UiEvent::Technicians(list));
+                return true;
+            }
+            IpcMessage::Input(event) => {
+                self.injector.inject(event);
+                return true;
+            }
+            IpcMessage::SetClipboard(data) => {
+                let _ = self.ui.send(UiEvent::SetClipboard(data));
+                return true;
+            }
+            IpcMessage::Toast { technician } => {
+                toast::technician_connected(&technician);
+                return true;
+            }
+            IpcMessage::ConsentPrompt {
+                request_id,
+                technician,
+                timeout_secs,
+            } => {
+                info!(request_id, %technician, timeout_secs, "showing consent prompt");
+                let ctl = self.ctl.clone();
+                let prompt = consent::show(
+                    &technician,
+                    Duration::from_secs(timeout_secs.into()),
+                    move |answer| {
+                        info!(request_id, ?answer, "consent answered");
+                        let _ = ctl.send(IpcMessage::ConsentAnswer { request_id, answer });
+                    },
+                );
+                self.prompts.insert(request_id, prompt);
+                return true;
+            }
+            IpcMessage::ConsentCancel { request_id } => {
+                if let Some(prompt) = self.prompts.remove(&request_id) {
+                    info!(request_id, "consent prompt withdrawn");
+                    prompt.cancel();
+                }
+                return true;
+            }
+            IpcMessage::ListMonitors => WorkerCommand::ListMonitors,
+            IpcMessage::StartCapture { monitor } => WorkerCommand::Start { monitor },
+            IpcMessage::StopCapture => WorkerCommand::Stop,
+            IpcMessage::ForceKeyframe => WorkerCommand::ForceKeyframe,
+            IpcMessage::SetBitrate { bps } => WorkerCommand::SetBitrate(bps),
+            IpcMessage::SetFrameRate { fps } => WorkerCommand::SetFrameRate(fps),
+            other => {
+                debug!(?other, "ignoring message from service");
+                return true;
+            }
+        };
+        self.worker.send(command).is_ok()
+    }
+}
+
+/// What must run on a UI thread (one with a message loop) while sessions
+/// are possible: the Ctrl+F12 kill switch, clipboard sync and the
+/// on-screen session indicator.
+pub struct DesktopUi {
+    clipboard: Option<Listener>,
+    guard: RefCell<ClipboardGuard>,
+    indicator: RefCell<Option<Indicator>>,
+    indicator_refreshed: Cell<Instant>,
+    /// To the service.
+    ctl: UnboundedSender<IpcMessage>,
+}
+
+impl DesktopUi {
+    /// Call on the UI thread; kill switch and clipboard messages go to `ctl`.
+    pub fn new(ctl: UnboundedSender<IpcMessage>) -> Self {
+        // The kill switch. Registered for this thread (no window), so
+        // WM_HOTKEY arrives in its message loop.
+        // SAFETY: no pointers.
+        match unsafe {
+            RegisterHotKey(
+                None,
+                KILL_SWITCH_HOTKEY,
+                MOD_CONTROL | MOD_NOREPEAT,
+                u32::from(VK_F12.0),
+            )
+        } {
+            Ok(()) => info!("Ctrl+F12 kill switch registered"),
+            // Another program holds Ctrl+F12; the tray item still works.
+            Err(e) => warn!("registering Ctrl+F12: {e}"),
+        }
+
+        let clipboard = match Listener::new() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                warn!("clipboard sync disabled: {e}");
+                None
+            }
+        };
+        let indicator = match Indicator::new() {
+            Ok(i) => Some(i),
+            Err(e) => {
+                warn!("session indicator unavailable: {e}");
+                None
+            }
+        };
+        let mut guard = ClipboardGuard::default();
+        // Whatever the user copied before a technician connected stays private.
+        guard.prime(clipboard.as_ref().and_then(Listener::read));
+        Self {
+            clipboard,
+            guard: RefCell::new(guard),
+            indicator: RefCell::new(indicator),
+            indicator_refreshed: Cell::new(Instant::now()),
+            ctl,
+        }
+    }
+
+    /// Whether `msg`, from this thread's queue, is the Ctrl+F12 hotkey.
+    pub fn is_kill_switch(&self, msg: &MSG) -> bool {
+        msg.message == WM_HOTKEY && msg.wParam.0 == KILL_SWITCH_HOTKEY as usize
+    }
+
+    /// End every remote session now.
+    pub fn kill_switch(&self, via: &str) {
+        warn!(via, "user ended all remote sessions");
+        let _ = self.ctl.send(IpcMessage::KillSwitch);
+    }
+
+    /// Call every turn of the message loop: passes on a changed clipboard,
+    /// and keeps the indicator on top.
+    pub fn poll(&self) {
+        if let Some(clipboard) = self.clipboard.as_ref().filter(|c| c.changed()) {
+            if let Some(data) = clipboard.read() {
+                if let Some(data) = self.guard.borrow_mut().local_changed(data) {
+                    debug!(bytes = data.size(), "clipboard changed");
+                    let _ = self.ctl.send(IpcMessage::Clipboard(data));
+                }
+            }
+        }
+        if self.indicator_refreshed.get().elapsed() >= INDICATOR_REFRESH {
+            self.indicator_refreshed.set(Instant::now());
+            if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
+                indicator.refresh();
+            }
+        }
+    }
+
+    /// Who is connected now: shows, updates or hides the indicator.
+    pub fn set_technicians(&self, list: &[String]) {
+        if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
+            indicator.set(indicator_text(list));
+        }
+    }
+
+    /// Put the technician's clipboard on the user's.
+    pub fn set_clipboard(&self, data: &ClipboardData) {
+        let Some(clipboard) = &self.clipboard else {
+            return;
+        };
+        if !self.guard.borrow_mut().remote(data) {
+            return;
+        }
+        match clipboard.write(data) {
+            Ok(()) => {
+                info!(bytes = data.size(), "technician's clipboard applied");
+                // What the listener reads back next is not a new copy.
+                self.guard
+                    .borrow_mut()
+                    .prime(Some(ClipboardData::Text(data.to_text())));
+            }
+            Err(e) => warn!("setting clipboard: {e}"),
+        }
+    }
+}
+
+impl Drop for DesktopUi {
+    fn drop(&mut self) {
+        // SAFETY: undoes our registration on this thread.
+        let _ = unsafe { UnregisterHotKey(None, KILL_SWITCH_HOTKEY) };
     }
 }
 
@@ -272,11 +431,7 @@ struct Tray {
     /// modify succeeds. After that tray-icon has the current values, which
     /// also covers Explorer restarts.
     dirty: Cell<bool>,
-    clipboard: Option<Listener>,
-    guard: RefCell<ClipboardGuard>,
-    indicator: RefCell<Option<Indicator>>,
-    /// To the service.
-    ctl: UnboundedSender<IpcMessage>,
+    desktop: DesktopUi,
 }
 
 impl Tray {
@@ -301,40 +456,6 @@ impl Tray {
             .with_icon(status_icon(&initial, false))
             .build()?;
 
-        // The kill switch. Registered for this thread (no window), so
-        // WM_HOTKEY arrives in the message loop below.
-        // SAFETY: no pointers.
-        match unsafe {
-            RegisterHotKey(
-                None,
-                KILL_SWITCH_HOTKEY,
-                MOD_CONTROL | MOD_NOREPEAT,
-                u32::from(VK_F12.0),
-            )
-        } {
-            Ok(()) => info!("Ctrl+F12 kill switch registered"),
-            // Another program holds Ctrl+F12; the tray item still works.
-            Err(e) => warn!("registering Ctrl+F12: {e}"),
-        }
-
-        let clipboard = match Listener::new() {
-            Ok(l) => Some(l),
-            Err(e) => {
-                warn!("clipboard sync disabled: {e}");
-                None
-            }
-        };
-        let indicator = match Indicator::new() {
-            Ok(i) => Some(i),
-            Err(e) => {
-                warn!("session indicator unavailable: {e}");
-                None
-            }
-        };
-        let mut guard = ClipboardGuard::default();
-        // Whatever the user copied before a technician connected stays private.
-        guard.prime(clipboard.as_ref().and_then(Listener::read));
-
         Ok(Self {
             icon,
             status_item,
@@ -344,17 +465,13 @@ impl Tray {
             status: RefCell::new(initial),
             technicians: RefCell::new(Vec::new()),
             dirty: Cell::new(false),
-            clipboard,
-            guard: RefCell::new(guard),
-            indicator: RefCell::new(indicator),
-            ctl,
+            desktop: DesktopUi::new(ctl),
         })
     }
 
     /// Win32 message loop plus polling of menu, clipboard and service
     /// events. Returns when the service disconnects.
     fn run(&self, ui: &mpsc::Receiver<UiEvent>) {
-        let mut indicator_refreshed = Instant::now();
         loop {
             // Sleep until there is window input, or at most 100 ms.
             // SAFETY: no handles; just waits on this thread's message queue.
@@ -366,8 +483,8 @@ impl Tray {
             // tray and clipboard windows.
             unsafe {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    if msg.message == WM_HOTKEY && msg.wParam.0 == KILL_SWITCH_HOTKEY as usize {
-                        self.kill_switch("hotkey");
+                    if self.desktop.is_kill_switch(&msg) {
+                        self.desktop.kill_switch("hotkey");
                         continue;
                     }
                     let _ = TranslateMessage(&msg);
@@ -379,20 +496,11 @@ impl Tray {
                 if event.id == *self.about_item.id() {
                     show_about();
                 } else if event.id == *self.end_sessions_item.id() {
-                    self.kill_switch("tray menu");
+                    self.desktop.kill_switch("tray menu");
                 }
             }
             // Clicks on the icon itself are not used; drain them.
             while TrayIconEvent::receiver().try_recv().is_ok() {}
-
-            if let Some(clipboard) = self.clipboard.as_ref().filter(|c| c.changed()) {
-                if let Some(data) = clipboard.read() {
-                    if let Some(data) = self.guard.borrow_mut().local_changed(data) {
-                        debug!(bytes = data.size(), "clipboard changed");
-                        let _ = self.ctl.send(IpcMessage::Clipboard(data));
-                    }
-                }
-            }
 
             loop {
                 match ui.try_recv() {
@@ -402,52 +510,17 @@ impl Tray {
                         self.dirty.set(true);
                     }
                     Ok(UiEvent::Technicians(list)) => {
-                        if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
-                            indicator.set(indicator_text(&list));
-                        }
+                        self.desktop.set_technicians(&list);
                         *self.technicians.borrow_mut() = list;
                         self.dirty.set(true);
                     }
-                    Ok(UiEvent::SetClipboard(data)) => self.set_clipboard(&data),
-                    Ok(UiEvent::Disconnected) | Err(mpsc::TryRecvError::Disconnected) => {
-                        // SAFETY: undoes our registration on this thread.
-                        let _ = unsafe { UnregisterHotKey(None, KILL_SWITCH_HOTKEY) };
-                        return;
-                    }
+                    Ok(UiEvent::SetClipboard(data)) => self.desktop.set_clipboard(&data),
+                    Ok(UiEvent::Disconnected) | Err(mpsc::TryRecvError::Disconnected) => return,
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
             self.apply();
-            if indicator_refreshed.elapsed() >= INDICATOR_REFRESH {
-                indicator_refreshed = Instant::now();
-                if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
-                    indicator.refresh();
-                }
-            }
-        }
-    }
-
-    fn kill_switch(&self, via: &str) {
-        warn!(via, "user ended all remote sessions");
-        let _ = self.ctl.send(IpcMessage::KillSwitch);
-    }
-
-    fn set_clipboard(&self, data: &ClipboardData) {
-        let Some(clipboard) = &self.clipboard else {
-            return;
-        };
-        if !self.guard.borrow_mut().remote(data) {
-            return;
-        }
-        match clipboard.write(data) {
-            Ok(()) => {
-                info!(bytes = data.size(), "technician's clipboard applied");
-                // What the listener reads back next is not a new copy.
-                self.guard
-                    .borrow_mut()
-                    .prime(Some(ClipboardData::Text(data.to_text())));
-            }
-            Err(e) => warn!("setting clipboard: {e}"),
+            self.desktop.poll();
         }
     }
 

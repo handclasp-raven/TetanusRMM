@@ -4,6 +4,7 @@ Remote monitoring and management tool.
 
 - **Server** (Rust): QUIC listener for agents and viewers, HTTPS API, Postgres, audit log, enrollment CA and signed update publishing.
 - **Agent** (Windows service): enrollment, telemetry, signed self-update, remote desktop capture, remote shell, scripts and file transfer.
+- **Quick assist** (Windows, portable): one-time support for a machine with no agent. The user downloads one file from `https://<host>:8443/assist` and types a six-digit code from the technician.
 - **Viewer** (Linux, macOS, Windows): end-to-end encrypted remote desktop, relayed through the server or direct when NAT allows.
 - **Support TUI** (Python + Textual): sign in, agent table, launch the viewer, shell console and script runner.
 
@@ -21,6 +22,19 @@ bash install.sh --host rmm.example.com
 If the server is reached at more than one name or address, list them all (`--host rmm.example.com,10.0.0.5`, or `--host` again for each): every one goes into the server certificate, and the first is the public address.
 
 Open ports 8443/tcp, 4433/udp, 4433/tcp and 3478/udp. The script prints the admin's TOTP secret once, so add it to an authenticator app before closing the terminal. Then send staff to `https://<host>:8443/install` and [enroll an agent](https://github.com/handclasp-raven/TetanusRMM/wiki/Enrolling-an-Agent).
+
+## Quick assist
+
+To help someone whose computer has no agent, once:
+
+1. In the TUI press `h` (Agent menu, Quick assist). It shows a page address and a six-digit code, valid for ten minutes and usable once.
+2. The user opens `https://<host>:8443/assist`, downloads `TetanusRMM-Assist.exe` and runs it. Nothing is installed. Windows asks whether to let it run as administrator; saying no still works, but you then cannot control administrator windows.
+3. The program shows a warning about scams (never pay anyone with gift cards or cryptocurrency) that cannot be accepted for five seconds, then asks for the code.
+4. When the code is typed, your viewer opens and the user is asked, with your username, whether to allow you. They can stop you with Ctrl+F12, and closing the program ends the session.
+
+You get remote desktop (screen, input, clipboard) and file transfer, running as the user. There is no shell, no scripts and no command buttons, for admins too. Only the technician who made the code, and admins, can use the session. While the program stays open the machine is in the agent table, so a closed viewer can be reopened with `d`; the server forgets the machine two minutes after the program is closed. Codes, their use and the end of each session are in the audit log (`assist.create`, `assist.redeem`, `assist.end`).
+
+Limits: Windows only. UAC prompts and the lock screen cannot be seen or controlled. With the installer's own CA the user's browser warns about the page's certificate, and Windows SmartScreen warns about the unsigned program; a publicly trusted certificate on the API and a code-signing certificate remove those warnings.
 
 The script installs the newest release: a server image from `ghcr.io/handclasp-raven/tetanusrmm` and the agent, viewer and TUI builds from the [releases page](https://github.com/handclasp-raven/TetanusRMM/releases). Nothing is compiled on the host. To upgrade later, run this in the install directory; it backs the database up to `backups/` first:
 

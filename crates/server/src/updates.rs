@@ -21,6 +21,10 @@
 //! download. They are not signed with the update key: a signature made for a
 //! viewer would also pass an agent's update check.
 //!
+//! The quick assist client (`publish_assist`) sits there too, as
+//! `<updates_dir>/<platform>/{assist.json, assist}`; the download page
+//! appends each server's settings to it (see `protocol::assist`).
+//!
 //! The support TUI's wheel is published as `<updates_dir>/tui/<wheel>`
 //! (`publish_tui`), under its own file name, for the install page.
 
@@ -37,6 +41,8 @@ pub const BINARY_FILE: &str = "agent";
 pub const SIGNATURE_FILE: &str = "agent.sig";
 pub const VIEWER_MANIFEST_FILE: &str = "viewer.json";
 pub const VIEWER_BINARY_FILE: &str = "viewer";
+pub const ASSIST_MANIFEST_FILE: &str = "assist.json";
+pub const ASSIST_BINARY_FILE: &str = "assist";
 /// Directory of the published TUI wheel, beside the platform directories.
 pub const TUI_DIR: &str = "tui";
 pub const SIGNING_KEY_FILE: &str = "update.key";
@@ -241,6 +247,42 @@ pub fn publish_viewer(
     platform: &str,
     version: &str,
 ) -> Result<UpdateManifest, UpdateError> {
+    publish_unsigned(
+        updates_dir,
+        file,
+        platform,
+        version,
+        VIEWER_BINARY_FILE,
+        VIEWER_MANIFEST_FILE,
+    )
+}
+
+/// Copy the quick assist build `file` into `<updates_dir>/<platform>/` and
+/// write its manifest, for the `/assist` page to offer.
+pub fn publish_assist(
+    updates_dir: &Path,
+    file: &Path,
+    platform: &str,
+    version: &str,
+) -> Result<UpdateManifest, UpdateError> {
+    publish_unsigned(
+        updates_dir,
+        file,
+        platform,
+        version,
+        ASSIST_BINARY_FILE,
+        ASSIST_MANIFEST_FILE,
+    )
+}
+
+fn publish_unsigned(
+    updates_dir: &Path,
+    file: &Path,
+    platform: &str,
+    version: &str,
+    binary_name: &str,
+    manifest_name: &str,
+) -> Result<UpdateManifest, UpdateError> {
     check_release(platform, version)?;
     let binary = fs::read(file).map_err(io_err(file))?;
     let manifest = UpdateManifest {
@@ -252,9 +294,9 @@ pub fn publish_viewer(
     write_release(
         &updates_dir.join(platform),
         &[
-            (VIEWER_BINARY_FILE, binary.as_slice()),
+            (binary_name, binary.as_slice()),
             (
-                VIEWER_MANIFEST_FILE,
+                manifest_name,
                 serde_json::to_vec_pretty(&manifest)?.as_slice(),
             ),
         ],
@@ -323,6 +365,14 @@ pub fn load_manifest(
     platform: &str,
 ) -> Result<Option<UpdateManifest>, UpdateError> {
     load_manifest_file(updates_dir, platform, MANIFEST_FILE)
+}
+
+/// The published quick assist manifest for `platform`, if any.
+pub fn load_assist_manifest(
+    updates_dir: &Path,
+    platform: &str,
+) -> Result<Option<UpdateManifest>, UpdateError> {
+    load_manifest_file(updates_dir, platform, ASSIST_MANIFEST_FILE)
 }
 
 /// The published viewer manifest for `platform`, if any.
@@ -448,8 +498,24 @@ mod tests {
             fs::read(dir.path().join("linux-x86_64").join(VIEWER_BINARY_FILE)).unwrap(),
             b"viewer binary"
         );
-        // The agent's release is separate.
+        // The agent's release is separate, and so is quick assist's.
         assert_eq!(load_manifest(dir.path(), "linux-x86_64").unwrap(), None);
+        assert_eq!(
+            load_assist_manifest(dir.path(), "linux-x86_64").unwrap(),
+            None
+        );
+        let assist = publish_assist(dir.path(), &file, "linux-x86_64", "0.3.1").unwrap();
+        assert_eq!(
+            load_assist_manifest(dir.path(), "linux-x86_64").unwrap(),
+            Some(assist)
+        );
+        assert_eq!(
+            load_viewer_manifest(dir.path(), "linux-x86_64")
+                .unwrap()
+                .unwrap()
+                .version,
+            "0.3.0"
+        );
     }
 
     #[test]

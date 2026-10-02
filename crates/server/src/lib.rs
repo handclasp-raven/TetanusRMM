@@ -6,6 +6,7 @@
 //! - [`access`]: role- and grant-based access to agents (RBAC).
 //! - [`groups`]: agent groups.
 //! - [`metrics`]: Prometheus metrics.
+//! - [`assist`]: quick assist: one-time sessions by six-digit code.
 //! - [`audit`]: hash-chained audit log.
 //! - [`registry`]: agents and per-device policies.
 //! - [`enroll`]: enrollment tokens and the internal CA for agent certificates.
@@ -20,6 +21,7 @@
 
 pub mod access;
 pub mod api;
+pub mod assist;
 pub mod audit;
 pub mod auth;
 pub mod config;

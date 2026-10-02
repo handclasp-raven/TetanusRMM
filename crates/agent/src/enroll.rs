@@ -31,6 +31,30 @@ pub struct EnrollOptions {
 /// signature proving possession) is sent, so the private key never leaves
 /// this machine.
 pub async fn enroll(opts: &EnrollOptions) -> Result<Credential, AgentError> {
+    exchange(opts, |csr_der| Message::Enroll {
+        token: opts.token.clone(),
+        csr_der,
+    })
+    .await
+}
+
+/// [`enroll`] for a quick assist session: `opts.token` is the six-digit
+/// code, and the credential is for a throwaway agent with a short-lived
+/// certificate. It is meant to be kept in memory, never stored.
+pub async fn enroll_assist(opts: &EnrollOptions) -> Result<Credential, AgentError> {
+    exchange(opts, |csr_der| Message::AssistEnroll {
+        code: opts.token.clone(),
+        csr_der,
+    })
+    .await
+}
+
+/// Send the request `request` builds from the CSR, on a connection without
+/// a client certificate, and turn the reply into a credential.
+async fn exchange(
+    opts: &EnrollOptions,
+    request: impl FnOnce(Vec<u8>) -> Message,
+) -> Result<Credential, AgentError> {
     let key = KeyPair::generate().map_err(|e| AgentError::Enroll(e.to_string()))?;
     let csr = CertificateParams::default()
         .serialize_request(&key)
@@ -46,14 +70,7 @@ pub async fn enroll(opts: &EnrollOptions) -> Result<Credential, AgentError> {
     let conn = dialed.connection;
 
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_frame(
-        &mut send,
-        &Message::Enroll {
-            token: opts.token.clone(),
-            csr_der: csr.der().to_vec(),
-        },
-    )
-    .await?;
+    write_frame(&mut send, &request(csr.der().to_vec())).await?;
     let reply = read_frame(&mut recv).await;
     // Read the server's close reason (if it rejected us) before closing ourselves.
     let rejection = conn

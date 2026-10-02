@@ -507,7 +507,7 @@ async fn upgrading_to_rbac_keeps_existing_engineers_access() {
         .await
         .unwrap();
     assert_eq!(
-        visibility.capabilities("agt-1"),
+        visibility.capabilities("agt-1", false),
         server::access::all_capabilities()
     );
     let grants = server::access::list_grants(&db.pool, None).await.unwrap();

@@ -80,6 +80,14 @@ pub enum Action {
     /// A program was started on an agent's desktop; detail has the command
     /// and how it went.
     CommandLaunch,
+    /// A technician made a quick assist code.
+    AssistCreate,
+    /// A quick assist code was typed; detail has the throwaway agent.
+    AssistRedeem,
+    /// A quick assist agent was removed after its session.
+    AssistEnd,
+    /// Too many wrong quick assist codes: the outstanding ones were voided.
+    AssistLockout,
 }
 
 impl Action {
@@ -119,6 +127,10 @@ impl Action {
             Action::GroupMembers => "group.members",
             Action::AgentClassify => "agent.classify",
             Action::CommandLaunch => "command.launch",
+            Action::AssistCreate => "assist.create",
+            Action::AssistRedeem => "assist.redeem",
+            Action::AssistEnd => "assist.end",
+            Action::AssistLockout => "assist.lockout",
         }
     }
 }

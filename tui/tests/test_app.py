@@ -13,6 +13,7 @@ from textual.widgets import DataTable, Input, OptionList, SelectionList, Static,
 
 from tetanus_rmm.api import ApiClient
 from tetanus_rmm.app import RmmApp
+from tetanus_rmm.assist import QuickAssistScreen
 from tetanus_rmm.auth import SessionManager, StoredSession, TokenStore
 from tetanus_rmm.commands import DEFAULT_COMMANDS, CommandsScreen, QuickCommand
 from tetanus_rmm.config import Config
@@ -200,6 +201,96 @@ async def test_remote_desktop_launches_the_viewer_with_a_fresh_token(tmp_path) -
     # Both tokens stay out of the process list.
     assert command.env == {"RMM_VIEWER_TOKEN": "vtok", "RMM_API_TOKEN": "sess"}
     assert "sess" not in command.argv
+
+
+async def test_quick_assist_shows_a_code_and_opens_the_viewer_once_it_is_typed(tmp_path) -> None:
+    server, kr, launched = FakeServer(), MemoryKeyring(), []
+    TokenStore(BASE, kr).save(StoredSession("sess", LATER, "jane"))
+    serve_agents(server)
+    server.on(
+        "POST",
+        "/api/assist-sessions",
+        body={
+            "id": 7,
+            "code": "482913",
+            "expires_at": LATER.isoformat(),
+            "url": f"{BASE}/assist",
+        },
+    )
+    server.on("GET", "/api/assist-sessions/7", body={"id": 7, "status": "waiting"})
+    server.on(
+        "POST",
+        "/api/agents/qa-1/viewer-sessions",
+        body={
+            "token": "vtok",
+            "expires_at": LATER.isoformat(),
+            "agent_id": "qa-1",
+            "online": True,
+        },
+    )
+    app = make_app(server, kr, tmp_path, launched)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+        await pilot.press("h")
+        await wait_for(pilot, lambda: isinstance(app.screen, QuickAssistScreen))
+        screen = app.screen
+        await wait_for(pilot, lambda: screen.code is not None)
+        assert screen.query_one("#qa-url", Input).value == f"{BASE}/assist"
+        assert str(screen.query_one("#qa-code", Static).render()) == "482 913"
+        # Nothing starts while the code has not been typed.
+        await wait_for(pilot, lambda: screen.status is not None, timeout=10)
+        assert not launched
+        assert "Waiting for them" in str(screen.query_one("#qa-status", Static).render())
+
+        server.on(
+            "GET",
+            "/api/assist-sessions/7",
+            body={"id": 7, "status": "connected", "agent_id": "qa-1", "hostname": "HOME-PC"},
+        )
+        await wait_for(pilot, lambda: launched, timeout=10)
+        await wait_for(
+            pilot,
+            lambda: "HOME-PC" in str(screen.query_one("#qa-status", Static).render()),
+        )
+        # Once: the polling stops when the viewer has been started.
+        await pilot.pause(1.5)
+    (command,) = launched
+    # No command buttons in a quick assist session.
+    assert "--no-default-commands" in command.argv and "--command" not in command.argv
+    assert command.env == {"RMM_VIEWER_TOKEN": "vtok", "RMM_API_TOKEN": "sess"}
+
+
+async def test_an_expired_quick_assist_code_says_so_and_a_new_one_can_be_made(tmp_path) -> None:
+    server, kr, launched = FakeServer(), MemoryKeyring(), []
+    TokenStore(BASE, kr).save(StoredSession("sess", LATER, "jane"))
+    serve_agents(server)
+    codes = iter(["111111", "222222"])
+    server.on(
+        "POST",
+        "/api/assist-sessions",
+        handler=lambda _req: httpx.Response(
+            200,
+            json={
+                "id": 7,
+                "code": next(codes),
+                "expires_at": LATER.isoformat(),
+                "url": f"{BASE}/assist",
+            },
+        ),
+    )
+    server.on("GET", "/api/assist-sessions/7", body={"id": 7, "status": "expired"})
+    app = make_app(server, kr, tmp_path, launched)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+        await pilot.press("h")
+        await wait_for(pilot, lambda: isinstance(app.screen, QuickAssistScreen))
+        screen = app.screen
+        status = screen.query_one("#qa-status", Static)
+        await wait_for(pilot, lambda: "expired" in str(status.render()), timeout=10)
+        await pilot.press("ctrl+g")
+        await wait_for(pilot, lambda: screen.code is not None and screen.code.code == "222222")
+        assert str(screen.query_one("#qa-code", Static).render()) == "222 222"
+    assert not launched
 
 
 async def test_auditors_see_agents_but_no_control_actions(tmp_path) -> None:
@@ -1432,6 +1523,7 @@ async def test_the_menu_bar_runs_the_agent_tables_actions(tmp_path) -> None:
             "scripts",
             "classify",
             "new_agent",
+            "quick_assist",
         ]
         assert str(items.get_option_at_index(0).prompt).split() == ["Remote", "desktop", "d"]
         # A support engineer may not classify.

@@ -306,6 +306,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "assist"
+version = "0.1.2"
+dependencies = [
+ "agent",
+ "anyhow",
+ "common",
+ "protocol",
+ "tokio",
+ "tracing",
+ "transport",
+ "windows",
+]
+
+[[package]]
 name = "astral-tokio-tar"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

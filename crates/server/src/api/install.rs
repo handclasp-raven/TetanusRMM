@@ -70,7 +70,7 @@ async fn viewer(
     Ok(attachment(resp, filename))
 }
 
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -109,8 +109,7 @@ fn render(
 ) -> String {
     let server = escape(server);
     let Some(wheel) = wheel else {
-        return PAGE.replace(
-            "{body}",
+        return page_with(
             "<p class=\"note\">The support TUI has not been published on this server yet. \
              Ask an administrator to run <code>scripts/build-clients.sh</code>.</p>",
         );
@@ -200,21 +199,19 @@ kept up to date from this server.</p>
 </li>
 </ol>"#
     );
-    PAGE.replace("{body}", &body)
+    page_with(&body)
 }
 
-const PAGE: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Install the RMM support tools</title>
-<style>
-:root { --bg: #f6f7f9; --card: #fff; --text: #1c2330; --muted: #5d6878; --line: #dde1e7;
-  --accent: #1f5fd0; --accent-text: #fff; --code: #eef1f5; }
+fn page_with(body: &str) -> String {
+    PAGE.replace("{style}", PAGE_STYLE).replace("{body}", body)
+}
+
+/// Styles shared with the quick assist page (`super::assist`).
+pub(super) const PAGE_STYLE: &str = r#":root { --bg: #f6f7f9; --card: #fff; --text: #1c2330; --muted: #5d6878; --line: #dde1e7;
+  --accent: #1f5fd0; --accent-text: #fff; --code: #eef1f5; --warn: #c0392b; }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #12161c; --card: #1a2029; --text: #e6e9ee; --muted: #9aa5b5; --line: #2c3442;
-    --accent: #6ea2ff; --accent-text: #0d1320; --code: #10151c; }
+    --accent: #6ea2ff; --accent-text: #0d1320; --code: #10151c; --warn: #ff7b6b; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; padding: 32px 16px 64px; background: var(--bg); color: var(--text);
@@ -237,7 +234,16 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font
 code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
 pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px;
   padding: 10px 12px; margin: 8px 0; overflow-x: auto; white-space: pre; }
-pre.server { font-weight: 600; font-size: 1rem; }
+pre.server { font-weight: 600; font-size: 1rem; }"#;
+
+const PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install the RMM support tools</title>
+<style>
+{style}
 </style>
 </head>
 <body>
@@ -267,7 +273,7 @@ mod tests {
         assert!(page.contains("<pre class=\"server\">rmm.example.com:8443</pre>"));
         assert!(page.contains("AB:CD\nEF:01"));
         assert!(page.contains("href=\"/install/viewer/windows-x86_64\">Windows (0.2.0)"));
-        assert!(!page.contains("{body}") && !page.contains("{wheel}"));
+        assert!(!page.contains("{body}") && !page.contains("{wheel}") && !page.contains("{style}"));
     }
 
     #[test]

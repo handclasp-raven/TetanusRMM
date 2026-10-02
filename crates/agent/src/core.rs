@@ -34,6 +34,8 @@ pub struct CoreOptions {
     pub media: Option<Arc<crate::media::source::MediaLink>>,
     /// The user's desktop (Windows service: the session helper).
     pub desktop: Option<Arc<crate::interactive::DesktopLink>>,
+    /// Which remote operations to serve.
+    pub remote: crate::remote::Allowed,
 }
 
 pub fn version() -> &'static str {
@@ -59,6 +61,7 @@ pub async fn run(
     config.telemetry = options.telemetry;
     config.media = options.media;
     config.desktop = options.desktop;
+    config.remote = options.remote;
     tokio::select! {
         () = connect_forever(&config, &status) => unreachable!("connect_forever never returns"),
         update = update_loop(credential, options.update_interval, options.store.as_ref()) => Ok(update),

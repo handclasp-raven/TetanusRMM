@@ -114,6 +114,9 @@ pub struct Agent {
     pub dns_servers: Option<Vec<String>>,
     /// Fixed disks and their usage, as last reported (protocol 9+).
     pub disks: Option<sqlx::types::Json<Vec<protocol::DiskUsage>>>,
+    /// Set for a quick assist client's throwaway agent (see
+    /// `crate::assist`); `None` for installed agents.
+    pub assist_session_id: Option<i64>,
 }
 
 impl Agent {

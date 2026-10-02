@@ -117,6 +117,8 @@ pub struct AgentConfig {
     pub hostname: Option<String>,
     /// Direct paths to viewers (the server can also turn them off).
     pub direct: peer::DirectSettings,
+    /// Which remote operations to serve (a quick assist client: files only).
+    pub remote: remote::Allowed,
 }
 
 /// What the agent observed, for tests.
@@ -161,6 +163,7 @@ pub struct AgentSession {
     hostname: Option<String>,
     server_addr: SocketAddr,
     direct: peer::DirectSettings,
+    remote: remote::Allowed,
     /// This connection's Noise static key, and the proof (signed with the
     /// enrolled certificate's key) that it is this agent's.
     peer_key: Arc<peer::StaticKey>,
@@ -219,9 +222,30 @@ pub async fn connect_with(
         hostname: config.hostname.clone(),
         server_addr: config.server_addr,
         direct: config.direct.clone(),
+        remote: config.remote,
         peer_key,
         proof,
     })
+}
+
+/// A server address given as `ip:port`, or as `host:port` and resolved,
+/// preferring IPv4 (the server listens on `0.0.0.0` by default, and
+/// `localhost` often resolves to `::1` first).
+pub fn resolve_server(value: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    if let Ok(addr) = value.parse() {
+        return Ok(addr);
+    }
+    let addrs: Vec<SocketAddr> = value
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {value:?} (expected host:port): {e}"))?
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addrs.first())
+        .copied()
+        .ok_or_else(|| format!("{value:?} has no addresses"))
 }
 
 fn quic_only() -> std::io::Error {
@@ -751,8 +775,9 @@ impl AgentSession {
             loop {
                 let (mut send, mut recv) = self.connection.accept_bi().await?;
                 while tasks.try_join_next().is_some() {}
+                let allowed = self.remote;
                 tasks.spawn(async move {
-                    if remote::serve(&mut send, &mut recv).await.is_ok() {
+                    if remote::serve(allowed, &mut send, &mut recv).await.is_ok() {
                         let _ = send.finish();
                     }
                 });

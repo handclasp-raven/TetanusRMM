@@ -41,6 +41,9 @@ enum Command {
     /// Copy the support TUI's wheel into the updates directory, for the
     /// install page (`/install`) to offer.
     PublishTui(PublishTuiArgs),
+    /// Copy a quick assist build into the updates directory, for the
+    /// `/assist` page to offer.
+    PublishAssist(PublishViewerArgs),
 }
 
 #[derive(Args)]
@@ -90,7 +93,7 @@ struct PublishUpdateArgs {
 
 #[derive(Args)]
 struct PublishViewerArgs {
-    /// Viewer binary.
+    /// The binary to publish.
     file: PathBuf,
     #[command(flatten)]
     release: Release,
@@ -175,6 +178,16 @@ async fn main() -> anyhow::Result<()> {
                 &args.release.version,
             )?;
             info!(platform = %manifest.platform, version = %manifest.version, sha256 = %manifest.sha256, "published viewer");
+            Ok(())
+        }
+        Command::PublishAssist(args) => {
+            let manifest = updates::publish_assist(
+                &args.updates_dir,
+                &args.file,
+                &args.release.platform,
+                &args.release.version,
+            )?;
+            info!(platform = %manifest.platform, version = %manifest.version, sha256 = %manifest.sha256, "published quick assist");
             Ok(())
         }
         Command::PublishTui(args) => {
@@ -266,6 +279,21 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             }
         }
     };
+    // Quick assist agents are deleted soon after they go.
+    let prune_assist = {
+        let pool = pool.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                match server::assist::prune(&pool, server::assist::GONE_AFTER).await {
+                    Ok(gone) if !gone.is_empty() => info!(agents = ?gone, "quick assist ended"),
+                    Ok(_) => {}
+                    Err(e) => warn!("pruning quick assist agents failed: {e}"),
+                }
+            }
+        }
+    };
     let app = api::router(AppState {
         pool,
         auth: AuthSettings {
@@ -285,6 +313,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         () = quic.run() => bail!("QUIC listener stopped"),
         () = stun => bail!("STUN responder stopped"),
         () = prune => bail!("telemetry pruning stopped"),
+        () = prune_assist => bail!("quick assist pruning stopped"),
         res = metrics => {
             res.context("metrics listener stopped")?;
             bail!("metrics listener stopped");

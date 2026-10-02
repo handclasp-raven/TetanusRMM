@@ -349,6 +349,7 @@ async fn service_body(
             telemetry: Some(Arc::new(SystemTelemetry::new())),
             media: Some(Arc::new(media_link)),
             desktop: Some(Arc::new(desktop_link)),
+            remote: Default::default(),
         };
         core::run(&credential, options, status_tx).await
     };

@@ -262,6 +262,9 @@ class Agent:
     os: str | None = None
     #: Fixed disks, as last reported. ``None`` if not reported.
     disks: tuple[Disk, ...] | None = None
+    #: A quick assist session's throwaway agent: there only while the user
+    #: keeps the quick assist window open.
+    quick_assist: bool = False
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Agent:
@@ -293,6 +296,7 @@ class Agent:
             classification_override=d.get("classification_override"),
             os=d.get("os"),
             disks=tuple(Disk.from_json(x) for x in disks) if disks is not None else None,
+            quick_assist=d.get("assist_session_id") is not None,
         )
 
     def allows(self, capability: str, user: User | None) -> bool:
@@ -363,6 +367,66 @@ class EnrollmentLink:
             server=d.get("server", ""),
             server_name=d.get("server_name", ""),
         )
+
+
+@dataclass(frozen=True)
+class AssistCode:
+    """A quick assist code: six digits to read out to a user, who types
+    them into the quick assist program from ``url``."""
+
+    id: int
+    code: str
+    expires_at: datetime
+    #: The page the user downloads the program from.
+    url: str
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> AssistCode:
+        return cls(
+            id=int(d["id"]),
+            code=d["code"],
+            expires_at=parse_time(d["expires_at"]),  # type: ignore[arg-type]
+            url=d.get("url", ""),
+        )
+
+    @property
+    def spaced(self) -> str:
+        """The code as it is read out: ``482 913``."""
+        half = len(self.code) // 2
+        return f"{self.code[:half]} {self.code[half:]}"
+
+
+#: Where a quick assist session is (``AssistStatus.status``).
+ASSIST_WAITING = "waiting"
+ASSIST_EXPIRED = "expired"
+ASSIST_CONNECTING = "connecting"
+ASSIST_CONNECTED = "connected"
+ASSIST_ENDED = "ended"
+
+
+@dataclass(frozen=True)
+class AssistStatus:
+    """Where a quick assist session is."""
+
+    id: int
+    status: str
+    #: The session's agent, once the code has been typed.
+    agent_id: str | None
+    hostname: str | None
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> AssistStatus:
+        return cls(
+            id=int(d["id"]),
+            status=d["status"],
+            agent_id=d.get("agent_id"),
+            hostname=d.get("hostname"),
+        )
+
+    @property
+    def label(self) -> str:
+        """The user's machine: its hostname if known yet."""
+        return self.hostname or "the user's computer"
 
 
 @dataclass(frozen=True)
@@ -703,6 +767,17 @@ class ApiClient:
             raise ApiError(0, f"cannot write {dest}: {e}") from e
         finally:
             tmp.unlink(missing_ok=True)
+
+    # --- quick assist ------------------------------------------------------
+
+    async def create_assist_code(self) -> AssistCode:
+        """A new quick assist code, valid for a few minutes and usable once."""
+        response = await self._request("POST", "/api/assist-sessions")
+        return AssistCode.from_json(response.json())
+
+    async def assist_status(self, session_id: int) -> AssistStatus:
+        response = await self._request("GET", f"/api/assist-sessions/{session_id}")
+        return AssistStatus.from_json(response.json())
 
     async def ca_certificate(self) -> str:
         """The server's CA certificate (PEM): the one the viewer must trust."""

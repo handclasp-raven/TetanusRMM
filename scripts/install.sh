@@ -24,7 +24,7 @@
 #   6. starts Postgres and the server with Docker Compose;
 #   7. creates the first admin user;
 #   8. signs the Windows agent with your update key and publishes it, the
-#      viewers and the TUI.
+#      viewers, the quick assist client and the TUI.
 #
 # Only Docker is needed on the host: there is no Rust or Python to install.
 #
@@ -468,7 +468,7 @@ $ADMIN_SUMMARY"
 # The release's agent is the same for every server: it is signed here, with
 # this server's update key, which agents pin the first time they connect.
 publish_release() {
-    say "Signing and publishing the agent, the viewers and the TUI ($VERSION)"
+    say "Signing and publishing the agent, the viewers, quick assist and the TUI ($VERSION)"
     local rel=releases/$VERSION
     server sign-update "$rel/rmm-agent-windows-x86_64.exe" \
         --platform windows-x86_64 --version "$VERSION"
@@ -478,6 +478,13 @@ publish_release() {
         --platform linux-x86_64 --version "$VERSION"
     server publish-viewer "$rel/rmm-viewer-windows-x86_64.exe" \
         --platform windows-x86_64 --version "$VERSION"
+    # Releases before quick assist existed do not have it.
+    if [ -f "$rel/rmm-assist-windows-x86_64.exe" ]; then
+        server publish-assist "$rel/rmm-assist-windows-x86_64.exe" \
+            --platform windows-x86_64 --version "$VERSION"
+    else
+        note "this release has no quick assist client; /assist will say so"
+    fi
     server publish-tui "$rel"/tetanus_rmm-*.whl
     # Downloads of earlier releases are not needed again.
     find releases -mindepth 1 -maxdepth 1 ! -name "$VERSION" -exec rm -rf {} +
@@ -499,7 +506,7 @@ clients() {
     fi
     say "Building the Windows agent (the first build downloads a ~3.6 GB toolchain image)"
     scripts/build-windows-agent.sh
-    say "Building the viewers and the TUI"
+    say "Building the viewers, quick assist and the TUI"
     scripts/build-clients.sh
 }
 
@@ -509,6 +516,7 @@ summary() {
 
   Server:        https://$HOST:$API_PORT
   Staff install: https://$HOST:$API_PORT/install   (TUI download and instructions)
+  Quick assist:  https://$HOST:$API_PORT/assist    (one-time help for a user with no agent)
   Installed in:  $DIR
   Version:       $(version_summary)
   CA fingerprint (staff confirm it at first sign-in):

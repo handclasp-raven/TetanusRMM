@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,23 +92,8 @@ struct ServerArgs {
     ws_server: Option<SocketAddr>,
 }
 
-/// `ip:port` as is; `host:port` resolved, preferring IPv4 (the server
-/// listens on `0.0.0.0` by default, and `localhost` often resolves to `::1`
-/// first).
 fn server_addr(value: &str) -> Result<SocketAddr, String> {
-    if let Ok(addr) = value.parse() {
-        return Ok(addr);
-    }
-    let addrs: Vec<SocketAddr> = value
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {value:?} (expected host:port): {e}"))?
-        .collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or(addrs.first())
-        .copied()
-        .ok_or_else(|| format!("{value:?} has no addresses"))
+    agent::resolve_server(value)
 }
 
 impl ServerArgs {
@@ -253,6 +238,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         // Console mode has no helper: no consent prompt can be shown, so
         // `require` falls back to its on_no_user setting.
         desktop: None,
+        remote: Default::default(),
     };
     tokio::select! {
         update = agent::core::run(&credential, options, status) => install_and_relaunch(&paths, update?),

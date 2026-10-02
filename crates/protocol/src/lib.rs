@@ -3,6 +3,7 @@
 //! Every message on a QUIC stream is a [`Message`] encoded with `postcard` and
 //! prefixed by its length as a big-endian `u32` (see [`framing`]).
 
+pub mod assist;
 pub mod clipboard;
 pub mod consent;
 pub mod e2e;
@@ -48,7 +49,10 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   and again whenever it changes. Agents never send it unasked, so an
 ///   older server is not upset. Also `StreamOpen::Launch` (appended
 ///   variant): start a program on the signed-in user's desktop.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// - 10: quick assist (appended variant): `AssistEnroll` trades a six-digit
+///   code for a short-lived certificate (see [`assist`]). Only the quick
+///   assist client sends it; an older server closes the connection.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Oldest agent protocol that reports [`AgentStatus`].
 pub const MIN_STATUS_VERSION: u32 = 9;
@@ -243,6 +247,13 @@ pub enum Message {
     /// is on its own network. The server cleans it (see
     /// [`AgentStatus::sanitized`]).
     AgentStatus(AgentStatus),
+
+    // --- Quick assist (Phase 12) -------------------------------------------
+    /// First (and only) message on a connection made *without* a client
+    /// certificate by the quick assist client: exchange the six-digit code
+    /// a technician read out for a short-lived certificate. Like
+    /// [`Message::Enroll`], and answered with [`Message::Enrolled`].
+    AssistEnroll { code: String, csr_der: Vec<u8> },
 }
 
 /// Most signed-in users an [`AgentStatus`] carries.
@@ -529,6 +540,17 @@ mod tests {
             assert_eq!(usize::from(bytes[0]), 28 + i);
             assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn assist_enroll_is_appended_after_agent_status() {
+        let msg = Message::AssistEnroll {
+            code: "482913".into(),
+            csr_der: vec![1, 2, 3],
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        assert_eq!(bytes[0], 35);
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
     }
 
     #[test]

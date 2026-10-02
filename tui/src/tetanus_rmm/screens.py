@@ -45,7 +45,7 @@ from .config import ConfigError, normalize_server_url
 from .menu import MenuBar
 from .stats import StatsPanel, TelemetryCache
 from .trust import fingerprint
-from .viewer import FONT_FILE, ViewerError, build_command
+from .viewer import ViewerError
 
 if TYPE_CHECKING:
     from .app import RmmApp
@@ -344,6 +344,7 @@ class MainScreen(Screen):
         Binding("s", "shell", "Shell"),
         Binding("r", "scripts", "Scripts", show=False),
         Binding("n", "new_agent", "New agent", show=False),
+        Binding("h", "quick_assist", "Quick assist", show=False),
         Binding("k", "classify", "Classify", show=False),
         Binding("g", "groups", "Groups", show=False),
         Binding("u", "users", "Users", show=False),
@@ -363,7 +364,7 @@ class MainScreen(Screen):
 
     #: The menu bar: each menu's name and the actions in it.
     MENUS = {
-        "Agent": ["desktop", "shell", "scripts", "classify", "new_agent"],
+        "Agent": ["desktop", "shell", "scripts", "classify", "new_agent", "quick_assist"],
         "View": ["search", "filter", "columns", "stats", "app.change_theme", "themes", "refresh"],
         "Manage": ["groups", "users", "audit", "viewer_commands"],
         "Session": ["logout", "app.quit"],
@@ -457,6 +458,8 @@ class MainScreen(Screen):
             return bool(user and user.can_read_audit)
         if action == "new_agent":
             return bool(user and user.can_enroll)
+        if action == "quick_assist":
+            return bool(user and user.can_control)
         if action in ("classify", "users"):
             return bool(user and user.is_admin)
         return True
@@ -746,18 +749,12 @@ class MainScreen(Screen):
     @work(group="viewer")
     async def launch_viewer(self, agent: Agent) -> None:
         try:
-            session = await self.app.session.api.create_viewer_session(agent.id)
-            if not session.online:
+            # A quick assist session allows no command buttons.
+            commands = [] if agent.quick_assist else self.app.state.commands
+            process = await self.app.start_viewer(agent.id, commands)
+            if process is None:
                 self.app.notify(f"{agent.label} went offline.", severity="error")
                 return
-            command = build_command(
-                await self.app.viewer_config(),
-                session,
-                api_token=self.app.session.api.token,
-                commands=self.app.state.commands,
-                font_file=self.app.state.path.with_name(FONT_FILE),
-            )
-            process = self.app.launch_viewer(command)
         except Unauthorized:
             self.app.session_expired()
             return
@@ -847,6 +844,11 @@ class MainScreen(Screen):
         from .enroll import NewAgentScreen
 
         self.app.push_screen(NewAgentScreen())
+
+    def action_quick_assist(self) -> None:
+        from .assist import QuickAssistScreen
+
+        self.app.push_screen(QuickAssistScreen())
 
     def action_groups(self) -> None:
         from .groups import GroupsScreen

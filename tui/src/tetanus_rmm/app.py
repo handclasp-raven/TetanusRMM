@@ -7,7 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 
 from textual import work
@@ -17,13 +17,14 @@ from textual.theme import Theme
 from . import provision
 from .api import ApiClient, ApiError
 from .auth import SessionManager
+from .commands import QuickCommand
 from .config import Config, data_dir
 from .screens import LoginScreen, MainScreen, SplashScreen
 from .scripts import ScriptLibrary
 from .state import UiState
 from .themes import DEFAULT_THEME, PREVIEW, THEMES
 from .trust import TrustStore, fetch_ca
-from .viewer import ViewerCommand, ViewerError, close_all
+from .viewer import FONT_FILE, ViewerCommand, ViewerError, build_command, close_all
 from .viewer import launch as launch_process
 
 Launcher = Callable[[ViewerCommand, Path], "subprocess.Popen[bytes]"]
@@ -175,6 +176,24 @@ class RmmApp(App):
         self.viewers = [p for p in self.viewers if p.poll() is None]
         self.viewers.append(process)
         return process
+
+    async def start_viewer(
+        self, agent_id: str, commands: Iterable[QuickCommand]
+    ) -> subprocess.Popen[bytes] | None:
+        """Ask for a viewer session on ``agent_id`` and start the viewer
+        for it, with ``commands`` as its buttons. ``None`` if the agent has
+        gone offline. Raises :class:`ApiError` or :class:`ViewerError`."""
+        session = await self.session.api.create_viewer_session(agent_id)
+        if not session.online:
+            return None
+        command = build_command(
+            await self.viewer_config(),
+            session,
+            api_token=self.session.api.token,
+            commands=commands,
+            font_file=self.state.path.with_name(FONT_FILE),
+        )
+        return self.launch_viewer(command)
 
     def close_viewers(self) -> None:
         """Close every viewer this TUI started. Safe to call more than once."""

@@ -11,6 +11,7 @@
 //! |---|---|---|
 //! | yes | `Hello` | Accepted if the cert is pinned to that agent id in the registry, then `Heartbeat`/`HeartbeatAck` |
 //! | no  | `Enroll` | Token consumed, certificate issued, `Enrolled` sent, connection ends |
+//! | no  | `AssistEnroll` | Quick assist code consumed (see `crate::assist`), short-lived certificate issued, `Enrolled` sent, connection ends |
 //! | no  | `ViewerHello` | Viewer token consumed; the viewer is subscribed to its agent's video via the relay |
 //! | anything else | | Closed with `PROTOCOL_ERROR` or `UNAUTHORIZED` |
 //!
@@ -45,7 +46,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::Identity;
 use protocol::consent::{ConsentMode, OnNoUser, Outcome, SessionRequest};
@@ -60,6 +61,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use transport::{Connection, ConnectionError, TransportKind};
 
+use crate::assist::{self, AssistError};
 use crate::enroll::{self, AgentCa, EnrollError};
 use crate::metrics::{self, ConnectedGuard, PathGauge, ReasonLabels, ResultLabels, SessionLabels};
 use crate::registry;
@@ -180,6 +182,7 @@ pub struct Server {
     registry: Option<Arc<Registry>>,
     hub: Arc<Hub>,
     peer: PeerPolicy,
+    assist: Arc<assist::Limiter>,
 }
 
 /// Per-connection context shared with the connection task.
@@ -189,6 +192,8 @@ struct Hooks {
     registry: Option<Arc<Registry>>,
     hub: Arc<Hub>,
     peer: PeerPolicy,
+    /// Limits wrong quick assist codes.
+    assist: Arc<assist::Limiter>,
 }
 
 impl Hooks {
@@ -228,6 +233,7 @@ impl Server {
                 direct: true,
                 stun_port: None,
             },
+            assist: Arc::default(),
         })
     }
 
@@ -272,6 +278,7 @@ impl Server {
             registry: self.registry.clone(),
             hub: self.hub.clone(),
             peer: self.peer,
+            assist: self.assist.clone(),
         }
     }
 
@@ -550,10 +557,69 @@ async fn dispatch(
             let _ = tokio::time::timeout(ENROLL_LINGER, conn.closed()).await;
             Ok(())
         }
-        (Some(Message::Enroll { .. }), Some(_)) => {
+        (Some(Message::AssistEnroll { code, csr_der }), None) => {
+            let registry = hooks
+                .registry
+                .as_ref()
+                .ok_or(ConnError::Unauthorized("quick assist is not available"))?;
+            let remote = conn.remote_address().ip();
+            if !hooks.assist.allows(remote, Instant::now()) {
+                enrollment_result("assist_rate_limited");
+                return Err(ConnError::Unauthorized(protocol::assist::REJECT_TOO_MANY));
+            }
+            let enrolled =
+                match assist::redeem(&registry.pool, &registry.ca, &code, &csr_der, remote).await {
+                    Ok(enrolled) => enrolled,
+                    Err(AssistError::InvalidCode) => {
+                        enrollment_result("assist_invalid_code");
+                        if let assist::Failure::Lockout(failures) =
+                            hooks.assist.failed(remote, Instant::now())
+                        {
+                            let voided = assist::void_all(&registry.pool, failures).await?;
+                            warn!(
+                                failures,
+                                voided,
+                                "too many wrong quick assist codes: outstanding codes voided"
+                            );
+                        }
+                        return Err(ConnError::Unauthorized(protocol::assist::REJECT_CODE));
+                    }
+                    Err(AssistError::Ca(e)) => {
+                        enrollment_result("invalid_csr");
+                        warn!(conn_id, "quick assist CSR rejected: {e}");
+                        return Err(ConnError::Protocol("invalid certificate signing request"));
+                    }
+                    Err(AssistError::NoFreeCode) => {
+                        return Err(ConnError::Protocol("unexpected quick assist error"))
+                    }
+                    Err(AssistError::Db(e)) => return Err(e.into()),
+                };
+            info!(conn_id, agent_id = %enrolled.agent_id, fingerprint = %enrolled.fingerprint, "quick assist code redeemed");
+            enrollment_result("assist_redeemed");
+            write_frame(
+                &mut send,
+                &Message::Enrolled {
+                    agent_id: enrolled.agent_id.clone(),
+                    cert_pem: enrolled.cert_pem,
+                    ca_pem: registry.ca.ca_pem().to_owned(),
+                    api_url: registry.api_url.clone(),
+                },
+            )
+            .await?;
+            let _ = send.finish();
+            hooks.emit(ServerEvent::Enrolled {
+                conn_id,
+                agent_id: enrolled.agent_id,
+            });
+            let _ = tokio::time::timeout(ENROLL_LINGER, conn.closed()).await;
+            Ok(())
+        }
+        (Some(Message::Enroll { .. } | Message::AssistEnroll { .. }), Some(_)) => {
             Err(ConnError::Protocol("already enrolled; send Hello"))
         }
-        (Some(_), _) => Err(ConnError::Protocol("expected Hello, Enroll or ViewerHello")),
+        (Some(_), _) => Err(ConnError::Protocol(
+            "expected Hello, Enroll, AssistEnroll or ViewerHello",
+        )),
     }
 }
 

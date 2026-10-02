@@ -25,6 +25,9 @@ directly. What it does:
 - **New agent:** a single-use download link for installing an agent. On
   Windows that's an MSI which installs and enrolls it unattended, optionally
   straight into agent groups. The MSI can be saved from the TUI.
+- **Quick assist:** help someone whose computer has no agent, for one
+  session: a six-digit code they type into a program they download from
+  the server. The viewer opens when they have.
 - **Groups:** view groups and their members. Admins can also create, rename,
   delete and fill them. The group list beside the agent table filters it,
   and the search box above it filters by hostname, IP address or group
@@ -200,6 +203,7 @@ server-side session then expires on its own.
 | `s` | Shell console on the selected agent |
 | `r` | Script runner (the selected agent is pre-selected) |
 | `n` | New agent: download link / MSI (admins and support engineers) |
+| `h` | Quick assist: a one-time session by six-digit code (admins and support engineers) |
 | `/` | Search by hostname, IP address or group name (`Enter`: back to the table, `Esc`: clear) |
 | `f` | Jump to the group list |
 | `k` | Classify the selected agent as server, desktop or other (admins) |
@@ -378,6 +382,20 @@ the server applies your access and audits what it does. It also gets
 `--remember-font-size <data dir>/viewer.json`: a text size you pick in a
 viewer is saved there, and the next viewer starts at it (see
 `viewer_font_size`).
+
+**Quick assist** (`h`): for a computer with no agent installed.
+1. Tell the user the page address shown (**Copy** puts it on the clipboard).
+   They download quick assist there and open it; it makes them read a
+   warning about scams for five seconds first.
+2. Read them the six-digit code. It works once and expires after ten
+   minutes; `Ctrl+G` makes a new one.
+3. When they have typed it, the viewer starts by itself and they are asked,
+   with your username, whether to allow you.
+
+You get remote desktop and file transfer, no shell, scripts or command
+buttons. The session lasts until they close quick assist. Until then their
+computer is in the agent table, so if you close the viewer, press `d` on it
+to open another (they are asked again).
 
 **Viewer buttons** (`v`): the command buttons shown in the viewer's side
 panel. Each starts its command on the agent's desktop as the signed-in

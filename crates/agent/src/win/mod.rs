@@ -20,6 +20,9 @@
 //!                                         └─────────────────────────────┘
 //! ```
 //!
+//! The quick assist client has none of this: one process, run by the user,
+//! does it all for a single session (see [`local`]).
+//!
 //! See [`crate::session`] for why the helper exists, and [`input_helper`]
 //! for why input has a process of its own.
 
@@ -36,6 +39,7 @@ pub mod helper;
 pub mod indicator;
 pub mod input;
 pub mod input_helper;
+pub mod local;
 pub mod pipe;
 pub mod process;
 pub mod service;

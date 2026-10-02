@@ -4,14 +4,18 @@
 #
 #   - the viewer for Linux and Windows, published to ./updates/<platform>/
 #     (the TUI downloads the one for its machine from the server);
+#   - the quick assist client for Windows, published to
+#     ./updates/windows-x86_64/ (users download it from the server's
+#     quick assist page, https://<server>/assist);
 #   - the TUI as a wheel, published to ./updates/tui/ (staff download it
 #     from the server's install page, https://<server>/install).
 #
 #   scripts/build-clients.sh [--no-publish] [VERSION]
 #
-# VERSION defaults to the viewer crate's version. Both viewers are built in
-# Docker: Linux against an old glibc (docker/viewer-linux.Dockerfile),
-# Windows with the agent's cross toolchain (docker/agent-windows.Dockerfile).
+# VERSION defaults to the viewer crate's version. The viewers and quick
+# assist are built in Docker: Linux against an old glibc
+# (docker/viewer-linux.Dockerfile), Windows with the agent's cross toolchain
+# (docker/agent-windows.Dockerfile).
 # Build outputs and the cargo caches live in Docker volumes.
 set -eu
 cd "$(dirname "$0")/.."
@@ -43,6 +47,9 @@ build rmm-viewer-linux-builder viewer-linux.Dockerfile rmm-viewer-linux rmm-view
 build rmm-agent-windows-builder agent-windows.Dockerfile rmm-xwin rmm-viewer.exe '
     cargo xwin build --locked --release -p viewer --target x86_64-pc-windows-msvc &&
     cp /target/x86_64-pc-windows-msvc/release/viewer.exe /out/rmm-viewer.exe'
+build rmm-agent-windows-builder agent-windows.Dockerfile rmm-xwin rmm-assist.exe '
+    cargo xwin build --locked --release -p assist --target x86_64-pc-windows-msvc &&
+    cp /target/x86_64-pc-windows-msvc/release/assist.exe /out/rmm-assist.exe'
 
 rm -f "$out"/tetanus_rmm-*.whl
 if python3 -m pip --version >/dev/null 2>&1; then
@@ -66,9 +73,11 @@ if [ "$publish" = yes ]; then
         --platform linux-x86_64 --version "$version"
     server publish-viewer "$out/rmm-viewer.exe" \
         --platform windows-x86_64 --version "$version"
+    server publish-assist "$out/rmm-assist.exe" \
+        --platform windows-x86_64 --version "$version"
     server publish-tui "$wheel"
-    echo "published viewer $version (linux-x86_64, windows-x86_64) and $(basename "$wheel")"
-    echo "staff install from the server's /install page"
+    echo "published viewer $version (linux-x86_64, windows-x86_64), quick assist and $(basename "$wheel")"
+    echo "staff install from the server's /install page; users get quick assist from /assist"
 else
-    echo "built $out/rmm-viewer, $out/rmm-viewer.exe ($version) and $wheel, not published"
+    echo "built $out/rmm-viewer, $out/rmm-viewer.exe, $out/rmm-assist.exe ($version) and $wheel, not published"
 fi
