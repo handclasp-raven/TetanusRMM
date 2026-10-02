@@ -1,12 +1,14 @@
-# TetanusRMM
+<img width="1280" height="640" alt="Frame 1" src="https://github.com/user-attachments/assets/5eeb6c9e-2385-49c8-a998-604e2b016678" />
 
-Remote monitoring and management tool.
+# Tetanus RMM
 
-- **Server** (Rust): QUIC listener for agents and viewers, HTTPS API, Postgres, audit log, enrollment CA and signed update publishing.
-- **Agent** (Windows service): enrollment, telemetry, signed self-update, remote desktop capture, remote shell, scripts and file transfer.
-- **Quick assist** (Windows, portable): one-time support for a machine with no agent. The user downloads one file from `https://<host>:8443/assist` and types a six-digit code from the technician.
+Terminal based remote monitoring and management tool.
+
+- **Support TUI** (Python + Textual): Runs anywhere you can run python. Sign in, administrate accounts, add agents, launch the viewer, shell console and script runner.
 - **Viewer** (Linux, macOS, Windows): end-to-end encrypted remote desktop, relayed through the server or direct when NAT allows.
-- **Support TUI** (Python + Textual): sign in, agent table, launch the viewer, shell console and script runner.
+- **Server** (Rust): Runs in Docker, maintains connection to agents and acts as a direct connection broker or fallback relay if necessary.
+- **Agent** (Windows service): enrollment, telemetry, signed self-update, remote desktop capture, remote shell, scripts and file transfer.
+- **Quick assist** (Windows, portable): one-time support for a machine with no agent. The user downloads one file from `https://<host>:8443/assist` and types a code provided by the technician.
 
 Full documentation is in the **[wiki](https://github.com/handclasp-raven/TetanusRMM/wiki)**.
 
