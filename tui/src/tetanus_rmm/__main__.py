@@ -1,4 +1,4 @@
-"""Entry point: ``rmm-tui`` or ``python -m rmm_tui``."""
+"""Entry point: ``tetanus-rmm`` or ``python -m tetanus_rmm``."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from .trust import TrustStore
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="rmm-tui", description="RMM support TUI")
+    parser = argparse.ArgumentParser(prog="tetanus-rmm", description="RMM support TUI")
     parser.add_argument(
         "--config", type=Path, help=f"config file (default: {config_mod.default_config_path()})"
     )
@@ -54,18 +54,19 @@ def resolve_config(args: argparse.Namespace, state: UiState) -> config_mod.Confi
 
 
 def main(argv: list[str] | None = None) -> None:
+    config_mod.migrate_legacy_dirs()
     args = parse_args(argv)
     log_dir = config_mod.data_dir()
     state = UiState.load(log_dir / "state.json")
     try:
         config = resolve_config(args, state)
     except config_mod.ConfigError as e:
-        sys.exit(f"rmm-tui: {e}")
+        sys.exit(f"tetanus-rmm: {e}")
 
     log_dir.mkdir(parents=True, exist_ok=True)
     # Never log to the terminal: it belongs to the TUI.
     logging.basicConfig(
-        filename=log_dir / "rmm-tui.log",
+        filename=log_dir / "tetanus-rmm.log",
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
@@ -88,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         api = ApiClient(config.server_url, config.ca_path or trust.pinned(config.server_url))
     except ApiError as e:
-        sys.exit(f"rmm-tui: {e.message}")
+        sys.exit(f"tetanus-rmm: {e.message}")
 
     from .app import RmmApp
 

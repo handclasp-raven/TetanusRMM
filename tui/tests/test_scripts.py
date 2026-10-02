@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from rmm_tui.scripts import (
+from tetanus_rmm.scripts import (
     DEFAULT_SCRIPTS,
     AgentResult,
     SavedScript,

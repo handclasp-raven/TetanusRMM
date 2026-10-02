@@ -11,16 +11,16 @@ import httpx
 import pytest
 from textual.widgets import DataTable, Static
 
-from rmm_tui import provision
-from rmm_tui.__main__ import main
-from rmm_tui.api import ApiClient, ApiError, UntrustedServer, cert_failure
-from rmm_tui.app import RmmApp
-from rmm_tui.auth import SessionManager, StoredSession, TokenStore
-from rmm_tui.config import Config
-from rmm_tui.screens import LoginScreen, MainScreen, TrustScreen
-from rmm_tui.scripts import ScriptLibrary
-from rmm_tui.state import UiState
-from rmm_tui.trust import TrustStore, fingerprint
+from tetanus_rmm import provision
+from tetanus_rmm.__main__ import main
+from tetanus_rmm.api import ApiClient, ApiError, UntrustedServer, cert_failure
+from tetanus_rmm.app import RmmApp
+from tetanus_rmm.auth import SessionManager, StoredSession, TokenStore
+from tetanus_rmm.config import Config
+from tetanus_rmm.screens import LoginScreen, MainScreen, TrustScreen
+from tetanus_rmm.scripts import ScriptLibrary
+from tetanus_rmm.state import UiState
+from tetanus_rmm.trust import TrustStore, fingerprint
 
 from .conftest import BASE, FakeServer, MemoryKeyring
 from .test_app import LATER, FakeProcess, serve_agents, serve_login, sign_in, wait_for
@@ -143,7 +143,7 @@ async def test_first_sign_in_asks_to_trust_the_servers_ca(tmp_path) -> None:
         await wait_for(pilot, lambda: app.screen.query_one("#agents", DataTable).row_count == 3)
     pinned = TrustStore(tmp_path / "servers").pinned(BASE)
     assert pinned is not None and pinned.read_text() == CA_PEM
-    assert kr.entries.get(("rmm-tui", BASE))
+    assert kr.entries.get(("tetanus-rmm", BASE))
 
     # Next launch: the saved session is checked against the accepted CA,
     # with no prompt and no fetch.
@@ -294,7 +294,7 @@ async def test_with_a_public_certificate_the_viewers_ca_comes_from_the_server(tm
 
 
 def test_forget_ca_drops_the_accepted_certificate(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("rmm_tui.config.data_dir", lambda: tmp_path)
+    monkeypatch.setattr("tetanus_rmm.config.data_dir", lambda: tmp_path)
     TrustStore(tmp_path / "servers").pin(BASE, CA_PEM)
     args = ["--config", str(tmp_path / "none.toml"), "--server-url", BASE, "--forget-ca"]
     main(args)
@@ -302,3 +302,20 @@ def test_forget_ca_drops_the_accepted_certificate(tmp_path, monkeypatch, capsys)
     assert TrustStore(tmp_path / "servers").pinned(BASE) is None
     main(args)
     assert "No certificate authority" in capsys.readouterr().out
+
+
+def test_directories_under_the_former_name_are_moved_over(tmp_path, monkeypatch) -> None:
+    from tetanus_rmm import config
+
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path / "config" / "tetanus-rmm")
+    monkeypatch.setattr(config, "data_dir", lambda: tmp_path / "data" / "tetanus-rmm")
+    (tmp_path / "config" / "rmm-tui").mkdir(parents=True)
+    (tmp_path / "config" / "rmm-tui" / "config.toml").write_text("poll_interval = 9\n")
+    (tmp_path / "data" / "rmm-tui").mkdir(parents=True)
+    (tmp_path / "data" / "tetanus-rmm").mkdir()  # already there: left alone
+
+    config.migrate_legacy_dirs()
+
+    assert (tmp_path / "config" / "tetanus-rmm" / "config.toml").exists()
+    assert not (tmp_path / "config" / "rmm-tui").exists()
+    assert (tmp_path / "data" / "rmm-tui").exists()

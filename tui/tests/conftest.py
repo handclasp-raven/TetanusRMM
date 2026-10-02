@@ -8,7 +8,7 @@ import httpx
 import keyring.errors
 import pytest
 
-from rmm_tui.api import ApiClient
+from tetanus_rmm.api import ApiClient
 
 BASE = "https://rmm.test:8443"
 

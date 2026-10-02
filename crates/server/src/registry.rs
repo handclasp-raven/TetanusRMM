@@ -1,5 +1,7 @@
 //! Agent registry and per-device consent policies.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -238,9 +240,72 @@ pub async fn touch(
             .bind(big(t.uptime_secs))
             .execute(pool)
             .await?;
+            // History: one sample per step, however often the agent beats.
+            sqlx::query(
+                "INSERT INTO agent_telemetry (agent_id, cpu_percent, mem_used_bytes,
+                     mem_total_bytes, disk_used_bytes, disk_total_bytes)
+                 SELECT id, $2, $3, $4, $5, $6 FROM agents
+                 WHERE id = $1 AND NOT EXISTS (
+                     SELECT 1 FROM agent_telemetry
+                     WHERE agent_id = $1 AND ts > now() - make_interval(secs => $7))
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(agent_id)
+            .bind(t.cpu_percent.clamp(0.0, 100.0))
+            .bind(big(t.mem_used_bytes))
+            .bind(big(t.mem_total_bytes))
+            .bind(big(t.disk_used_bytes))
+            .bind(big(t.disk_total_bytes))
+            .bind(TELEMETRY_STEP.as_secs_f64())
+            .execute(pool)
+            .await?;
         }
     }
     Ok(())
+}
+
+/// How far apart the samples kept in an agent's telemetry history are.
+pub const TELEMETRY_STEP: Duration = Duration::from_secs(30);
+
+/// How long telemetry history is kept.
+pub const TELEMETRY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One sample of an agent's telemetry history.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct TelemetrySample {
+    pub ts: DateTime<Utc>,
+    pub cpu_percent: f32,
+    pub mem_used_bytes: i64,
+    pub mem_total_bytes: i64,
+    pub disk_used_bytes: i64,
+    pub disk_total_bytes: i64,
+}
+
+/// An agent's telemetry samples taken after `since`, oldest first.
+pub async fn telemetry_history(
+    pool: &PgPool,
+    agent_id: &str,
+    since: DateTime<Utc>,
+) -> sqlx::Result<Vec<TelemetrySample>> {
+    sqlx::query_as(
+        "SELECT ts, cpu_percent, mem_used_bytes, mem_total_bytes, disk_used_bytes,
+                disk_total_bytes
+         FROM agent_telemetry WHERE agent_id = $1 AND ts > $2 ORDER BY ts",
+    )
+    .bind(agent_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete telemetry samples older than `retention`. Returns how many.
+pub async fn prune_telemetry(pool: &PgPool, retention: Duration) -> sqlx::Result<u64> {
+    let deleted =
+        sqlx::query("DELETE FROM agent_telemetry WHERE ts < now() - make_interval(secs => $1)")
+            .bind(retention.as_secs_f64())
+            .execute(pool)
+            .await?;
+    Ok(deleted.rows_affected())
 }
 
 /// Record the device kind an agent reported (on every connect).

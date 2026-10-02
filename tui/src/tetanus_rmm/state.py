@@ -1,7 +1,7 @@
 """What the TUI remembers between launches: the server last signed in to
 (the login screen's default), the agent-table columns, the remote
-viewer's command buttons, the colour theme and the themes made in the theme
-editor.
+viewer's command buttons, whether the stats panel is shown, the colour theme
+and the themes made in the theme editor.
 
 A small JSON file in the data directory. It is only a convenience: if it is
 missing or unreadable the defaults apply, and failing to write it is logged,
@@ -33,6 +33,8 @@ class UiState:
     agent_columns: list[str] | None = None
     #: The viewer's command buttons. ``None``: the defaults.
     viewer_commands: list[QuickCommand] | None = None
+    #: Whether the agent table's stats panel is shown.
+    stats_panel: bool = True
     #: Name of the colour theme. ``None``: the default.
     theme: str | None = None
     #: The themes made in the theme editor, by name.
@@ -59,11 +61,13 @@ class UiState:
         server = raw.get("last_server")
         columns = raw.get("agent_columns")
         theme = raw.get("theme")
+        stats_panel = raw.get("stats_panel")
         return cls(
             path,
             last_server=server if isinstance(server, str) else None,
             agent_columns=[str(c) for c in columns] if isinstance(columns, list) else None,
             viewer_commands=commands.from_json(raw.get("viewer_commands")),
+            stats_panel=stats_panel if isinstance(stats_panel, bool) else True,
             theme=theme if isinstance(theme, str) else None,
             custom_themes=themes.from_json(raw.get("custom_themes")),
         )
@@ -77,6 +81,7 @@ class UiState:
                 if self.viewer_commands is None
                 else [c.to_json() for c in self.viewer_commands]
             ),
+            "stats_panel": self.stats_panel,
             "theme": self.theme,
             "custom_themes": {n: themes.to_json(t) for n, t in self.custom_themes.items()},
         }

@@ -8,8 +8,8 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from rmm_tui.api import ApiClient, ApiError
-from rmm_tui.auth import KEYRING_SERVICE, SessionManager, StoredSession, TokenStore
+from tetanus_rmm.api import ApiClient, ApiError
+from tetanus_rmm.auth import KEYRING_SERVICE, SessionManager, StoredSession, TokenStore
 
 from .conftest import BASE, USER, FakeServer, MemoryKeyring
 
@@ -178,3 +178,16 @@ async def test_switching_server_signs_out_and_uses_that_servers_keyring_entry(
     assert session.store.load() == StoredSession("other-tok", LATER, "jane")
     await api.aclose()
     await other.aclose()
+
+
+def test_a_session_saved_under_the_former_name_is_moved_over(
+    memory_keyring: MemoryKeyring,
+) -> None:
+    store = TokenStore(BASE, memory_keyring)
+    session = StoredSession(token="tok", expires_at=LATER, username="jane")
+    assert store.save(session)
+    raw = memory_keyring.entries.pop((KEYRING_SERVICE, BASE))
+    memory_keyring.entries[("rmm-tui", BASE)] = raw
+
+    assert store.load() == session
+    assert memory_keyring.entries == {(KEYRING_SERVICE, BASE): raw}

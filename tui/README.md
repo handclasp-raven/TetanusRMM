@@ -1,4 +1,4 @@
-# rmm-tui: support TUI
+# tetanus-rmm: support TUI
 
 A terminal app for support engineers. It runs on Linux, macOS and Windows,
 and talks only to the RMM server's HTTPS API. It never connects to agents
@@ -37,15 +37,15 @@ directly. What it does:
 
 For staff: open your server's install page, `https://<server>:8443/install`,
 download the TUI there and follow its steps (an administrator fills the page
-with `scripts/build-clients.sh`). Then run `rmm-tui` and sign in. No config
+with `scripts/build-clients.sh`). Then run `tetanus-rmm` and sign in. No config
 file, certificate or viewer has to be set up by hand: see
 [First sign-in](#first-sign-in). The install itself is one command, with
 [uv](https://docs.astral.sh/uv/) (which fetches Python itself) or pipx
 (Python 3.11 or newer):
 
 ```sh
-uv tool install rmm_tui-0.1.0-py3-none-any.whl     # or: pipx install rmm_tui-…whl
-rmm-tui
+uv tool install tetanus_rmm-0.1.2-py3-none-any.whl     # or: pipx install tetanus_rmm-…whl
+tetanus-rmm
 ```
 
 For development, from the repository, with uv:
@@ -53,7 +53,7 @@ For development, from the repository, with uv:
 ```sh
 cd tui
 uv venv && uv pip install -e .          # add '.[dev]' for the tests
-.venv/bin/rmm-tui --help
+.venv/bin/tetanus-rmm --help
 ```
 
 With pip:
@@ -62,10 +62,10 @@ With pip:
 cd tui
 python -m venv .venv
 .venv/bin/pip install -e .              # Windows: .venv\Scripts\pip
-.venv/bin/rmm-tui
+.venv/bin/tetanus-rmm
 ```
 
-`python -m rmm_tui` works too. Dependencies: `textual`, `httpx`, `keyring`,
+`python -m tetanus_rmm` works too. Dependencies: `textual`, `httpx`, `keyring`,
 `websockets` (the shell), `pyte` (terminal emulation for the shell pane).
 
 The keyring uses Windows Credential Manager, the macOS Keychain, or Secret
@@ -95,7 +95,7 @@ sign, the TUI refuses to sign in rather than ask again. If the server's
 certificates really were replaced, forget the old CA and accept the new one:
 
 ```sh
-rmm-tui --forget-ca --server-url https://rmm.example.com:8443
+tetanus-rmm --forget-ca --server-url https://rmm.example.com:8443
 ```
 
 A server whose API has a publicly trusted certificate (`RMM_API_TLS_CERT`)
@@ -117,11 +117,15 @@ file, and command-line flags override them. The file lives at:
 
 | OS | Default path |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/rmm-tui/config.toml` (usually `~/.config/rmm-tui/config.toml`) |
-| macOS | `~/Library/Application Support/rmm-tui/config.toml` |
-| Windows | `%APPDATA%\rmm-tui\config.toml` |
+| Linux | `$XDG_CONFIG_HOME/tetanus-rmm/config.toml` (usually `~/.config/tetanus-rmm/config.toml`) |
+| macOS | `~/Library/Application Support/tetanus-rmm/config.toml` |
+| Windows | `%APPDATA%\tetanus-rmm\config.toml` |
 
-Pass `--config PATH` or set `RMM_TUI_CONFIG` to use a different file.
+Pass `--config PATH` or set `TETANUS_RMM_CONFIG` to use a different file.
+
+Up to 0.1.1 the TUI was called `rmm-tui`. The first run moves that name's
+config and data directories and saved sign-in over to `tetanus-rmm`; remove
+the old tool with `uv tool uninstall rmm-tui`.
 
 ```toml
 server_url = "https://rmm.example.com:8443"   # the HTTPS API
@@ -154,16 +158,16 @@ The TUI also remembers the server you last signed in to, your agent-table
 columns, your colour theme and the themes you made, in `state.json` in the
 data directory.
 
-Logs go to the data directory (`~/.local/share/rmm-tui/`,
-`~/Library/Application Support/rmm-tui/` or `%LOCALAPPDATA%\rmm-tui\`), never
-to the terminal: `rmm-tui.log` for the TUI and `viewer.log` for viewers it
+Logs go to the data directory (`~/.local/share/tetanus-rmm/`,
+`~/Library/Application Support/tetanus-rmm/` or `%LOCALAPPDATA%\tetanus-rmm\`), never
+to the terminal: `tetanus-rmm.log` for the TUI and `viewer.log` for viewers it
 launches.
 
 ## Running
 
 ```sh
 # Against a dev server started from the repo root (see the main README):
-rmm-tui --server-url https://localhost:8443 --ca ../dev-certs/ca.crt \
+tetanus-rmm --server-url https://localhost:8443 --ca ../dev-certs/ca.crt \
         --viewer ../target/debug/viewer
 ```
 
@@ -182,7 +186,7 @@ On start, the TUI checks the saved session with `GET /api/me`:
 The server has no refresh endpoint, so a session lasts the server's
 `RMM_SESSION_TTL_SECS` (12 h by default); then you sign in again. `l` signs
 out (the server revokes the session and the token is removed from the
-keyring). `rmm-tui --logout` only forgets the saved token locally; the
+keyring). `tetanus-rmm --logout` only forgets the saved token locally; the
 server-side session then expires on its own.
 
 ### Keys
@@ -203,6 +207,7 @@ server-side session then expires on its own.
 | `u` | Users: accounts, roles, access and passwords (admins; hidden otherwise) |
 | `a` | Audit log (admins and auditors) |
 | `c` | Choose columns |
+| `p` | Show or hide the stats panel (kept between runs) |
 | `t` | Choose the colour theme (kept between runs; `tetanus` is the default) |
 | `e` | Theme editor: make, change and delete themes of your own |
 | `v` | Viewer buttons: the remote viewer's command buttons |
@@ -212,6 +217,16 @@ server-side session then expires on its own.
 
 The **menu bar** over the table groups the same actions into Agent, View,
 Manage and Session menus, each item with its key; click a menu or press `m`.
+
+The **stats panel** under the table shows the selected agent's CPU, memory
+and system disk, each with a graph of the last hour, and its uptime,
+sessions, signed-in users and fixed disks. The figures come with the agent
+list, so they appear at once; the graphs are fetched when the selection has
+rested on an agent for a moment (a bar at the panel's top right shows while
+they load), and are kept, so moving through the list or back to an agent
+asks the server for nothing. A gap in a graph is time the agent was not
+connected. `p` hides the panel, and hidden it fetches nothing. An older server
+keeps no history: the panel then shows the figures alone.
 
 The **theme editor** (`e`) lists every theme on the left. Pick one to start
 from, change its colours (`#RRGGBB`) and the whole screen takes them on as

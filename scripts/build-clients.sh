@@ -44,7 +44,7 @@ build rmm-agent-windows-builder agent-windows.Dockerfile rmm-xwin rmm-viewer.exe
     cargo xwin build --locked --release -p viewer --target x86_64-pc-windows-msvc &&
     cp /target/x86_64-pc-windows-msvc/release/viewer.exe /out/rmm-viewer.exe'
 
-rm -f "$out"/rmm_tui-*.whl
+rm -f "$out"/tetanus_rmm-*.whl
 if python3 -m pip --version >/dev/null 2>&1; then
     python3 -m pip wheel --quiet --no-deps --wheel-dir "$out" ./tui
 else
@@ -57,9 +57,9 @@ else
         python:3-slim sh -c '
             cp -r /src /tmp/tui &&
             pip wheel --quiet --no-deps --wheel-dir /out /tmp/tui &&
-            chown "$HOST_IDS" /out/rmm_tui-*.whl'
+            chown "$HOST_IDS" /out/tetanus_rmm-*.whl'
 fi
-wheel=$(ls "$out"/rmm_tui-*.whl)
+wheel=$(ls "$out"/tetanus_rmm-*.whl)
 
 if [ "$publish" = yes ]; then
     server publish-viewer "$out/rmm-viewer" \

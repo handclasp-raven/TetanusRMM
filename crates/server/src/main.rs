@@ -100,7 +100,7 @@ struct PublishViewerArgs {
 
 #[derive(Args)]
 struct PublishTuiArgs {
-    /// The wheel, e.g. `rmm_tui-0.1.0-py3-none-any.whl`.
+    /// The wheel, e.g. `tetanus_rmm-0.1.0-py3-none-any.whl`.
     file: PathBuf,
     #[arg(long, env = "RMM_UPDATES_DIR", default_value = "updates")]
     updates_dir: PathBuf,
@@ -251,6 +251,21 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             None => std::future::pending().await,
         }
     };
+    let prune = {
+        let pool = pool.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tick.tick().await;
+                if let Err(e) =
+                    server::registry::prune_telemetry(&pool, server::registry::TELEMETRY_RETENTION)
+                        .await
+                {
+                    warn!("pruning telemetry history failed: {e}");
+                }
+            }
+        }
+    };
     let app = api::router(AppState {
         pool,
         auth: AuthSettings {
@@ -269,6 +284,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     tokio::select! {
         () = quic.run() => bail!("QUIC listener stopped"),
         () = stun => bail!("STUN responder stopped"),
+        () = prune => bail!("telemetry pruning stopped"),
         res = metrics => {
             res.context("metrics listener stopped")?;
             bail!("metrics listener stopped");

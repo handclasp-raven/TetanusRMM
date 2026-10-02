@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "protocol",
  "quinn",
@@ -3613,7 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "peer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "common",
  "if-addrs",
@@ -3926,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "postcard",
  "ring",
@@ -4623,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent",
  "anyhow",
@@ -5689,7 +5689,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "common",
@@ -5916,7 +5916,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "viewer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arboard",

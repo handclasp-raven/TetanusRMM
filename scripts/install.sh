@@ -478,7 +478,7 @@ publish_release() {
         --platform linux-x86_64 --version "$VERSION"
     server publish-viewer "$rel/rmm-viewer-windows-x86_64.exe" \
         --platform windows-x86_64 --version "$VERSION"
-    server publish-tui "$rel"/rmm_tui-*.whl
+    server publish-tui "$rel"/tetanus_rmm-*.whl
     # Downloads of earlier releases are not needed again.
     find releases -mindepth 1 -maxdepth 1 ! -name "$VERSION" -exec rm -rf {} +
 }

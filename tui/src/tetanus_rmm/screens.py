@@ -1,10 +1,11 @@
-"""Login, agent list (with its column menu and classify dialog) and audit
-screens."""
+"""Login, agent list (with its column menu, classify dialog and stats
+panel) and audit screens."""
 
 from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -13,6 +14,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     DataTable,
@@ -41,6 +43,7 @@ from .api import (
 )
 from .config import ConfigError, normalize_server_url
 from .menu import MenuBar
+from .stats import StatsPanel, TelemetryCache
 from .trust import fingerprint
 from .viewer import FONT_FILE, ViewerError, build_command
 
@@ -196,7 +199,7 @@ class LoginScreen(Screen):
                 0,
                 "The server's certificate no longer matches the one you trusted. If an "
                 "administrator confirms its certificates were replaced, run "
-                f"`rmm-tui --forget-ca --server-url {server_url}` and sign in again. "
+                f"`tetanus-rmm --forget-ca --server-url {server_url}` and sign in again. "
                 "Otherwise the connection may be being intercepted.",
             )
         self.set_status("Checking the server's certificate…")
@@ -348,6 +351,7 @@ class MainScreen(Screen):
         Binding("f", "filter", "Filter by group", show=False),
         Binding("a", "audit", "Audit log", show=False),
         Binding("c", "columns", "Columns", show=False),
+        Binding("p", "stats", "Stats panel", show=False),
         Binding("t", "app.change_theme", "Theme", show=False),
         Binding("e", "themes", "Edit themes", show=False),
         Binding("v", "viewer_commands", "Viewer buttons", show=False),
@@ -360,7 +364,7 @@ class MainScreen(Screen):
     #: The menu bar: each menu's name and the actions in it.
     MENUS = {
         "Agent": ["desktop", "shell", "scripts", "classify", "new_agent"],
-        "View": ["search", "filter", "columns", "app.change_theme", "themes", "refresh"],
+        "View": ["search", "filter", "columns", "stats", "app.change_theme", "themes", "refresh"],
         "Manage": ["groups", "users", "audit", "viewer_commands"],
         "Session": ["logout", "app.quit"],
     }
@@ -371,6 +375,10 @@ class MainScreen(Screen):
     #: Group list entries (besides ``group:<name>``).
     ALL_GROUPS = "all"
     NO_GROUP = "none"
+
+    #: Seconds the selection must rest on an agent before its telemetry
+    #: history is fetched: moving through the list fetches nothing.
+    STATS_DEBOUNCE = 0.25
 
     def __init__(self) -> None:
         super().__init__()
@@ -387,6 +395,16 @@ class MainScreen(Screen):
         #: Lower-cased search text; agents with it in their hostname, an IP
         #: address or a group name are shown.
         self.search = ""
+        #: Telemetry history already fetched, for the stats panel.
+        self.stats_cache = TelemetryCache()
+        #: The pending fetch for the agent the selection rests on.
+        self.stats_timer: Timer | None = None
+        #: The agent whose history is being fetched.
+        self.stats_loading: str | None = None
+        #: Why an agent has no history to show, by agent id.
+        self.stats_errors: dict[str, str] = {}
+        #: The server is too old to keep telemetry history.
+        self.stats_unavailable = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -409,6 +427,7 @@ class MainScreen(Screen):
                 zebra_stripes=True,
                 cursor_foreground_priority="renderable",
             )
+        yield StatsPanel(id="stats")
         yield Static("Loading agents…", id="status")
         yield Footer()
 
@@ -416,6 +435,7 @@ class MainScreen(Screen):
         self.title = "TetanusRMM"
         self.set_columns(formatting.valid_columns(self.app.state.agent_columns))
         self.update_group_options()
+        self.query_one("#stats", StatsPanel).display = self.app.state.stats_panel
         self.query_one("#agents", DataTable).focus()
         self.refresh_agents()
         self.load_groups()
@@ -445,6 +465,7 @@ class MainScreen(Screen):
     def selection_moved(self) -> None:
         # What the footer offers depends on the selected agent.
         self.refresh_bindings()
+        self.update_stats()
 
     # --- agent list -----------------------------------------------------------
 
@@ -497,6 +518,7 @@ class MainScreen(Screen):
         for agent in sorted(new, key=lambda a: (not a.online, a.label.lower())):
             table.add_row(*formatting.agent_row(agent, now, self.columns), key=agent.id)
         self.refresh_bindings()
+        self.update_stats()
         online = sum(a.online for a in visible.values())
         count = f"{len(visible)} agents"
         if len(visible) != len(self.agents):
@@ -504,6 +526,81 @@ class MainScreen(Screen):
         self.query_one("#status", Static).update(
             f"{count}, {online} online · updated {now.astimezone():%H:%M:%S}"
         )
+
+    # --- stats panel ----------------------------------------------------------
+
+    def update_stats(self) -> None:
+        """Show the selected agent in the stats panel from what is already
+        known (the agent list and any history held), and fetch its history
+        once the selection has rested on it, unless what is held is fresh."""
+        if not self.app.state.stats_panel:
+            return
+        panel = self.query_one("#stats", StatsPanel)
+        agent = self.selected()
+        if self.stats_timer is not None:
+            self.stats_timer.stop()
+            self.stats_timer = None
+        if agent is None:
+            panel.show(None)
+            panel.loading_history = False
+            return
+        cache = self.stats_cache
+        note = self.stats_errors.get(agent.id, "")
+        if self.stats_unavailable:
+            note = "no history on this server"
+        panel.show(agent, cache.get(agent.id), step=cache.step(agent.id), note=note)
+        if self.stats_loading == agent.id:
+            panel.loading_history = True
+        elif self.stats_unavailable or cache.fresh(agent.id):
+            panel.loading_history = False
+        else:
+            panel.loading_history = True
+            self.stats_timer = self.set_timer(
+                self.STATS_DEBOUNCE, partial(self.load_stats, agent.id)
+            )
+
+    # Exclusive: a fetch for an agent the selection has left is cancelled.
+    @work(exclusive=True, group="stats")
+    async def load_stats(self, agent_id: str) -> None:
+        self.stats_timer = None
+        self.stats_loading = agent_id
+        cache = self.stats_cache
+        try:
+            history = await self.app.session.api.agent_telemetry(
+                agent_id, since=cache.last(agent_id)
+            )
+        except Unauthorized:
+            self.app.session_expired()
+            return
+        except ApiError as e:
+            if e.status == 404:
+                # The agent is one the server lists, so it is the route
+                # that is missing: do not ask again.
+                self.stats_unavailable = True
+            else:
+                self.stats_errors[agent_id] = e.message
+                cache.failed(agent_id)
+        else:
+            self.stats_errors.pop(agent_id, None)
+            cache.store(agent_id, history)
+        finally:
+            if self.stats_loading == agent_id:
+                self.stats_loading = None
+        self.update_stats()
+
+    def action_stats(self) -> None:
+        """Show or hide the stats panel. Hidden, it fetches nothing."""
+        shown = not self.app.state.stats_panel
+        self.app.state.stats_panel = shown
+        self.app.state.save()
+        self.query_one("#stats", StatsPanel).display = shown
+        if shown:
+            self.update_stats()
+            return
+        if self.stats_timer is not None:
+            self.stats_timer.stop()
+            self.stats_timer = None
+        self.workers.cancel_group(self, "stats")
 
     # --- search ----------------------------------------------------------------
 

@@ -11,7 +11,7 @@ import json
 import os
 import ssl
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -168,6 +168,62 @@ class LoginResult:
 
 
 @dataclass(frozen=True)
+class Disk:
+    """A fixed disk on an agent and how full it is."""
+
+    name: str
+    total_bytes: int
+    used_bytes: int
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Disk:
+        return cls(
+            name=str(d.get("name", "")),
+            total_bytes=int(d.get("total_bytes", 0)),
+            used_bytes=int(d.get("used_bytes", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class TelemetrySample:
+    """One sample of an agent's telemetry history."""
+
+    ts: datetime
+    cpu_percent: float
+    mem_used_bytes: int
+    mem_total_bytes: int
+    disk_used_bytes: int
+    disk_total_bytes: int
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> TelemetrySample:
+        return cls(
+            ts=parse_time(d["ts"]),  # type: ignore[arg-type]
+            cpu_percent=float(d["cpu_percent"]),
+            mem_used_bytes=int(d["mem_used_bytes"]),
+            mem_total_bytes=int(d["mem_total_bytes"]),
+            disk_used_bytes=int(d["disk_used_bytes"]),
+            disk_total_bytes=int(d["disk_total_bytes"]),
+        )
+
+
+@dataclass(frozen=True)
+class TelemetryHistory:
+    """An agent's recent telemetry samples, oldest first."""
+
+    #: Seconds between samples while the agent is connected.
+    step_secs: float
+    samples: tuple[TelemetrySample, ...]
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> TelemetryHistory:
+        return cls(
+            step_secs=float(d.get("step_secs", 30)),
+            samples=tuple(TelemetrySample.from_json(s) for s in d.get("samples") or ()),
+        )
+
+
+@dataclass(frozen=True)
 class Agent:
     id: str
     hostname: str | None
@@ -204,11 +260,14 @@ class Agent:
     classification_override: str | None = None
     #: Operating system and version, as last reported.
     os: str | None = None
+    #: Fixed disks, as last reported. ``None`` if not reported.
+    disks: tuple[Disk, ...] | None = None
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Agent:
         caps = d.get("capabilities")
         users = d.get("logged_in_users")
+        disks = d.get("disks")
         return cls(
             id=d["id"],
             hostname=d.get("hostname"),
@@ -233,6 +292,7 @@ class Agent:
             classification=d.get("classification") or derived_classification(d.get("device_kind")),
             classification_override=d.get("classification_override"),
             os=d.get("os"),
+            disks=tuple(Disk.from_json(x) for x in disks) if disks is not None else None,
         )
 
     def allows(self, capability: str, user: User | None) -> bool:
@@ -484,6 +544,22 @@ class ApiClient:
     async def list_agents(self) -> list[Agent]:
         return [Agent.from_json(a) for a in (await self._request("GET", "/api/agents")).json()]
 
+    async def agent_telemetry(
+        self, agent_id: str, since: datetime | None = None
+    ) -> TelemetryHistory:
+        """The agent's telemetry samples of the last hour, or only those
+        after ``since`` (to add to ones already fetched)."""
+        params = {}
+        if since is not None:
+            params["since"] = since.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        response = await self._request(
+            "GET", f"/api/agents/{quote(agent_id, safe='')}/telemetry", params=params
+        )
+        try:
+            return TelemetryHistory.from_json(response.json())
+        except (ValueError, KeyError, TypeError) as e:
+            raise ApiError(0, "the server sent malformed telemetry history") from e
+
     async def set_classification(self, agent_id: str, classification: str | None) -> str:
         """Classify an agent (admins only); ``None`` returns it to the
         derived classification. Returns the one now in effect."""
@@ -663,7 +739,7 @@ class ApiClient:
     ) -> dict[str, Any]:
         """Run ``script`` on every agent (and every member of ``group_ids``,
         resolved by the server at run time) and wait for all results (the
-        raw report; see :mod:`rmm_tui.scripts`)."""
+        raw report; see :mod:`tetanus_rmm.scripts`)."""
         body: dict[str, Any] = {"agent_ids": agent_ids, "script": script}
         if group_ids:
             body["group_ids"] = group_ids
@@ -720,7 +796,7 @@ class ApiClient:
 
 
 class ShellConnection:
-    """An attached shell: raw bytes in, :mod:`rmm_tui.shell` events out."""
+    """An attached shell: raw bytes in, :mod:`tetanus_rmm.shell` events out."""
 
     def __init__(self, ws: Any) -> None:
         self._ws = ws

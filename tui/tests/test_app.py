@@ -11,16 +11,16 @@ import httpx
 from rich.text import Text
 from textual.widgets import DataTable, Input, OptionList, SelectionList, Static, TextArea
 
-from rmm_tui.api import ApiClient
-from rmm_tui.app import RmmApp
-from rmm_tui.auth import SessionManager, StoredSession, TokenStore
-from rmm_tui.commands import DEFAULT_COMMANDS, CommandsScreen, QuickCommand
-from rmm_tui.config import Config
-from rmm_tui.console import ConsoleScreen
-from rmm_tui.runner import NewScriptScreen, ScriptScreen
-from rmm_tui.screens import ColumnsScreen, LoginScreen, MainScreen
-from rmm_tui.scripts import ScriptLibrary
-from rmm_tui.state import UiState
+from tetanus_rmm.api import ApiClient
+from tetanus_rmm.app import RmmApp
+from tetanus_rmm.auth import SessionManager, StoredSession, TokenStore
+from tetanus_rmm.commands import DEFAULT_COMMANDS, CommandsScreen, QuickCommand
+from tetanus_rmm.config import Config
+from tetanus_rmm.console import ConsoleScreen
+from tetanus_rmm.runner import NewScriptScreen, ScriptScreen
+from tetanus_rmm.screens import ColumnsScreen, LoginScreen, MainScreen
+from tetanus_rmm.scripts import ScriptLibrary
+from tetanus_rmm.state import UiState
 
 from .conftest import BASE, USER, FakeServer, MemoryKeyring, agent_json
 
@@ -560,7 +560,7 @@ async def test_login_to_another_server_switches_and_is_remembered(tmp_path) -> N
         assert app.config.server_url == other_url
         assert "other.test:9443" in str(app.screen.query_one("#whoami", Static).render())
     assert not any(r.url.path.startswith("/api/auth") for r in server.requests)
-    assert kr.entries.get(("rmm-tui", other_url)), "saved for the server signed in to"
+    assert kr.entries.get(("tetanus-rmm", other_url)), "saved for the server signed in to"
     assert UiState.load(tmp_path / "state.json").last_server == other_url
 
 
@@ -849,7 +849,7 @@ async def test_search_filters_by_hostname_with_the_group_list(tmp_path) -> None:
 
 
 async def test_admins_classify_the_selected_agent(tmp_path) -> None:
-    from rmm_tui.screens import ClassifyScreen
+    from tetanus_rmm.screens import ClassifyScreen
 
     server = FakeServer()
     app = signed_in_app(server, tmp_path)
@@ -1015,7 +1015,7 @@ async def test_engineers_make_links_without_groups_and_auditors_cannot(tmp_path)
 
 
 async def test_admins_create_rename_fill_and_delete_groups(tmp_path) -> None:
-    from rmm_tui.groups import ConfirmScreen, GroupEditScreen, GroupsScreen, MembersScreen
+    from tetanus_rmm.groups import ConfirmScreen, GroupEditScreen, GroupsScreen, MembersScreen
 
     server = FakeServer()
     app = signed_in_app(server, tmp_path)
@@ -1083,7 +1083,7 @@ async def test_admins_create_rename_fill_and_delete_groups(tmp_path) -> None:
 
 
 async def test_non_admins_see_groups_read_only(tmp_path) -> None:
-    from rmm_tui.groups import GroupsScreen
+    from tetanus_rmm.groups import GroupsScreen
 
     server = FakeServer()
     app = signed_in_app(server, tmp_path, USER)
@@ -1121,8 +1121,8 @@ GRANT = {
 
 
 async def test_admins_manage_users(tmp_path) -> None:
-    from rmm_tui.groups import ConfirmScreen
-    from rmm_tui.users import (
+    from tetanus_rmm.groups import ConfirmScreen
+    from tetanus_rmm.users import (
         GrantEditScreen,
         GrantsScreen,
         NewUserScreen,
@@ -1306,7 +1306,7 @@ async def test_the_users_menu_is_for_admins_only(tmp_path) -> None:
 
 
 async def test_an_admin_who_demotes_themselves_leaves_the_users_screen(tmp_path) -> None:
-    from rmm_tui.users import RoleScreen, UsersScreen
+    from tetanus_rmm.users import RoleScreen, UsersScreen
 
     server = FakeServer()
     app = signed_in_app(server, tmp_path)
@@ -1412,7 +1412,7 @@ async def test_viewer_buttons_are_edited_saved_and_passed_to_the_viewer(tmp_path
 
 
 async def test_the_menu_bar_runs_the_agent_tables_actions(tmp_path) -> None:
-    from rmm_tui.menu import MenuBar, MenuScreen
+    from tetanus_rmm.menu import MenuBar, MenuScreen
 
     server = FakeServer()
     app = signed_in_app(server, tmp_path, USER)
@@ -1457,7 +1457,7 @@ async def test_the_menu_bar_runs_the_agent_tables_actions(tmp_path) -> None:
 
 
 async def test_the_theme_is_kept_between_runs(tmp_path) -> None:
-    from rmm_tui.themes import THEMES
+    from tetanus_rmm.themes import THEMES
 
     server = FakeServer()
     app = signed_in_app(server, tmp_path)
@@ -1488,9 +1488,9 @@ async def test_the_theme_is_kept_between_runs(tmp_path) -> None:
 async def test_the_theme_editor_previews_saves_and_deletes_themes(tmp_path) -> None:
     from textual.widgets import Button
 
-    from rmm_tui.groups import ConfirmScreen
-    from rmm_tui.theme_editor import ThemeEditorScreen
-    from rmm_tui.themes import PREVIEW
+    from tetanus_rmm.groups import ConfirmScreen
+    from tetanus_rmm.theme_editor import ThemeEditorScreen
+    from tetanus_rmm.themes import PREVIEW
 
     def saved() -> UiState:
         return UiState.load(tmp_path / "state.json")

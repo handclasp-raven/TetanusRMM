@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from rmm_tui.api import ApiClient, ApiError, Forbidden, Unauthorized
+from tetanus_rmm.api import ApiClient, ApiError, Forbidden, Unauthorized
 
 from .conftest import BASE, USER, FakeServer, agent_json
 
@@ -191,7 +191,7 @@ def test_bad_ca_path_is_reported(tmp_path) -> None:
 
 
 def test_only_admins_edit_groups_and_auditors_make_no_links() -> None:
-    from rmm_tui.api import User
+    from tetanus_rmm.api import User
 
     admin, engineer, auditor = (
         User(1, n, r) for n, r in (("a", "admin"), ("e", "support_engineer"), ("c", "auditor"))
@@ -201,7 +201,7 @@ def test_only_admins_edit_groups_and_auditors_make_no_links() -> None:
 
 
 def test_roles_decide_what_the_ui_offers() -> None:
-    from rmm_tui.api import User
+    from tetanus_rmm.api import User
 
     admin = User(1, "a", "admin")
     engineer = User(2, "e", "support_engineer")
@@ -338,3 +338,48 @@ async def test_user_administration(api: ApiClient, server: FakeServer) -> None:
     assert server.body() == {"user_id": 9, "capabilities": ["shell"], "all_agents": True}
     await api.delete_grant(3)
     assert server.requests[-1].url.path == "/api/grants/3"
+
+
+async def test_telemetry_history_is_parsed_and_can_be_incremental(
+    api: ApiClient, server: FakeServer
+) -> None:
+    api.token = "t"
+    server.on(
+        "GET",
+        "/api/agents/agt-1/telemetry",
+        body={
+            "step_secs": 30,
+            "samples": [
+                {
+                    "ts": "2026-10-03T10:00:00.5Z",
+                    "cpu_percent": 12.5,
+                    "mem_used_bytes": 4 << 30,
+                    "mem_total_bytes": 16 << 30,
+                    "disk_used_bytes": 1,
+                    "disk_total_bytes": 2,
+                }
+            ],
+        },
+    )
+    history = await api.agent_telemetry("agt-1")
+    assert history.step_secs == 30
+    (only,) = history.samples
+    assert only.ts == datetime(2026, 10, 3, 10, 0, 0, 500000, tzinfo=UTC)
+    assert (only.cpu_percent, only.mem_total_bytes) == (12.5, 16 << 30)
+    assert "since" not in server.requests[-1].url.params
+
+    await api.agent_telemetry("agt-1", since=only.ts)
+    assert server.requests[-1].url.params["since"] == "2026-10-03T10:00:00.500000Z"
+
+    server.on("GET", "/api/agents/agt-1/telemetry", body={"samples": [{"ts": "x"}]})
+    with pytest.raises(ApiError, match="malformed"):
+        await api.agent_telemetry("agt-1")
+
+
+async def test_agent_disks_are_parsed(api: ApiClient, server: FakeServer) -> None:
+    api.token = "t"
+    disk = {"name": "C:\\", "total_bytes": 100, "used_bytes": 40}
+    server.on("GET", "/api/agents", body=[agent_json("agt-1", disks=[disk]), agent_json("agt-2")])
+    first, second = await api.list_agents()
+    assert [(d.name, d.total_bytes, d.used_bytes) for d in first.disks] == [("C:\\", 100, 40)]
+    assert second.disks is None

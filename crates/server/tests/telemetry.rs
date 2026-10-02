@@ -170,3 +170,123 @@ async fn heartbeat_without_telemetry_only_updates_last_seen() {
     assert_eq!(agent.cpu_percent, Some(100.0));
     assert_eq!(agent.mem_used_bytes, Some(i64::MAX));
 }
+
+fn sample(cpu_percent: f32) -> Telemetry {
+    Telemetry {
+        cpu_percent,
+        mem_used_bytes: 6 << 30,
+        mem_total_bytes: 16 << 30,
+        disk_used_bytes: 120 << 30,
+        disk_total_bytes: 500 << 30,
+        uptime_secs: 1000,
+    }
+}
+
+/// A history sample taken `minutes_ago`, as an earlier heartbeat left it.
+async fn insert_sample(pool: &sqlx::PgPool, agent_id: &str, minutes_ago: i32, cpu_percent: f32) {
+    sqlx::query(
+        "INSERT INTO agent_telemetry (agent_id, ts, cpu_percent, mem_used_bytes,
+             mem_total_bytes, disk_used_bytes, disk_total_bytes)
+         VALUES ($1, now() - make_interval(mins => $2), $3, 1, 2, 3, 4)",
+    )
+    .bind(agent_id)
+    .bind(minutes_ago)
+    .bind(cpu_percent)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn telemetry_history_keeps_one_sample_per_step_and_is_pruned() {
+    let db = start_db().await;
+    support::insert_agent(&db.pool, "agent-1").await;
+    let long_ago = chrono::Utc::now() - chrono::Duration::days(30);
+
+    // Heartbeats arrive every few seconds: only the first of a step is kept.
+    for cpu in [10.0, 20.0, 30.0] {
+        server::registry::touch(&db.pool, "agent-1", Some(&sample(cpu)))
+            .await
+            .unwrap();
+    }
+    let history = server::registry::telemetry_history(&db.pool, "agent-1", long_ago)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0].cpu_percent, 10.0);
+    assert_eq!(history[0].mem_total_bytes, 16 << 30);
+    // The agents row still has the latest.
+    let agent = &server::registry::list_agents(&db.pool).await.unwrap()[0];
+    assert_eq!(agent.cpu_percent, Some(30.0));
+
+    // A heartbeat from an agent that is not registered leaves nothing behind.
+    server::registry::touch(&db.pool, "agent-gone", Some(&sample(1.0)))
+        .await
+        .unwrap();
+
+    insert_sample(&db.pool, "agent-1", 10, 5.0).await;
+    insert_sample(&db.pool, "agent-1", 3 * 24 * 60, 99.0).await;
+    let pruned = server::registry::prune_telemetry(&db.pool, server::registry::TELEMETRY_RETENTION)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1);
+    let history = server::registry::telemetry_history(&db.pool, "agent-1", long_ago)
+        .await
+        .unwrap();
+    let cpu: Vec<f32> = history.iter().map(|s| s.cpu_percent).collect();
+    assert_eq!(cpu, [5.0, 10.0]);
+}
+
+#[tokio::test]
+async fn telemetry_history_is_served_to_those_who_see_the_agent() {
+    let db = start_db().await;
+    support::insert_agent(&db.pool, "agent-1").await;
+    insert_sample(&db.pool, "agent-1", 90, 1.0).await;
+    insert_sample(&db.pool, "agent-1", 20, 2.0).await;
+    insert_sample(&db.pool, "agent-1", 5, 3.0).await;
+    let auditor = create_user(&db.pool, "root", Role::Auditor).await;
+    let engineer = create_user(&db.pool, "eng", Role::SupportEngineer).await;
+    let api = support::start_api(db.pool.clone()).await;
+    let session = api.session("root", &auditor.totp_secret).await;
+    let get = |query: &str, session: &str| {
+        let req = api
+            .client
+            .get(api.url(&format!("/api/agents/agent-1/telemetry{query}")))
+            .bearer_auth(session);
+        async move { req.send().await.unwrap() }
+    };
+    let cpu = |body: &Value| -> Vec<f64> {
+        body["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["cpu_percent"].as_f64().unwrap())
+            .collect()
+    };
+
+    // The last hour by default, oldest first.
+    let body: Value = get("", &session).await.json().await.unwrap();
+    assert_eq!(body["step_secs"], 30);
+    assert_eq!(cpu(&body), [2.0, 3.0]);
+    assert_eq!(body["samples"][0]["mem_total_bytes"], 2);
+    let body: Value = get("?minutes=120", &session).await.json().await.unwrap();
+    assert_eq!(cpu(&body), [1.0, 2.0, 3.0]);
+
+    // Only what is newer than the samples already fetched.
+    let since = body["samples"][1]["ts"]
+        .as_str()
+        .unwrap()
+        .replace('+', "%2B");
+    let body: Value = get(&format!("?since={since}"), &session)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cpu(&body), [3.0]);
+
+    assert_eq!(get("?minutes=0", &session).await.status(), 400);
+    assert_eq!(get("", "not-a-session").await.status(), 401);
+    // An engineer with no grant on the agent cannot tell that it exists.
+    let session = api.session("eng", &engineer.totp_secret).await;
+    assert_eq!(get("", &session).await.status(), 404);
+}

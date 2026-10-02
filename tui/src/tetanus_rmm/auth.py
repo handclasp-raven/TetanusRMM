@@ -18,7 +18,9 @@ from .api import ApiClient, ApiError, Unauthorized, User, parse_time
 
 log = logging.getLogger(__name__)
 
-KEYRING_SERVICE = "rmm-tui"
+KEYRING_SERVICE = "tetanus-rmm"
+#: The service name up to 0.1.1; a session saved under it is moved over.
+LEGACY_KEYRING_SERVICE = "rmm-tui"
 
 
 class KeyringBackend(Protocol):
@@ -49,7 +51,7 @@ class TokenStore:
         """The saved session, or ``None`` if there is none, it is unreadable,
         or the keyring is unavailable."""
         try:
-            raw = self._backend.get_password(KEYRING_SERVICE, self.key)
+            raw = self._backend.get_password(KEYRING_SERVICE, self.key) or self._adopt_legacy()
         except keyring.errors.KeyringError as e:
             log.warning("reading the keyring failed: %s", e)
             return None
@@ -64,6 +66,14 @@ class TokenStore:
         except (ValueError, KeyError, TypeError) as e:
             log.warning("ignoring a malformed saved session: %s", e)
             return None
+
+    def _adopt_legacy(self) -> str | None:
+        """Move a session saved under the former service name to this one."""
+        raw = self._backend.get_password(LEGACY_KEYRING_SERVICE, self.key)
+        if raw:
+            self._backend.set_password(KEYRING_SERVICE, self.key, raw)
+            self._backend.delete_password(LEGACY_KEYRING_SERVICE, self.key)
+        return raw
 
     def save(self, session: StoredSession) -> bool:
         """Save; ``False`` if the keyring is unavailable (the user then has

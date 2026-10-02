@@ -115,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(me))
         .route("/api/agents", get(list_agents))
         .route("/api/agents/{id}", get(get_agent))
+        .route("/api/agents/{id}/telemetry", get(agent_telemetry))
         .route("/api/agents/{id}/launch", post(launch_command))
         .route("/api/audit", get(list_audit))
         .route("/api/audit/verify", get(verify_audit))
@@ -443,6 +444,51 @@ async fn get_agent(
         .remove(&agent_id)
         .unwrap_or_default();
     Ok(Json(agent_view(&state, &visibility, agent, groups)))
+}
+
+#[derive(Deserialize)]
+struct TelemetryQuery {
+    /// Only samples taken after this (to add to ones already fetched).
+    since: Option<DateTime<Utc>>,
+    /// Otherwise the last this many minutes. Defaults to 60.
+    minutes: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TelemetryHistory {
+    /// Seconds between samples while the agent is connected.
+    step_secs: u64,
+    /// Oldest first.
+    samples: Vec<registry::TelemetrySample>,
+}
+
+/// An agent's recent telemetry samples (the TUI's stats panel).
+async fn agent_telemetry(
+    State(state): State<AppState>,
+    session: Session,
+    Path(agent_id): Path<String>,
+    Query(query): Query<TelemetryQuery>,
+) -> Result<Json<TelemetryHistory>, ApiError> {
+    // Agents the user cannot see do not exist, as far as they know.
+    if !access::visibility(&state.pool, &session.user)
+        .await?
+        .sees(&agent_id)
+    {
+        return Err(ApiError::NotFound);
+    }
+    let retention = i64::try_from(registry::TELEMETRY_RETENTION.as_secs() / 60).unwrap_or(i64::MAX);
+    let minutes = query.minutes.unwrap_or(60);
+    if !(1..=retention).contains(&minutes) {
+        return Err(ApiError::BadRequest(format!(
+            "minutes must be between 1 and {retention}"
+        )));
+    }
+    let window = Utc::now() - chrono::Duration::minutes(minutes);
+    let since = query.since.map_or(window, |since| since.max(window));
+    Ok(Json(TelemetryHistory {
+        step_secs: registry::TELEMETRY_STEP.as_secs(),
+        samples: registry::telemetry_history(&state.pool, &agent_id, since).await?,
+    }))
 }
 
 #[derive(Deserialize)]

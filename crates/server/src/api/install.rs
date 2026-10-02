@@ -163,7 +163,7 @@ fn render(
         r#"<ol class="steps">
 <li>
 <h2>Download the support TUI</h2>
-<p><a class="button" href="/install/{wheel}" download>Download rmm-tui {version}</a></p>
+<p><a class="button" href="/install/{wheel}" download>Download tetanus-rmm {version}</a></p>
 <p class="note">One file, <code>{wheel}</code>, for Linux and Windows. Keep its name as it is.</p>
 </li>
 <li>
@@ -186,7 +186,7 @@ uv tool install ./{wheel}</pre>
 </li>
 <li>
 <h2>Open it and sign in</h2>
-<pre>rmm-tui</pre>
+<pre>tetanus-rmm</pre>
 <p>Enter this server, then your username, password and the code from your authenticator
 app:</p>
 <pre class="server">{server}</pre>
@@ -258,12 +258,12 @@ mod tests {
     fn the_page_links_the_wheel_and_names_the_server() {
         let page = render(
             "rmm.example.com:8443",
-            Some("rmm_tui-0.1.0-py3-none-any.whl"),
+            Some("tetanus_rmm-0.1.0-py3-none-any.whl"),
             &[("windows-x86_64", "Windows", "0.2.0".into())],
             Some("AB:CD:EF:01"),
         );
-        assert!(page.contains("href=\"/install/rmm_tui-0.1.0-py3-none-any.whl\""));
-        assert!(page.contains("Download rmm-tui 0.1.0"));
+        assert!(page.contains("href=\"/install/tetanus_rmm-0.1.0-py3-none-any.whl\""));
+        assert!(page.contains("Download tetanus-rmm 0.1.0"));
         assert!(page.contains("<pre class=\"server\">rmm.example.com:8443</pre>"));
         assert!(page.contains("AB:CD\nEF:01"));
         assert!(page.contains("href=\"/install/viewer/windows-x86_64\">Windows (0.2.0)"));
@@ -275,7 +275,7 @@ mod tests {
         let page = render("rmm.example.com:8443", None, &[], None);
         assert!(page.contains("has not been published"));
         assert!(!page.contains("class=\"button\""));
-        let page = render("h:1", Some("rmm_tui-0.1.0-py3-none-any.whl"), &[], None);
+        let page = render("h:1", Some("tetanus_rmm-0.1.0-py3-none-any.whl"), &[], None);
         assert!(page.contains("No viewer has been published"));
     }
 
@@ -283,7 +283,7 @@ mod tests {
     fn text_is_escaped() {
         let page = render(
             "<script>",
-            Some("rmm_tui-0.1.0-py3-none-any.whl"),
+            Some("tetanus_rmm-0.1.0-py3-none-any.whl"),
             &[],
             None,
         );

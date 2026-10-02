@@ -369,7 +369,7 @@ async fn the_install_page_offers_the_published_tui_and_viewer() {
         .unwrap()
         .contains("has not been published"));
 
-    let name = "rmm_tui-0.1.0-py3-none-any.whl";
+    let name = "tetanus_rmm-0.1.0-py3-none-any.whl";
     let wheel = f.dir.path().join(name);
     std::fs::write(&wheel, b"wheel bytes").unwrap();
     updates::publish_tui(&f.updates_dir(), &wheel).unwrap();
@@ -405,7 +405,7 @@ async fn the_install_page_offers_the_published_tui_and_viewer() {
 
     // Only the published wheel is served from there.
     for path in [
-        "/install/rmm_tui-9.9.9-py3-none-any.whl",
+        "/install/tetanus_rmm-9.9.9-py3-none-any.whl",
         "/install/viewer/linux-x86_64",
         "/install/viewer/..%2Ftui",
     ] {

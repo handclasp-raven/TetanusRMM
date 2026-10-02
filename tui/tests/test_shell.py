@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from rmm_tui.shell import (
+from tetanus_rmm.shell import (
     Exited,
     Failed,
     Output,

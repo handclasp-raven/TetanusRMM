@@ -77,7 +77,7 @@ jobs:
           cp target/windows-x86_64/rmm-agent.exe dist/rmm-agent-windows-x86_64.exe
           cp target/clients/rmm-viewer.exe dist/rmm-viewer-windows-x86_64.exe
           cp target/clients/rmm-viewer dist/rmm-viewer-linux-x86_64
-          cp target/clients/rmm_tui-*.whl docker-compose.yml scripts/install.sh scripts/lib.sh dist/
+          cp target/clients/tetanus_rmm-*.whl docker-compose.yml scripts/install.sh scripts/lib.sh dist/
           cd dist
           sha256sum -- * > SHA256SUMS
 

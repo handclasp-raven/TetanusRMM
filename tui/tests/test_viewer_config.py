@@ -11,13 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from rmm_tui import formatting
-from rmm_tui.__main__ import parse_args, resolve_config
-from rmm_tui.api import Agent, ViewerSession
-from rmm_tui.commands import DEFAULT_COMMANDS, CommandError, QuickCommand, from_json
-from rmm_tui.config import Config, ConfigError, load, normalize_server_url
-from rmm_tui.state import UiState
-from rmm_tui.viewer import (
+from tetanus_rmm import formatting
+from tetanus_rmm.__main__ import parse_args, resolve_config
+from tetanus_rmm.api import Agent, ViewerSession
+from tetanus_rmm.commands import DEFAULT_COMMANDS, CommandError, QuickCommand, from_json
+from tetanus_rmm.config import Config, ConfigError, load, normalize_server_url
+from tetanus_rmm.state import UiState
+from tetanus_rmm.viewer import (
     ViewerCommand,
     ViewerError,
     build_command,
@@ -446,7 +446,7 @@ def test_valid_columns_drops_unknown_and_repeated_keys() -> None:
 
 
 def test_capabilities_decide_per_agent_and_the_role_is_the_fallback() -> None:
-    from rmm_tui.api import User
+    from tetanus_rmm.api import User
 
     engineer = User(id=1, username="jane", role="support_engineer")
     auditor = User(id=2, username="carol", role="auditor")

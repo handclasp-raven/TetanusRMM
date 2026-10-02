@@ -232,6 +232,54 @@ ColumnsScreen, NewScriptScreen, CommandsScreen {
     width: 1fr;
 }
 
+/* --- stats panel ---------------------------------------------------------- */
+
+#stats {
+    height: 5;
+    border-top: solid $primary;
+    padding: 0 1;
+}
+
+#stats-head {
+    height: 1;
+}
+
+#stats-title {
+    width: 1fr;
+}
+
+#stats-loading {
+    width: 24;
+}
+
+#stats-loading Bar {
+    width: 1fr;
+}
+
+#stats-body {
+    height: 3;
+}
+
+.stat {
+    width: 1fr;
+    max-width: 40;
+    margin-right: 2;
+}
+
+.stat Static, .stat Spark {
+    height: 1;
+}
+
+.stat Spark {
+    color: $accent;
+}
+
+#stats-details {
+    width: 2fr;
+    height: 3;
+    color: $text-muted;
+}
+
 /* --- new agent ------------------------------------------------------------ */
 
 #new-agent {

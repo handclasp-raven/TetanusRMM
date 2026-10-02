@@ -23,7 +23,9 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-APP_NAME = "rmm-tui"
+APP_NAME = "tetanus-rmm"
+#: The app's name up to 0.1.1; its directories are moved over on first run.
+LEGACY_APP_NAME = "rmm-tui"
 DEFAULT_QUIC_PORT = 4433
 #: Text sizes the viewer accepts (``--font-size``).
 VIEWER_FONT_SIZES = range(6, 33)
@@ -51,6 +53,18 @@ def data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / APP_NAME
 
 
+def migrate_legacy_dirs() -> None:
+    """Move the config and data directories kept under the former name to
+    the current ones, unless those already exist."""
+    for new in {config_dir(), data_dir()}:
+        old = new.with_name(LEGACY_APP_NAME)
+        if old.is_dir() and not new.exists():
+            try:
+                old.rename(new)
+            except OSError:
+                pass  # start afresh; the old directory is left as it was
+
+
 def check_server_url(url: str) -> None:
     parts = urlsplit(url)
     if parts.scheme != "https" or not parts.hostname:
@@ -75,7 +89,8 @@ def normalize_server_url(value: str) -> str:
 
 
 def default_config_path() -> Path:
-    return Path(os.environ.get("RMM_TUI_CONFIG") or config_dir() / "config.toml")
+    env = os.environ.get("TETANUS_RMM_CONFIG") or os.environ.get("RMM_TUI_CONFIG")  # former name
+    return Path(env or config_dir() / "config.toml")
 
 
 @dataclass(frozen=True)

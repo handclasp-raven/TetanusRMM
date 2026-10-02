@@ -54,7 +54,7 @@ pub enum UpdateError {
     InvalidPlatform(String),
     #[error("invalid version {0:?}: must be semver like 1.2.3")]
     InvalidVersion(String),
-    #[error("{0:?} is not a TUI wheel: expected a file named rmm_tui-<version>-….whl")]
+    #[error("{0:?} is not a TUI wheel: expected a file named tetanus_rmm-<version>-….whl")]
     InvalidWheel(String),
     #[error("invalid key file: expected 64 hex characters")]
     InvalidKey,
@@ -263,10 +263,12 @@ pub fn publish_viewer(
 }
 
 /// Whether `name` is a TUI wheel's file name (and safe as a path segment).
-/// Installers read the version from the name, so it is kept as built.
+/// Installers read the version from the name, so it is kept as built. The
+/// wheel was `rmm_tui-…` up to 0.1.1; one published then is still served
+/// until the next replaces it.
 pub fn valid_wheel_name(name: &str) -> bool {
     name.len() <= 128
-        && name.starts_with("rmm_tui-")
+        && (name.starts_with("tetanus_rmm-") || name.starts_with("rmm_tui-"))
         && name.ends_with(".whl")
         && !name.contains("..")
         && name
@@ -457,7 +459,7 @@ mod tests {
         assert_eq!(tui_wheel(&updates).unwrap(), None);
         for (name, bytes) in [
             ("rmm_tui-0.1.0-py3-none-any.whl", b"one"),
-            ("rmm_tui-0.2.0-py3-none-any.whl", b"two"),
+            ("tetanus_rmm-0.2.0-py3-none-any.whl", b"two"),
         ] {
             let file = dir.path().join(name);
             fs::write(&file, bytes).unwrap();
@@ -473,8 +475,8 @@ mod tests {
             publish_tui(&updates, &other),
             Err(UpdateError::InvalidWheel(_))
         ));
-        assert!(!valid_wheel_name("rmm_tui-../x.whl"));
-        assert!(!valid_wheel_name("rmm_tui-0.1.0/x.whl"));
+        assert!(!valid_wheel_name("tetanus_rmm-../x.whl"));
+        assert!(!valid_wheel_name("tetanus_rmm-0.1.0/x.whl"));
     }
 
     #[test]
