@@ -4,7 +4,9 @@
 //! - It injects the technician's input. The session helper runs as the
 //!   user, and Windows drops input from a lower integrity level aimed at a
 //!   higher one (UIPI), so it cannot type into or click elevated windows.
-//!   SYSTEM outranks every window in the session.
+//!   SYSTEM outranks every window in the session. Likewise it types the
+//!   password a user lent the technicians (see `protocol::credential`),
+//!   which is mostly wanted at the lock screen and UAC prompts.
 //! - It follows the input desktop (see `super::desktop`). The logon
 //!   screen, the lock screen and UAC prompts are on the secure desktop,
 //!   which only SYSTEM may attach to. While that desktop is showing, or
@@ -146,6 +148,16 @@ async fn serve(service_pid: u32, session_id: u32) -> anyhow::Result<()> {
                         let moved = follower.borrow_mut().follow().is_ok();
                         if !(moved && injector.inject(event)) {
                             warn!(?event, "input was blocked");
+                        }
+                    }
+                    continue;
+                }
+                IpcMessage::TypeText(text) => {
+                    if !injector.type_text(text.units()) {
+                        // The desktop changed since the last poll.
+                        let moved = follower.borrow_mut().follow().is_ok();
+                        if !(moved && injector.type_text(text.units())) {
+                            warn!("typing was blocked");
                         }
                     }
                     continue;

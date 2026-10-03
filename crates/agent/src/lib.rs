@@ -42,6 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::Identity;
 use protocol::clipboard::MAX_CLIPBOARD_BYTES;
 use protocol::consent::{decide, Decision, DeviceKind, Outcome, SessionRequest};
+use protocol::credential::CredentialEvent;
 use protocol::e2e::{AgentProof, Control};
 use protocol::media::{FrameRate, StreamReport, StreamStatus, VideoPayload};
 use protocol::{close_code, read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
@@ -405,6 +406,9 @@ impl AgentSession {
         publish_technicians(self.desktop.as_deref(), &sessions);
         // Set when the server asks for status reports (protocol 9).
         let status_wanted = tokio::sync::Notify::new();
+        // Set when the server asks for reports on the lent password
+        // (protocol 12). Until then none is kept: it would go unaudited.
+        let credential_reports = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Consent prompts run concurrently; dropped (aborted) with the session.
         let mut consent_tasks = tokio::task::JoinSet::new();
 
@@ -487,6 +491,11 @@ impl AgentSession {
                         status_wanted.notify_one();
                         continue;
                     }
+                    Message::EnableCredentialReports => {
+                        info!("server asked for reports on the lent password");
+                        credential_reports.store(true, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                     Message::PeerConfig { direct, stun_port } => {
                         info!(direct, ?stun_port, "direct-path policy from server");
                         peers.set_policy(direct, stun_port);
@@ -521,6 +530,11 @@ impl AgentSession {
                             }
                         }
                         publish_technicians(self.desktop.as_deref(), &sessions);
+                        // The password was lent to the technicians who
+                        // were here; the last of them has left.
+                        if !lock(&sessions).any_active() {
+                            forget_credential(self.desktop.as_deref(), &outbox_tx);
+                        }
                         continue;
                     }
                     Message::StreamReport(mut report) => {
@@ -684,7 +698,7 @@ impl AgentSession {
                         peers.end_all();
                         lock(&frame_rates).wanted.clear();
                         update_stream();
-                        let ended = self.end_all_sessions(&sessions);
+                        let ended = self.end_all_sessions(&sessions, &outbox_tx);
                         lock(&rate).stream_restarted();
                         warn!(sessions = ?ended, "user pressed Ctrl+F12: all sessions terminated");
                         if !ended.is_empty() {
@@ -699,6 +713,9 @@ impl AgentSession {
         // Records from viewers (over the relay or a direct path), opened and
         // in order. Consent still decides whether they reach the desktop.
         let records = async {
+            // Waiting on the user's answer to a password prompt, or on the
+            // desktop; dropped (aborted) with the connection.
+            let mut credential_tasks = tokio::task::JoinSet::new();
             let mut tick = tokio::time::interval(REORDER_TICK);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
@@ -744,6 +761,81 @@ impl AgentSession {
                                 let _ = desktop.commands.send(DesktopCommand::SecureAttention);
                             }
                             _ => debug!(session_id, "Ctrl+Alt+Del for an inactive session dropped"),
+                        }
+                    }
+                    Inbound::Record {
+                        session_id,
+                        record:
+                            record @ (Control::CredentialRequest
+                            | Control::CredentialType
+                            | Control::CredentialForget),
+                    } => {
+                        let technician = lock(&sessions).technician(session_id);
+                        let (Some(technician), Some(desktop)) = (technician, &self.desktop) else {
+                            debug!(session_id, ?record, "dropped: not an active session");
+                            continue;
+                        };
+                        if !credential_reports.load(std::sync::atomic::Ordering::Relaxed) {
+                            info!(session_id, "no lent password: the server cannot audit it");
+                            let status = Control::CredentialStatus(CredentialEvent::Unavailable);
+                            peers.send(session_id, &status);
+                            continue;
+                        }
+                        info!(session_id, %technician, ?record, "lent password");
+                        let report = {
+                            let peers = peers.clone();
+                            let outbox = outbox_tx.clone();
+                            move |event: CredentialEvent| {
+                                info!(session_id, %event, "lent password");
+                                peers.send(session_id, &Control::CredentialStatus(event));
+                                if event != CredentialEvent::NotStored {
+                                    let _ = outbox.send(Message::CredentialEvent {
+                                        session_id: Some(session_id),
+                                        event,
+                                    });
+                                }
+                            }
+                        };
+                        while credential_tasks.try_join_next().is_some() {}
+                        match record {
+                            Control::CredentialRequest => {
+                                let (reply, answer) = tokio::sync::oneshot::channel();
+                                let sent = desktop
+                                    .commands
+                                    .send(DesktopCommand::CredentialPrompt { technician, reply });
+                                if sent.is_err() {
+                                    report(CredentialEvent::Unavailable);
+                                    continue;
+                                }
+                                report(CredentialEvent::Requested);
+                                credential_tasks.spawn(async move {
+                                    report(answer.await.unwrap_or(CredentialEvent::Declined));
+                                });
+                            }
+                            Control::CredentialType => {
+                                let (reply, typed) = tokio::sync::oneshot::channel();
+                                let _ = desktop
+                                    .commands
+                                    .send(DesktopCommand::CredentialType { reply });
+                                credential_tasks.spawn(async move {
+                                    report(match typed.await {
+                                        Ok(true) => CredentialEvent::Typed,
+                                        _ => CredentialEvent::NotStored,
+                                    });
+                                });
+                            }
+                            _ => {
+                                let (reply, forgotten) = tokio::sync::oneshot::channel();
+                                let _ = desktop
+                                    .commands
+                                    .send(DesktopCommand::CredentialForget { reply });
+                                credential_tasks.spawn(async move {
+                                    report(match forgotten.await {
+                                        Ok(true) => CredentialEvent::Forgotten,
+                                        _ => CredentialEvent::NotStored,
+                                    });
+                                });
+                            }
                         }
                     }
                     Inbound::Record {
@@ -811,7 +903,7 @@ impl AgentSession {
         };
         // Sessions do not survive the connection.
         peers.end_all();
-        self.end_all_sessions(&sessions);
+        self.end_all_sessions(&sessions, &outbox_tx);
         if let Err(AgentError::Unexpected(msg)) = &result {
             warn!(?msg, "closing connection after protocol violation");
             self.connection
@@ -846,9 +938,14 @@ impl AgentSession {
     }
 
     /// End every session locally: release held input, withdraw prompts,
-    /// clear the tray list and stop capturing. Returns the ids of the
-    /// sessions (active or pending) that were ended.
-    fn end_all_sessions(&self, sessions: &std::sync::Mutex<Sessions>) -> Vec<u64> {
+    /// clear the tray list, forget the lent password and stop capturing.
+    /// Returns the ids of the sessions (active or pending) that were
+    /// ended.
+    fn end_all_sessions(
+        &self,
+        sessions: &std::sync::Mutex<Sessions>,
+        outbox: &UnboundedSender<Message>,
+    ) -> Vec<u64> {
         let (mut ended, cancelled, releases) = lock(sessions).terminate_all();
         if let Some(desktop) = &self.desktop {
             for event in releases {
@@ -861,6 +958,7 @@ impl AgentSession {
             }
         }
         publish_technicians(self.desktop.as_deref(), sessions);
+        forget_credential(self.desktop.as_deref(), outbox);
         if let Some(media) = &self.media {
             let _ = media.commands.send(MediaCommand::Stop);
         }
@@ -904,6 +1002,34 @@ fn publish_technicians(desktop: Option<&DesktopLink>, sessions: &std::sync::Mute
         let list = lock(sessions).technicians();
         let _ = desktop.commands.send(DesktopCommand::Technicians(list));
     }
+}
+
+/// No technician is connected any more: have the desktop forget the
+/// password the user lent them, and withdraw a prompt for one. The server
+/// is told if there was one to forget (it only was if the server asked
+/// for these reports).
+fn forget_credential(desktop: Option<&DesktopLink>, outbox: &UnboundedSender<Message>) {
+    let Some(desktop) = desktop else {
+        return;
+    };
+    let (reply, forgotten) = tokio::sync::oneshot::channel();
+    if desktop
+        .commands
+        .send(DesktopCommand::CredentialForget { reply })
+        .is_err()
+    {
+        return;
+    }
+    let outbox = outbox.clone();
+    tokio::spawn(async move {
+        if forgotten.await == Ok(true) {
+            info!("lent password forgotten: no sessions left");
+            let _ = outbox.send(Message::CredentialEvent {
+                session_id: None,
+                event: CredentialEvent::Forgotten,
+            });
+        }
+    });
 }
 
 /// Apply the consent policy to one request and report the outcome.

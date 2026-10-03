@@ -7,6 +7,11 @@
 //! clipboard. That check is here as well as on the server, so the kill
 //! switch takes effect on the agent immediately, whatever the server does.
 //!
+//! A technician may also ask the user to lend them a password for the
+//! length of the session (see [`protocol::credential`]). The desktop keeps
+//! it and types it; this side only passes the requests on, for sessions
+//! consent has granted, and says when to forget it.
+//!
 //! [`Sessions`] is the pure bookkeeping; [`DesktopLink`] connects to the
 //! thing that owns the user's desktop (on Windows, the session helper via
 //! the service's pipe bridge; in tests, a fake).
@@ -16,6 +21,7 @@ use std::time::Duration;
 
 use protocol::clipboard::ClipboardData;
 use protocol::consent::{ConsentMode, Outcome, PromptAnswer};
+use protocol::credential::CredentialEvent;
 use protocol::input::{scancode, InputEvent};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -92,6 +98,11 @@ impl Sessions {
 
     pub fn is_active(&self, id: u64) -> bool {
         self.active.contains_key(&id)
+    }
+
+    /// Who session `id` is, if consent has granted it.
+    pub fn technician(&self, id: u64) -> Option<String> {
+        self.active.get(&id).map(|a| a.technician.clone())
     }
 
     pub fn any_active(&self) -> bool {
@@ -197,6 +208,23 @@ pub enum DesktopCommand {
     SetClipboard(ClipboardData),
     /// Ctrl+Alt+Del, which cannot be injected as key events.
     SecureAttention,
+    /// Ask the user for a password to lend to the technicians, and keep
+    /// it. `reply` gets `Stored`, `Declined` or `Unavailable`; dropping it
+    /// counts as declined.
+    CredentialPrompt {
+        technician: String,
+        reply: oneshot::Sender<CredentialEvent>,
+    },
+    /// Type the lent password where the keyboard focus is. `reply` gets
+    /// whether there was one to type.
+    CredentialType {
+        reply: oneshot::Sender<bool>,
+    },
+    /// Forget the lent password and withdraw any prompt for one. `reply`
+    /// gets whether there was one to forget.
+    CredentialForget {
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

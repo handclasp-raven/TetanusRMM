@@ -8,6 +8,7 @@
 //! - the Ctrl+F12 hotkey, which ends every remote session;
 //! - the on-screen session indicator naming who is connected;
 //! - consent prompts (`require` mode) and "technician connected" toasts;
+//! - the prompt for a password to lend the technicians;
 //! - input injection, clipboard sync, and (in `stream`) screen capture.
 //!
 //! The parts that do not depend on the pipe are shared with the quick
@@ -50,7 +51,7 @@ use super::clipboard::Listener;
 use super::indicator::Indicator;
 use super::input::Injector;
 use super::stream::{self, Desktops, WorkerCommand};
-use super::{consent, toast};
+use super::{consent, credential, toast};
 use crate::core;
 use crate::interactive::indicator_text;
 
@@ -184,6 +185,8 @@ pub struct DesktopCommands {
     injector: Injector,
     /// Open prompts by request id, so they can be withdrawn.
     prompts: HashMap<u64, consent::Prompt>,
+    /// Open password prompts, likewise.
+    credential_prompts: HashMap<u64, credential::Prompt>,
     worker: mpsc::Sender<WorkerCommand>,
     ui: mpsc::Sender<UiEvent>,
     /// Answers, to the service.
@@ -200,6 +203,7 @@ impl DesktopCommands {
         Self {
             injector: Injector::default(),
             prompts: HashMap::new(),
+            credential_prompts: HashMap::new(),
             worker: stream::spawn(out, Desktops::Own),
             ui,
             ctl,
@@ -255,6 +259,36 @@ impl DesktopCommands {
                 if let Some(prompt) = self.prompts.remove(&request_id) {
                     info!(request_id, "consent prompt withdrawn");
                     prompt.cancel();
+                }
+                return true;
+            }
+            IpcMessage::CredentialPrompt {
+                request_id,
+                technician,
+            } => {
+                info!(request_id, %technician, "showing password prompt");
+                let ctl = self.ctl.clone();
+                let prompt = credential::show(&technician, move |secret| {
+                    info!(
+                        request_id,
+                        typed = secret.is_some(),
+                        "password prompt answered"
+                    );
+                    let _ = ctl.send(IpcMessage::CredentialAnswer { request_id, secret });
+                });
+                self.credential_prompts.insert(request_id, prompt);
+                return true;
+            }
+            IpcMessage::CredentialCancel { request_id } => {
+                if let Some(prompt) = self.credential_prompts.remove(&request_id) {
+                    info!(request_id, "password prompt withdrawn");
+                    prompt.cancel();
+                }
+                return true;
+            }
+            IpcMessage::TypeText(text) => {
+                if !self.injector.type_text(text.units()) {
+                    warn!("typing was blocked (secure desktop?)");
                 }
                 return true;
             }

@@ -12,6 +12,7 @@ use std::time::Duration;
 use agent::interactive::{desktop_channel, DesktopCommand, DesktopEnd, DesktopEvent};
 use protocol::clipboard::ClipboardData;
 use protocol::consent::{DeviceKind, PromptAnswer};
+use protocol::credential::CredentialEvent;
 use protocol::input::{scancode, InputEvent, MouseButton};
 use serde_json::Value;
 use server::registry::{self, ConsentMode, DevicePolicy, OnNoUser};
@@ -36,6 +37,9 @@ enum Seen {
     Input(InputEvent),
     SetClipboard(ClipboardData),
     SecureAttention,
+    CredentialPrompt(String),
+    CredentialType,
+    CredentialForget,
 }
 
 struct FakeDesktop {
@@ -43,6 +47,11 @@ struct FakeDesktop {
     user_present: Arc<AtomicBool>,
     /// How the next prompts are answered.
     answer: Mutex<PromptAnswer>,
+    /// How the next password prompts are answered.
+    lend: Mutex<CredentialEvent>,
+    /// Whether the desktop holds a lent password (the password itself
+    /// never reaches the agent core, so a flag stands in for it).
+    password: AtomicBool,
     events: mpsc::UnboundedSender<DesktopEvent>,
 }
 
@@ -122,6 +131,22 @@ fn run_desktop(mut end: DesktopEnd, fake: Arc<FakeDesktop>) {
                 DesktopCommand::Input(event) => Seen::Input(event),
                 DesktopCommand::SetClipboard(data) => Seen::SetClipboard(data),
                 DesktopCommand::SecureAttention => Seen::SecureAttention,
+                DesktopCommand::CredentialPrompt { technician, reply } => {
+                    let answer = *fake.lend.lock().unwrap();
+                    if answer == CredentialEvent::Stored {
+                        fake.password.store(true, Ordering::SeqCst);
+                    }
+                    let _ = reply.send(answer);
+                    Seen::CredentialPrompt(technician)
+                }
+                DesktopCommand::CredentialType { reply } => {
+                    let _ = reply.send(fake.password.load(Ordering::SeqCst));
+                    Seen::CredentialType
+                }
+                DesktopCommand::CredentialForget { reply } => {
+                    let _ = reply.send(fake.password.swap(false, Ordering::SeqCst));
+                    Seen::CredentialForget
+                }
             };
             fake.seen.lock().unwrap().push(seen);
         }
@@ -167,6 +192,8 @@ async fn rig_as(kind: DeviceKind) -> Rig {
         seen: Mutex::new(Vec::new()),
         user_present,
         answer: Mutex::new(PromptAnswer::Accepted),
+        lend: Mutex::new(CredentialEvent::Stored),
+        password: AtomicBool::new(false),
         events: end.events.clone(),
     });
     run_desktop(end, desktop.clone());
@@ -311,6 +338,20 @@ async fn next_clipboard(events: &mut mpsc::Receiver<ViewerEvent>) -> ClipboardDa
     .expect("clipboard within deadline")
 }
 
+async fn next_credential(events: &mut mpsc::Receiver<ViewerEvent>) -> CredentialEvent {
+    timeout(DEADLINE, async {
+        loop {
+            match events.recv().await.expect("viewer events") {
+                ViewerEvent::Credential(event) => return event,
+                ViewerEvent::Closed(reason) => panic!("closed: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("credential status within deadline")
+}
+
 async fn closed_reason(events: &mut mpsc::Receiver<ViewerEvent>) -> String {
     timeout(DEADLINE, async {
         loop {
@@ -401,9 +442,7 @@ async fn notify_starts_at_once_toasts_and_relays_input_and_clipboard() {
     // released and the tray empties.
     viewer.close();
     rig.desktop
-        .wait_until("tray emptied", |s| {
-            s.last() == Some(&Seen::Technicians(vec![]))
-        })
+        .wait_until("tray emptied", |_| rig.desktop.tray().is_empty())
         .await;
     let seen = rig.desktop.seen();
     for released in [
@@ -660,4 +699,123 @@ async fn device_kind_picks_the_default_until_an_admin_decides() {
         .unwrap()
         .unwrap();
     assert_eq!(policy.consent_mode, ConsentMode::Require);
+}
+
+/// `(actor, action)` of every `credential.*` audit row.
+async fn credential_audit(rig: &Rig) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT actor, action FROM audit_log WHERE action LIKE 'credential.%' ORDER BY id",
+    )
+    .fetch_all(&rig.db.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_lent_password_is_shared_by_technicians_and_forgotten_with_the_last_session() {
+    use CredentialEvent::{Declined, Forgotten, NotStored, Requested, Stored, Typed};
+    let rig = rig().await;
+    let jane = create_user(&rig.db.pool, "jane", Role::SupportEngineer).await;
+    server::access::create_grant(
+        &rig.db.pool,
+        "root",
+        jane.user.id,
+        server::access::Scope::Agent(rig.agent_id.clone()),
+        &[server::users::Capability::Desktop].into(),
+    )
+    .await
+    .unwrap();
+    let (root, mut root_events) = rig.connect().await;
+
+    // Nothing to type before the user lends one.
+    root.type_credential();
+    assert_eq!(next_credential(&mut root_events).await, NotStored);
+
+    // The user says no, then yes.
+    *rig.desktop.lend.lock().unwrap() = Declined;
+    root.request_credential();
+    assert_eq!(next_credential(&mut root_events).await, Requested);
+    assert_eq!(next_credential(&mut root_events).await, Declined);
+    *rig.desktop.lend.lock().unwrap() = Stored;
+    root.request_credential();
+    assert_eq!(next_credential(&mut root_events).await, Requested);
+    assert_eq!(next_credential(&mut root_events).await, Stored);
+    assert!(rig
+        .desktop
+        .seen()
+        .contains(&Seen::CredentialPrompt("root".into())));
+
+    // Another technician can have it typed, and still can once the one
+    // who asked has left.
+    let (jane_viewer, mut jane_events) = rig.connect_as(&jane).await.0.unwrap();
+    jane_viewer.type_credential();
+    assert_eq!(next_credential(&mut jane_events).await, Typed);
+    root.close();
+    assert!(!closed_reason(&mut root_events).await.is_empty());
+    rig.desktop
+        .wait_until("root gone from the tray", |_| {
+            rig.desktop.tray() == ["jane"]
+        })
+        .await;
+    assert!(rig.desktop.password.load(Ordering::SeqCst));
+    jane_viewer.type_credential();
+    assert_eq!(next_credential(&mut jane_events).await, Typed);
+
+    // The last session ends: forgotten.
+    jane_viewer.close();
+    rig.desktop
+        .wait_until("the password to be forgotten", |_| {
+            !rig.desktop.password.load(Ordering::SeqCst)
+        })
+        .await;
+
+    // A technician can also say to forget it; the kill switch does too.
+    let (root, mut root_events) = rig.connect().await;
+    root.type_credential();
+    assert_eq!(next_credential(&mut root_events).await, NotStored);
+    root.request_credential();
+    assert_eq!(next_credential(&mut root_events).await, Requested);
+    assert_eq!(next_credential(&mut root_events).await, Stored);
+    root.forget_credential();
+    assert_eq!(next_credential(&mut root_events).await, Forgotten);
+    root.request_credential();
+    assert_eq!(next_credential(&mut root_events).await, Requested);
+    assert_eq!(next_credential(&mut root_events).await, Stored);
+    rig.desktop.press_ctrl_f12();
+    closed_reason(&mut root_events).await;
+    rig.desktop
+        .wait_until("the password to be forgotten", |_| {
+            !rig.desktop.password.load(Ordering::SeqCst)
+        })
+        .await;
+
+    // All of it is in the audit log, by technician; the agent's own
+    // forgetting by the agent. "Not stored" is not an event.
+    let agent = format!("agent:{}", rig.agent_id);
+    let expected: Vec<(String, String)> = [
+        ("root", "credential.requested"),
+        ("root", "credential.declined"),
+        ("root", "credential.requested"),
+        ("root", "credential.stored"),
+        ("jane", "credential.typed"),
+        ("jane", "credential.typed"),
+        (agent.as_str(), "credential.forgotten"),
+        ("root", "credential.requested"),
+        ("root", "credential.stored"),
+        ("root", "credential.forgotten"),
+        ("root", "credential.requested"),
+        ("root", "credential.stored"),
+        (agent.as_str(), "credential.forgotten"),
+    ]
+    .into_iter()
+    .map(|(actor, action)| (actor.to_owned(), action.to_owned()))
+    .collect();
+    timeout(DEADLINE, async {
+        while credential_audit(&rig).await.len() < expected.len() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(());
+    assert_eq!(credential_audit(&rig).await, expected);
 }

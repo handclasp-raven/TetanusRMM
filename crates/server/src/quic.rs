@@ -27,6 +27,11 @@
 //! user's Ctrl+F12 (`UserTerminatedSessions`) closes every viewer of that
 //! agent with `USER_TERMINATED`, audited per session.
 //!
+//! A user can lend the technicians a password for the length of a session
+//! (see `protocol::credential`). It never leaves the agent; the agent
+//! reports what happens to it (`CredentialEvent`), audited as
+//! `credential.*`.
+//!
 //! Sessions are end-to-end encrypted between agent and viewer (see
 //! `protocol::e2e`). The viewer sends its session key right after
 //! `ViewerHello`; the server hands it to the agent with the session request
@@ -649,6 +654,11 @@ async fn serve_agent(
     if version >= protocol::MIN_STATUS_VERSION {
         let _ = to_agent.send(Message::EnableStatusReports);
     }
+    // Only with somewhere to audit it: an agent that is not asked keeps no
+    // password.
+    if version >= protocol::MIN_CREDENTIAL_VERSION && hooks.registry.is_some() {
+        let _ = to_agent.send(Message::EnableCredentialReports);
+    }
     // Where the agent connects from; re-recorded when that changes.
     let mut remote_ip = None;
 
@@ -724,6 +734,13 @@ async fn serve_agent(
                     metrics::get().user_terminations.inc();
                     warn!(%agent_id, viewers = link.viewers(), "user pressed Ctrl+F12");
                     link.user_terminated();
+                }
+                Message::CredentialEvent { session_id, event } => {
+                    info!(%agent_id, ?session_id, %event, "lent password");
+                    if let Some(registry) = &hooks.registry {
+                        viewers::record_credential(&registry.pool, agent_id, session_id, event)
+                            .await?;
+                    }
                 }
                 Message::AgentInfo { hostname } => {
                     let hostname = protocol::sanitize_hostname(&hostname);

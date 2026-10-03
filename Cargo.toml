@@ -51,6 +51,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 ed25519-dalek = "3"
 semver = "1"
+zeroize = "1"
 windows = { version = "0.62", features = [
     "Data_Xml_Dom",
     "Foundation",

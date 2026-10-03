@@ -6,6 +6,7 @@
 pub mod assist;
 pub mod clipboard;
 pub mod consent;
+pub mod credential;
 pub mod e2e;
 pub mod framing;
 pub mod input;
@@ -55,7 +56,16 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 /// - 11: the logon screen (appended sealed record): viewers may send
 ///   `Control::SecureAttention` for Ctrl+Alt+Del. Agents skip sealed
 ///   records they do not know, so an older agent just ignores it.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// - 12: the lent password (appended variants and sealed records, see
+///   [`credential`]): viewers may send `Control::CredentialRequest`,
+///   `CredentialType` and `CredentialForget`. The server sends
+///   `EnableCredentialReports` to agents at version 12+, which then report
+///   each `CredentialEvent` for the audit log; an agent that was not asked
+///   refuses to keep a password, so nothing is kept unaudited.
+pub const PROTOCOL_VERSION: u32 = 12;
+
+/// Oldest agent protocol that keeps a lent password (see [`credential`]).
+pub const MIN_CREDENTIAL_VERSION: u32 = 12;
 
 /// Oldest agent protocol that reports [`AgentStatus`].
 pub const MIN_STATUS_VERSION: u32 = 9;
@@ -257,6 +267,18 @@ pub enum Message {
     /// a technician read out for a short-lived certificate. Like
     /// [`Message::Enroll`], and answered with [`Message::Enrolled`].
     AssistEnroll { code: String, csr_der: Vec<u8> },
+
+    // --- The lent password (see `credential`) ------------------------------
+    /// Server to agent (version 12+), after `Hello`: report each
+    /// `CredentialEvent`. An agent that is not asked keeps no password.
+    EnableCredentialReports,
+    /// Agent to server, once enabled: what happened to the lent password,
+    /// for the audit log. `session_id` is the technician's session, or
+    /// `None` when the agent forgot it because the sessions ended.
+    CredentialEvent {
+        session_id: Option<u64>,
+        event: credential::CredentialEvent,
+    },
 }
 
 /// Most signed-in users an [`AgentStatus`] carries.
@@ -554,6 +576,22 @@ mod tests {
         let bytes = postcard::to_stdvec(&msg).unwrap();
         assert_eq!(bytes[0], 35);
         assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn credential_messages_are_appended_after_assist_enroll() {
+        let msgs = [
+            Message::EnableCredentialReports,
+            Message::CredentialEvent {
+                session_id: Some(4),
+                event: credential::CredentialEvent::Stored,
+            },
+        ];
+        for (i, msg) in msgs.into_iter().enumerate() {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            assert_eq!(usize::from(bytes[0]), 36 + i);
+            assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+        }
     }
 
     #[test]

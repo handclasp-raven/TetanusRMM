@@ -26,6 +26,7 @@ use peer::merge::{Merger, Source};
 use peer::noise::{Inbox, Initiator, Opener, Sealer, StaticKey};
 use peer::DirectSettings;
 use protocol::clipboard::{ClipboardData, MAX_CLIPBOARD_BYTES};
+use protocol::credential::CredentialEvent;
 use protocol::e2e::{Control, DirectAnswer, DirectOffer, Envelope, Path};
 use protocol::input::InputEvent;
 use protocol::media::{FrameRate, MediaFrame, MonitorInfo, StreamSettings, StreamStatus};
@@ -94,6 +95,9 @@ pub enum ViewerEvent {
     /// How the agent streams the video now (agents that support frame-rate
     /// settings send it after `set_frame_rate`).
     StreamStatus(StreamStatus),
+    /// What came of asking for, typing or forgetting the password the
+    /// remote user lends the technicians.
+    Credential(CredentialEvent),
     /// Video now flows this way (`Relayed` or `Direct`), or a direct
     /// attempt failed (`DirectFailed`: the session stays on the relay).
     Path(Path),
@@ -191,6 +195,25 @@ impl ViewerHandle {
     /// Press Ctrl+Alt+Del on the remote machine.
     pub fn send_secure_attention(&self) {
         self.shared.send_sealed(&Control::SecureAttention);
+    }
+
+    /// Ask the remote user to type a password that the agent keeps, on
+    /// their machine only, while remote sessions are open (see
+    /// [`protocol::credential`]). The answer is a
+    /// [`ViewerEvent::Credential`], as for the next two.
+    pub fn request_credential(&self) {
+        self.shared.send_sealed(&Control::CredentialRequest);
+    }
+
+    /// Have the agent type the lent password where the remote keyboard
+    /// focus is.
+    pub fn type_credential(&self) {
+        self.shared.send_sealed(&Control::CredentialType);
+    }
+
+    /// Have the agent forget the lent password now.
+    pub fn forget_credential(&self) {
+        self.shared.send_sealed(&Control::CredentialForget);
     }
 
     /// Put `data` on the remote clipboard.
@@ -647,6 +670,11 @@ async fn run(running: Running, early: Vec<Message>) {
                             .await
                             .is_err()
                         {
+                            return;
+                        }
+                    }
+                    Control::CredentialStatus(event) => {
+                        if events.send(ViewerEvent::Credential(event)).await.is_err() {
                             return;
                         }
                     }

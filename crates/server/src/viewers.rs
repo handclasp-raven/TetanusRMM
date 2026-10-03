@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use protocol::consent::{ConsentMode, Outcome};
+use protocol::credential::CredentialEvent;
 use protocol::e2e::Path;
 use serde_json::json;
 use sqlx::PgPool;
@@ -229,6 +230,46 @@ pub async fn record_path(pool: &PgPool, grant: &ViewerGrant, path: Path) -> sqlx
                 "viewer_session_id": grant.session_id,
                 "path": path,
             })),
+    )
+    .await
+    .map(drop)
+}
+
+/// Record what an agent says happened to the password its user lent the
+/// technicians (see `protocol::credential`). Audited as `credential.*`,
+/// by the technician of viewer session `session_id` if it is one of this
+/// agent's; otherwise (the agent forgot the password when its sessions
+/// ended, or names a session that is not its own) by the agent itself.
+pub async fn record_credential(
+    pool: &PgPool,
+    agent_id: &str,
+    session_id: Option<u64>,
+    event: CredentialEvent,
+) -> sqlx::Result<()> {
+    let session_id = session_id.and_then(|id| i64::try_from(id).ok());
+    let technician: Option<String> = match session_id {
+        Some(id) => {
+            sqlx::query_scalar(
+                "SELECT u.username FROM viewer_sessions v JOIN users u ON u.id = v.user_id
+                 WHERE v.id = $1 AND v.agent_id = $2",
+            )
+            .bind(id)
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?
+        }
+        None => None,
+    };
+    let detail = match (&technician, session_id) {
+        (Some(_), Some(id)) => json!({ "viewer_session_id": id }),
+        _ => json!({}),
+    };
+    let actor = technician.unwrap_or_else(|| format!("agent:{agent_id}"));
+    audit::append_now(
+        pool,
+        NewEntry::new(actor, Action::Credential(event))
+            .target(agent_id)
+            .detail(detail),
     )
     .await
     .map(drop)

@@ -351,11 +351,17 @@ impl Peers {
                 }
             }
             // Only the viewer sends these; ignore them from it.
-            Control::MediaKey(_) | Control::DirectAnswer(_) | Control::StreamStatus(_) => {}
+            Control::MediaKey(_)
+            | Control::DirectAnswer(_)
+            | Control::StreamStatus(_)
+            | Control::CredentialStatus(_) => {}
             record @ (Control::Input(_)
             | Control::Clipboard(_)
             | Control::StreamSettings(_)
-            | Control::SecureAttention) => {
+            | Control::SecureAttention
+            | Control::CredentialRequest
+            | Control::CredentialType
+            | Control::CredentialForget) => {
                 let _ = self.inbound.send(Inbound::Record { session_id, record });
             }
         }

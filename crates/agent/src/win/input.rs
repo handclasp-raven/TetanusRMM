@@ -14,6 +14,10 @@
 //! desktop, injection does not reach the secure desktop, and Windows
 //! (UIPI) drops input aimed at elevated windows. Ctrl+Alt+Del cannot be
 //! injected by anyone this way (see `super::sas`).
+//!
+//! [`Injector::type_text`] types text rather than keys: the password a
+//! user lent the technicians (see `protocol::credential`), whatever the
+//! keyboard layout.
 
 use std::time::{Duration, Instant};
 
@@ -22,11 +26,11 @@ use protocol::media::MonitorInfo;
 use tracing::{debug, warn};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -110,6 +114,39 @@ impl Injector {
                 ?event,
                 error = %windows::core::Error::from_thread(),
                 "SendInput was blocked"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Type `text` (UTF-16) where the keyboard focus is, as characters
+    /// rather than keys. `false` if Windows did not take it all. The text
+    /// is not logged, and the events built from it are wiped.
+    pub fn type_text(&mut self, text: &[u16]) -> bool {
+        let mut inputs: Vec<INPUT> = text
+            .iter()
+            .flat_map(|&unit| {
+                [
+                    key(unit, KEYEVENTF_UNICODE),
+                    key(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                ]
+            })
+            .collect();
+        if inputs.is_empty() {
+            return true;
+        }
+        // SAFETY: `inputs` is a valid slice of initialised INPUT structs.
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        for input in &mut inputs {
+            // SAFETY: a valid, exclusive reference; volatile so that the
+            // wipe is not optimised away.
+            unsafe { std::ptr::write_volatile(input, INPUT::default()) };
+        }
+        if sent as usize != text.len() * 2 {
+            debug!(
+                error = %windows::core::Error::from_thread(),
+                "SendInput was blocked while typing text"
             );
             return false;
         }

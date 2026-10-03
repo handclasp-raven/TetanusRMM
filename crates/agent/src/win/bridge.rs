@@ -16,6 +16,12 @@
 //! the stream moves between them as it changes; each starts with a
 //! keyframe, so viewers follow.
 //!
+//! The password a user lends the technicians (see `protocol::credential`)
+//! is kept here, in the service, encrypted in memory (see `super::secret`):
+//! out of reach of the user's own processes, and still there when a helper
+//! restarts. The session helper asks for it; it is typed by whichever
+//! helper takes input.
+//!
 //! Input goes to the system helper (SYSTEM, so it reaches elevated windows
 //! and the secure desktop) when one is attached, and to the session helper
 //! otherwise.
@@ -24,12 +30,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use protocol::consent::PromptAnswer;
-use protocol::ipc::IpcMessage;
+use protocol::credential::CredentialEvent;
+use protocol::ipc::{IpcMessage, Secret};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use super::sas;
+use super::secret::ProtectedSecret;
 use crate::interactive::{DesktopCommand, DesktopEnd, DesktopEvent};
 use crate::media::source::{MediaCommand, MediaEvent, MediaSourceEnd};
 use crate::session::{capturer, HelperRole};
@@ -57,6 +65,26 @@ struct State {
     technicians: Vec<String>,
     /// Consent prompts on screen, by request id.
     prompts: HashMap<u64, oneshot::Sender<PromptAnswer>>,
+    /// The password the user lent the technicians, if any.
+    credential: Option<ProtectedSecret>,
+    /// The prompt for one, while it is on screen.
+    credential_prompt: Option<CredentialPrompt>,
+    /// Request ids of password prompts so far.
+    credential_prompts: u64,
+}
+
+/// The password prompt on screen, and everyone waiting on it.
+struct CredentialPrompt {
+    request_id: u64,
+    waiting: Vec<oneshot::Sender<CredentialEvent>>,
+}
+
+impl CredentialPrompt {
+    fn answer(self, event: CredentialEvent) {
+        for reply in self.waiting {
+            let _ = reply.send(event);
+        }
+    }
 }
 
 impl State {
@@ -226,6 +254,76 @@ impl Bridge {
                 std::thread::spawn(sas::send);
                 return;
             }
+            DesktopCommand::CredentialPrompt { technician, reply } => {
+                // A second technician asking joins the prompt on screen.
+                if let Some(prompt) = &mut state.credential_prompt {
+                    prompt.waiting.push(reply);
+                    return;
+                }
+                // The user's helper shows it, on the user's desktop: not
+                // while that is locked or hidden by a UAC prompt.
+                if state.helper.is_none() || state.secure {
+                    warn!("password prompt needed but nobody is at the desktop");
+                    let _ = reply.send(CredentialEvent::Unavailable);
+                    return;
+                }
+                state.credential_prompts += 1;
+                let request_id = state.credential_prompts;
+                state.credential_prompt = Some(CredentialPrompt {
+                    request_id,
+                    waiting: vec![reply],
+                });
+                IpcMessage::CredentialPrompt {
+                    request_id,
+                    technician,
+                }
+            }
+            DesktopCommand::CredentialType { reply } => {
+                let text =
+                    match state.credential.as_mut().map(|credential| {
+                        credential.with_plain(|units| Secret::new(units.to_vec()))
+                    }) {
+                        Some(Ok(text)) => text,
+                        Some(Err(e)) => {
+                            warn!("the lent password could not be decrypted and is dropped: {e}");
+                            state.credential = None;
+                            let _ = reply.send(false);
+                            return;
+                        }
+                        None => {
+                            let _ = reply.send(false);
+                            return;
+                        }
+                    };
+                // Typed like any other input: by the system helper when
+                // there is one, so it reaches the lock screen and UAC.
+                let message = IpcMessage::TypeText(text);
+                let message = match &state.system {
+                    Some(system) => system.send(message).err().map(|e| e.0),
+                    None => Some(message),
+                };
+                let sent = match (message, &state.helper) {
+                    (None, _) => true,
+                    (Some(message), Some(helper)) => helper.send(message).is_ok(),
+                    (Some(_), None) => false,
+                };
+                info!(sent, "lent password typed");
+                let _ = reply.send(sent);
+                return;
+            }
+            DesktopCommand::CredentialForget { reply } => {
+                let held = state.credential.take().is_some();
+                if held {
+                    info!("lent password forgotten");
+                }
+                let _ = reply.send(held);
+                let Some(prompt) = state.credential_prompt.take() else {
+                    return;
+                };
+                let request_id = prompt.request_id;
+                prompt.answer(CredentialEvent::Declined);
+                IpcMessage::CredentialCancel { request_id }
+            }
         };
         if let Some(helper) = &state.helper {
             let _ = helper.send(message);
@@ -257,6 +355,10 @@ impl Bridge {
         for (request_id, reply) in state.prompts.drain() {
             info!(request_id, "helper gone while a consent prompt was open");
             let _ = reply.send(PromptAnswer::Unavailable);
+        }
+        if let Some(prompt) = state.credential_prompt.take() {
+            info!("helper gone while a password prompt was open");
+            prompt.answer(CredentialEvent::Unavailable);
         }
     }
 
@@ -300,6 +402,7 @@ impl Bridge {
             IpcMessage::Monitors(_) | IpcMessage::Frame(_) if !capturing => {}
             // Only the user's own helper speaks for the user.
             IpcMessage::ConsentAnswer { .. }
+            | IpcMessage::CredentialAnswer { .. }
             | IpcMessage::Clipboard(_)
             | IpcMessage::KillSwitch
                 if from != HelperRole::User =>
@@ -343,6 +446,32 @@ impl Bridge {
                         let _ = reply.send(answer);
                     }
                     None => debug!(request_id, ?answer, "answer for a withdrawn prompt"),
+                }
+            }
+            IpcMessage::CredentialAnswer { request_id, secret } => {
+                let mut state = self.state();
+                if state
+                    .credential_prompt
+                    .as_ref()
+                    .is_none_or(|p| p.request_id != request_id)
+                {
+                    debug!(request_id, "answer for a withdrawn password prompt");
+                    return;
+                }
+                let event = match secret.as_ref().map(ProtectedSecret::new) {
+                    Some(Ok(protected)) => {
+                        state.credential = Some(protected);
+                        CredentialEvent::Stored
+                    }
+                    Some(Err(e)) => {
+                        warn!("the lent password could not be encrypted, so is not kept: {e}");
+                        CredentialEvent::Unavailable
+                    }
+                    None => CredentialEvent::Declined,
+                };
+                info!(request_id, %event, "password prompt answered");
+                if let Some(prompt) = state.credential_prompt.take() {
+                    prompt.answer(event);
                 }
             }
             IpcMessage::Clipboard(data) => {
@@ -497,5 +626,101 @@ mod tests {
         let mut events = desktop.events.lock().await;
         assert_eq!(events.try_recv(), Ok(DesktopEvent::KillSwitch));
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_lent_password_is_kept_here_and_typed_by_the_system_helper() {
+        let (media, media_source) = media_channel();
+        let (desktop, desktop_end) = desktop_channel(|| true);
+        let bridge = Bridge::start(media_source, desktop_end);
+        let _media = media;
+        let (user_tx, mut user) = mpsc::unbounded_channel();
+        let (system_tx, mut system) = mpsc::unbounded_channel();
+        bridge.attach(user_tx);
+        bridge.attach_system(system_tx);
+        let password: Vec<u16> = "hunter2".encode_utf16().collect();
+        let type_it = || {
+            let (reply, typed) = oneshot::channel();
+            desktop
+                .commands
+                .send(DesktopCommand::CredentialType { reply })
+                .unwrap();
+            typed
+        };
+
+        // Nothing to type yet.
+        assert!(!type_it().await.unwrap());
+
+        let (reply, answer) = oneshot::channel();
+        desktop
+            .commands
+            .send(DesktopCommand::CredentialPrompt {
+                technician: "jane".into(),
+                reply,
+            })
+            .unwrap();
+        let request_id = loop {
+            if let IpcMessage::CredentialPrompt {
+                request_id,
+                technician,
+            } = next(&mut user).await
+            {
+                assert_eq!(technician, "jane");
+                break request_id;
+            }
+        };
+        // Only the user's own helper answers for the user.
+        bridge
+            .from_helper(
+                HelperRole::System,
+                IpcMessage::CredentialAnswer {
+                    request_id,
+                    secret: Some(Secret::new(vec![0x78])),
+                },
+            )
+            .await;
+        bridge
+            .from_helper(
+                HelperRole::User,
+                IpcMessage::CredentialAnswer {
+                    request_id,
+                    secret: Some(Secret::new(password.clone())),
+                },
+            )
+            .await;
+        assert_eq!(answer.await.unwrap(), CredentialEvent::Stored);
+
+        // Typed by the system helper, which reaches the lock screen.
+        assert!(type_it().await.unwrap());
+        let typed = loop {
+            if let IpcMessage::TypeText(text) = next(&mut system).await {
+                break text;
+            }
+        };
+        assert_eq!(typed.units(), password);
+
+        // Forgotten: nothing left to type, and an open prompt is withdrawn.
+        let (reply, answer) = oneshot::channel();
+        desktop
+            .commands
+            .send(DesktopCommand::CredentialPrompt {
+                technician: "jane".into(),
+                reply,
+            })
+            .unwrap();
+        let (reply, forgotten) = oneshot::channel();
+        desktop
+            .commands
+            .send(DesktopCommand::CredentialForget { reply })
+            .unwrap();
+        assert!(forgotten.await.unwrap());
+        assert_eq!(answer.await.unwrap(), CredentialEvent::Declined);
+        assert!(!type_it().await.unwrap());
+        let withdrawn = loop {
+            if let IpcMessage::CredentialCancel { request_id } = next(&mut user).await {
+                break request_id;
+            }
+        };
+        assert_eq!(withdrawn, request_id + 1);
     }
 }

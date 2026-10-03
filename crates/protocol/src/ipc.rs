@@ -4,9 +4,13 @@
 //! Framed with [`crate::framing`] like the network protocol. It carries the
 //! tray status, capture control and frames, and (Phase 6) the consent
 //! prompt, toasts, the technician list, input, clipboard and the Ctrl+F12
-//! kill switch.
+//! kill switch. It also carries the password a user lends the technicians
+//! (see [`crate::credential`]), as a [`Secret`]: from the prompt to the
+//! service, which keeps it, and from the service to the helper that types
+//! it.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::clipboard::ClipboardData;
 use crate::consent::PromptAnswer;
@@ -75,6 +79,47 @@ pub enum IpcMessage {
     /// in its session. `secure` is the logon screen, the lock screen or a
     /// UAC prompt, which only the system helper can capture.
     Desktop { secure: bool },
+    /// Service to helper: ask the user for a password to lend to the
+    /// technicians, for `technician`.
+    CredentialPrompt { request_id: u64, technician: String },
+    /// Service to helper: the request was withdrawn; close its prompt.
+    CredentialCancel { request_id: u64 },
+    /// Helper to service: what the user typed, or `None` if they declined
+    /// or did not answer.
+    CredentialAnswer {
+        request_id: u64,
+        secret: Option<Secret>,
+    },
+    /// Service to helper: type this where the keyboard focus is.
+    TypeText(Secret),
+}
+
+/// Text that must not be seen: a password, as UTF-16 units (what Windows'
+/// edit controls give and `SendInput` takes). It is wiped when dropped
+/// and never printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Secret(Vec<u16>);
+
+impl Secret {
+    pub fn new(units: Vec<u16>) -> Self {
+        Self(units)
+    }
+
+    pub fn units(&self) -> &[u16] {
+        &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
 }
 
 /// An encoded video frame from the helper.
@@ -190,6 +235,20 @@ mod tests {
             IpcMessage::SetBitrate { bps: 1_500_000 },
             IpcMessage::SetFrameRate { fps: 60 },
             IpcMessage::Desktop { secure: true },
+            IpcMessage::CredentialPrompt {
+                request_id: 3,
+                technician: "Jane Doe".into(),
+            },
+            IpcMessage::CredentialCancel { request_id: 3 },
+            IpcMessage::CredentialAnswer {
+                request_id: 3,
+                secret: Some(Secret::new("hunter2".encode_utf16().collect())),
+            },
+            IpcMessage::CredentialAnswer {
+                request_id: 3,
+                secret: None,
+            },
+            IpcMessage::TypeText(Secret::new(vec![0x70, 0x77])),
         ];
         let mut buf = Vec::new();
         for m in &msgs {
@@ -200,6 +259,24 @@ mod tests {
             let got: Option<IpcMessage> = read_frame(&mut reader).await.unwrap();
             assert_eq!(got, Some(m));
         }
+    }
+
+    #[test]
+    fn secrets_never_show_up_in_logs() {
+        let secret = Secret::new("hunter2".encode_utf16().collect());
+        let shown = format!(
+            "{:?}",
+            IpcMessage::CredentialAnswer {
+                request_id: 1,
+                secret: Some(secret.clone()),
+            }
+        );
+        assert!(shown.contains("Secret(..)"), "{shown}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("104"),
+            "{shown}"
+        );
+        assert!(!format!("{:?}", IpcMessage::TypeText(secret)).contains("104"));
     }
 
     #[test]

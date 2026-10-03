@@ -167,6 +167,13 @@ pub enum Action {
     Keyframe,
     /// Ctrl+Alt+Del on the remote machine.
     SecureAttention,
+    PasswordMenu,
+    /// Ask the remote user to lend a password (see `protocol::credential`).
+    PasswordRequest,
+    /// Have the agent type the lent password on the remote machine.
+    PasswordType,
+    /// Have the agent forget it.
+    PasswordForget,
     ToggleFullscreen,
     TogglePanel,
     Disconnect,
@@ -527,6 +534,28 @@ pub fn frame_rate_menu(anchor: Rect, current: FrameRate, streamed: Option<u32>) 
     }
 }
 
+/// The Password menu: the password the remote user lends the technicians.
+/// It is kept on their machine, so the viewer cannot tell whether there is
+/// one (another technician may have asked): every choice is always there,
+/// and the agent says what came of it.
+pub fn password_menu(anchor: Rect) -> Menu {
+    Menu {
+        anchor,
+        items: [
+            ("Ask the user for a password", Action::PasswordRequest),
+            ("Type the password", Action::PasswordType),
+            ("Forget the password", Action::PasswordForget),
+        ]
+        .into_iter()
+        .map(|(label, action)| MenuItem {
+            label: label.into(),
+            action,
+            checked: false,
+        })
+        .collect(),
+    }
+}
+
 /// Remember `px` as the text size in `path`, as `{"font_size": N}` (the
 /// TUI reads it to start the next viewer at that size). Written beside it
 /// and renamed, so a reader never sees half a file.
@@ -641,6 +670,7 @@ impl Chrome<'_> {
         );
         add_left("Refresh", Action::Keyframe, false, &mut buttons);
         add_left("Ctrl+Alt+Del", Action::SecureAttention, false, &mut buttons);
+        add_left("Password", Action::PasswordMenu, true, &mut buttons);
         let fullscreen = if t.fullscreen {
             "Exit full screen"
         } else {
@@ -1458,7 +1488,7 @@ mod tests {
     #[test]
     fn toolbar_offers_display_monitor_and_session_controls() {
         let f = Fixture::new();
-        let chrome = f.chrome(1800, 900);
+        let chrome = f.chrome(2000, 900);
         let buttons = chrome.toolbar_buttons();
         let labels: Vec<&str> = buttons.iter().map(|b| b.label.as_str()).collect();
         assert_eq!(
@@ -1470,14 +1500,16 @@ mod tests {
                 "Text: 16",
                 "Refresh",
                 "Ctrl+Alt+Del",
+                "Password",
                 "Full screen",
                 "Disconnect",
                 "Panel"
             ]
         );
-        assert!(buttons[..4].iter().all(|b| b.dropdown) && buttons[8].active);
+        assert!(buttons[..4].iter().all(|b| b.dropdown) && buttons[9].active);
+        assert!(buttons[6].dropdown);
         // Disconnect sits at the right edge.
-        assert_eq!(buttons[7].rect.right(), 1800 - M.gap);
+        assert_eq!(buttons[8].rect.right(), 2000 - M.gap);
         assert_eq!(
             chrome.hit(centre(buttons[0].rect)),
             Hit::Action(Action::DisplayMenu)
@@ -1491,7 +1523,23 @@ mod tests {
             Hit::Action(Action::SecureAttention)
         );
         assert_eq!(
-            chrome.hit(centre(buttons[7].rect)),
+            chrome.hit(centre(buttons[6].rect)),
+            Hit::Action(Action::PasswordMenu)
+        );
+        assert_eq!(
+            password_menu(buttons[6].rect)
+                .items
+                .into_iter()
+                .map(|i| i.action)
+                .collect::<Vec<_>>(),
+            [
+                Action::PasswordRequest,
+                Action::PasswordType,
+                Action::PasswordForget
+            ]
+        );
+        assert_eq!(
+            chrome.hit(centre(buttons[8].rect)),
             Hit::Action(Action::Disconnect)
         );
         assert_eq!(chrome.hit((800.0, 500.0)), Hit::Desktop);

@@ -28,6 +28,7 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use crate::clipboard::ClipboardData;
+use crate::credential::CredentialEvent;
 use crate::input::InputEvent;
 use crate::media::{StreamSettings, StreamStatus};
 
@@ -83,6 +84,17 @@ pub enum Control {
     /// secure attention sequence, which cannot be sent as key events).
     /// Older agents do not know this record and skip it.
     SecureAttention,
+    /// Viewer -> agent: ask the user to type a password the technicians
+    /// may have typed for them while a session is open (see
+    /// [`crate::credential`]). Older agents skip this and the next three.
+    CredentialRequest,
+    /// Viewer -> agent: type the lent password on the remote machine.
+    CredentialType,
+    /// Viewer -> agent: forget the lent password now.
+    CredentialForget,
+    /// Agent -> viewer: what came of one of the three above. Only to the
+    /// viewer that sent it, so never to one too old to know this record.
+    CredentialStatus(CredentialEvent),
 }
 
 /// A video key. Keys change when a viewer leaves, so a departed viewer
@@ -193,6 +205,22 @@ mod tests {
         assert!(shown.contains("epoch: 3"));
         assert!(!shown.to_lowercase().contains("ab, "), "{shown}");
         assert!(!shown.contains("171"), "{shown}");
+    }
+
+    #[test]
+    fn credential_records_are_appended_after_secure_attention() {
+        let records = [
+            Control::CredentialRequest,
+            Control::CredentialType,
+            Control::CredentialForget,
+            Control::CredentialStatus(CredentialEvent::Stored),
+        ];
+        let base = postcard::to_stdvec(&Control::SecureAttention).unwrap()[0];
+        for (i, record) in records.into_iter().enumerate() {
+            let bytes = postcard::to_stdvec(&record).unwrap();
+            assert_eq!(usize::from(bytes[0]), usize::from(base) + 1 + i);
+            assert_eq!(postcard::from_bytes::<Control>(&bytes).unwrap(), record);
+        }
     }
 
     #[test]

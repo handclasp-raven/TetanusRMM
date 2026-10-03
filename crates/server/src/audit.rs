@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use futures_util::TryStreamExt;
+use protocol::credential::CredentialEvent;
 use ring::digest::{digest, SHA256};
 use serde::Serialize;
 use serde_json::Value;
@@ -88,6 +89,10 @@ pub enum Action {
     AssistEnd,
     /// Too many wrong quick assist codes: the outstanding ones were voided.
     AssistLockout,
+    /// Something happened to the password a user lent the technicians on
+    /// an agent (asked for, stored, typed, forgotten...). Never the
+    /// password, which stays on the agent.
+    Credential(CredentialEvent),
 }
 
 impl Action {
@@ -131,6 +136,13 @@ impl Action {
             Action::AssistRedeem => "assist.redeem",
             Action::AssistEnd => "assist.end",
             Action::AssistLockout => "assist.lockout",
+            Action::Credential(CredentialEvent::Requested) => "credential.requested",
+            Action::Credential(CredentialEvent::Stored) => "credential.stored",
+            Action::Credential(CredentialEvent::Declined) => "credential.declined",
+            Action::Credential(CredentialEvent::Unavailable) => "credential.unavailable",
+            Action::Credential(CredentialEvent::Typed) => "credential.typed",
+            Action::Credential(CredentialEvent::Forgotten) => "credential.forgotten",
+            Action::Credential(CredentialEvent::NotStored) => "credential.not_stored",
         }
     }
 }

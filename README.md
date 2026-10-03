@@ -60,6 +60,7 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 -  **Remote Shell:** Need to just fire some commands without bugging the user? Say less.
 -  **Scripts:** Add scripts, choose target devices or a group and hit run. Easy.
 -  **Quick Commands:** In your remove viewer, you can add your own quick command buttons to save you having to hit Win+R.
+-  **Lent Password:** User off to lunch? From the viewer, ask them to type a password before they go. It stays on their PC, encrypted in memory, the agent types it for you (lock screen and UAC prompts too), and it is forgotten when the last session ends.
 -  **Audit Logging** The server keeps an audit of who did what and where
 
 

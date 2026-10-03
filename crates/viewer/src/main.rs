@@ -3,7 +3,8 @@
 //! mouse and keyboard input and clipboard changes to it.
 //!
 //! Around the picture: a toolbar (display mode, monitor, refresh,
-//! Ctrl+Alt+Del, full screen, the side panel, disconnect) and a side panel with the agent's
+//! Ctrl+Alt+Del, the password the remote user lends for the session, full
+//! screen, the side panel, disconnect) and a side panel with the agent's
 //! status, command buttons and file transfer (see `viewer::ui`). The panel
 //! uses the server's HTTPS API as the signed-in technician; the TUI passes
 //! the API address and its session token (`RMM_API_TOKEN`, never on the
@@ -35,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use clap::Parser;
+use protocol::credential::CredentialEvent;
 use protocol::input::{normalise, InputEvent, MouseButton, WHEEL_NOTCH};
 use protocol::media::{FrameRate, MonitorInfo, StreamStatus};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -298,6 +300,7 @@ enum UserEvent {
     Monitors(Vec<MonitorInfo>),
     StreamMonitor(u32),
     StreamStatus(StreamStatus),
+    Credential(CredentialEvent),
     Path(protocol::e2e::Path),
     Closed(String),
     /// The agent's status for the side panel, or why it could not be had.
@@ -500,6 +503,7 @@ fn network(
                 ViewerEvent::Monitors(m) => UserEvent::Monitors(m),
                 ViewerEvent::StreamMonitor(m) => UserEvent::StreamMonitor(m),
                 ViewerEvent::StreamStatus(status) => UserEvent::StreamStatus(status),
+                ViewerEvent::Credential(event) => UserEvent::Credential(event),
                 ViewerEvent::Path(path) => UserEvent::Path(path),
                 ViewerEvent::Closed(reason) => UserEvent::Closed(reason),
             };
@@ -1091,7 +1095,8 @@ impl App {
             Action::DisplayMenu
             | Action::FrameRateMenu
             | Action::MonitorMenu
-            | Action::TextMenu => {
+            | Action::TextMenu
+            | Action::PasswordMenu => {
                 let already = matches!(&self.overlay, Some(Overlay::Menu(m)) if m.anchor == self.anchor(&action));
                 if already {
                     self.overlay = None;
@@ -1104,6 +1109,7 @@ impl App {
                         ui::frame_rate_menu(anchor, self.frame_rate, self.streamed_fps)
                     }
                     Action::TextMenu => ui::text_menu(anchor, self.font_px),
+                    Action::PasswordMenu => ui::password_menu(anchor),
                     _ => ui::monitor_menu(anchor, &self.monitors, self.active),
                 };
                 self.open(Overlay::Menu(menu));
@@ -1144,6 +1150,17 @@ impl App {
                 if let Some(h) = &self.handle {
                     info!("sending Ctrl+Alt+Del");
                     h.send_secure_attention();
+                }
+            }
+            Action::PasswordRequest | Action::PasswordType | Action::PasswordForget => {
+                self.overlay = None;
+                if let Some(h) = &self.handle {
+                    info!(?action, "lent password");
+                    match action {
+                        Action::PasswordRequest => h.request_credential(),
+                        Action::PasswordType => h.type_credential(),
+                        _ => h.forget_credential(),
+                    }
                 }
             }
             Action::ToggleFullscreen => {
@@ -1502,6 +1519,11 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 self.streamed_fps = Some(status.fps);
             }
+            UserEvent::Credential(event) => {
+                info!(%event, "lent password");
+                let (text, error) = credential_notice(event);
+                self.notify(text, error);
+            }
             // A failed attempt leaves the session where it was: relayed.
             UserEvent::Path(protocol::e2e::Path::DirectFailed) => {}
             UserEvent::Path(path) => self.path = path,
@@ -1543,6 +1565,28 @@ impl ApplicationHandler<UserEvent> for App {
             self.window_title = title;
         }
         self.request_redraw();
+    }
+}
+
+/// What to tell the technician about the password the remote user lends
+/// them, and whether it is bad news.
+fn credential_notice(event: CredentialEvent) -> (&'static str, bool) {
+    match event {
+        CredentialEvent::Requested => ("Asking the user for a password...", false),
+        CredentialEvent::Stored => (
+            "The user typed a password. It stays on their computer until the last \
+             session ends: use Password > Type the password.",
+            false,
+        ),
+        CredentialEvent::Declined => ("The user did not give a password.", true),
+        CredentialEvent::Unavailable => (
+            "Cannot ask for a password: nobody is at the remote desktop, or the server \
+             cannot audit it.",
+            true,
+        ),
+        CredentialEvent::Typed => ("Password typed.", false),
+        CredentialEvent::Forgotten => ("Password forgotten.", false),
+        CredentialEvent::NotStored => ("No password is stored: ask the user first.", true),
     }
 }
 

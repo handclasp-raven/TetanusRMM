@@ -11,7 +11,8 @@
 //!  │ - updates                    │◀─────▶│ - capture + encode          │
 //!  │ - consent decisions          │ pipe  │ - clipboard                 │
 //!  │ - supervises the helpers     │       │ - consent prompt, toasts    │
-//!  │ - Ctrl+Alt+Del               │       └─────────────────────────────┘
+//!  │ - Ctrl+Alt+Del               │       │ - lent-password prompt      │
+//!  │ - keeps the lent password    │       └─────────────────────────────┘
 //!  │                              │ spawn ┌─────────────────────────────┐
 //!  │                              │──────▶│ rmm-agent.exe system-helper │
 //!  │                              │◀─────▶│ runs as SYSTEM, no windows  │
@@ -40,6 +41,7 @@ pub mod capture_test;
 pub mod clipboard;
 pub mod conpty;
 pub mod consent;
+pub mod credential;
 pub mod desktop;
 pub mod encoder;
 pub mod gdi;
@@ -50,6 +52,7 @@ pub mod local;
 pub mod pipe;
 pub mod process;
 pub mod sas;
+pub mod secret;
 pub mod service;
 pub mod stream;
 pub mod system_helper;
