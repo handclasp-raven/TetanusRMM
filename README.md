@@ -39,6 +39,16 @@ bash install.sh --host rmm.example.com
 > [!NOTE]
 >Open ports 8443/tcp, 4433/udp, 4433/tcp and 3478/udp. The script prints the admin's TOTP secret once, so add it to an authenticator app before closing the terminal. Then send staff to `https://<host>:8443/install` and [enroll an agent](https://github.com/handclasp-raven/TetanusRMM/wiki/Enrolling-an-Agent).
 
+## 📥 Updating
+The script installs the newest release: a server image from `ghcr.io/handclasp-raven/tetanusrmm` and the agent, viewer and TUI builds from the [releases page](https://github.com/handclasp-raven/TetanusRMM/releases). Nothing is compiled on the host. To upgrade later, run this in the install directory; it backs the database up to `backups/` first:
+
+```bash
+bash scripts/install.sh --upgrade
+```
+
+See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/Installing-the-Server) for options and the manual steps.
+
+
 
 ## 💎 Features
 -  **TUI Built with Textual (so you know it's good):** Fast, keyboard shortcuts for everything, built in themes and a theme editor.
@@ -79,14 +89,6 @@ You get remote desktop (screen, input, clipboard) and file transfer, running as 
 
 > [!IMPORTANT]
 > Windows only. UAC prompts and the lock screen cannot be seen or controlled. With the installer's own CA the user's browser warns about the page's certificate, and Windows SmartScreen warns about the unsigned program; a publicly trusted certificate on the API and a code-signing certificate remove those warnings.
-
-The script installs the newest release: a server image from `ghcr.io/handclasp-raven/tetanusrmm` and the agent, viewer and TUI builds from the [releases page](https://github.com/handclasp-raven/TetanusRMM/releases). Nothing is compiled on the host. To upgrade later, run this in the install directory; it backs the database up to `backups/` first:
-
-```bash
-bash scripts/install.sh --upgrade
-```
-
-See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/Installing-the-Server) for options and the manual steps.
 
 
 ## 📚 Documentation
