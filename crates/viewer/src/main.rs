@@ -2,8 +2,8 @@
 //! short-lived viewer-session token, shows the agent's screen, and sends
 //! mouse and keyboard input and clipboard changes to it.
 //!
-//! Around the picture: a toolbar (display mode, monitor, refresh, full
-//! screen, the side panel, disconnect) and a side panel with the agent's
+//! Around the picture: a toolbar (display mode, monitor, refresh,
+//! Ctrl+Alt+Del, full screen, the side panel, disconnect) and a side panel with the agent's
 //! status, command buttons and file transfer (see `viewer::ui`). The panel
 //! uses the server's HTTPS API as the signed-in technician; the TUI passes
 //! the API address and its session token (`RMM_API_TOKEN`, never on the
@@ -12,8 +12,11 @@
 //! Every key goes to the remote machine except these viewer shortcuts, all
 //! with Ctrl+Alt+Shift held: M opens the monitor menu, 1-9 picks a monitor,
 //! P shows or hides the panel, F toggles full screen, - and + make the
-//! controls' text smaller or larger, F5 asks for a fresh keyframe, Q quits. While a menu or dialog is open, keys go to it (Esc
-//! closes it; in the monitor menu 1-9 pick).
+//! controls' text smaller or larger, F5 asks for a fresh keyframe, Del
+//! presses Ctrl+Alt+Del on the remote machine (for its logon and lock
+//! screens; the technician's own Ctrl+Alt+Del never reaches the viewer),
+//! Q quits. While a menu or dialog is open, keys go to it (Esc closes it;
+//! in the monitor menu 1-9 pick).
 //!
 //! The FPS menu sets how many frames a second this technician wants (the
 //! agent streams at the fastest any technician watching wants); "Auto"
@@ -1036,6 +1039,7 @@ impl App {
             KeyCode::KeyF => self.act(event_loop, Action::ToggleFullscreen),
             KeyCode::KeyQ => event_loop.exit(),
             KeyCode::F5 => self.act(event_loop, Action::Keyframe),
+            KeyCode::Delete => self.act(event_loop, Action::SecureAttention),
             _ => match keymap::scancode(code).and_then(|s| (0x02..=0x0A).contains(&s).then_some(s))
             {
                 // Digit1..Digit9 have scancodes 0x02..0x0A.
@@ -1134,6 +1138,12 @@ impl App {
             Action::Keyframe => {
                 if let Some(h) = &self.handle {
                     h.request_keyframe();
+                }
+            }
+            Action::SecureAttention => {
+                if let Some(h) = &self.handle {
+                    info!("sending Ctrl+Alt+Del");
+                    h.send_secure_attention();
                 }
             }
             Action::ToggleFullscreen => {

@@ -25,7 +25,7 @@ pub fn run(monitor: u32, seconds: u64, out: &Path, fps: u32, bitrate: u32) -> an
             if m.primary { " primary" } else { "" }
         );
     }
-    let mut dup = ScreenCapture::new(monitor).context("starting screen capture")?;
+    let mut dup = ScreenCapture::new(monitor, true).context("starting screen capture")?;
     let (w, h) = (dup.frame().width, dup.frame().height);
     let mut enc = H264Encoder::new(w, h, fps, bitrate).context("creating encoder")?;
     println!(

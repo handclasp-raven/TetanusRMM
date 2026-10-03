@@ -165,6 +165,8 @@ pub enum Action {
     SetDisplay(DisplayMode),
     SelectMonitor(u32),
     Keyframe,
+    /// Ctrl+Alt+Del on the remote machine.
+    SecureAttention,
     ToggleFullscreen,
     TogglePanel,
     Disconnect,
@@ -638,6 +640,7 @@ impl Chrome<'_> {
             &mut buttons,
         );
         add_left("Refresh", Action::Keyframe, false, &mut buttons);
+        add_left("Ctrl+Alt+Del", Action::SecureAttention, false, &mut buttons);
         let fullscreen = if t.fullscreen {
             "Exit full screen"
         } else {
@@ -1455,7 +1458,7 @@ mod tests {
     #[test]
     fn toolbar_offers_display_monitor_and_session_controls() {
         let f = Fixture::new();
-        let chrome = f.chrome(1600, 900);
+        let chrome = f.chrome(1800, 900);
         let buttons = chrome.toolbar_buttons();
         let labels: Vec<&str> = buttons.iter().map(|b| b.label.as_str()).collect();
         assert_eq!(
@@ -1466,14 +1469,15 @@ mod tests {
                 "Monitor 2 of 2",
                 "Text: 16",
                 "Refresh",
+                "Ctrl+Alt+Del",
                 "Full screen",
                 "Disconnect",
                 "Panel"
             ]
         );
-        assert!(buttons[..4].iter().all(|b| b.dropdown) && buttons[7].active);
+        assert!(buttons[..4].iter().all(|b| b.dropdown) && buttons[8].active);
         // Disconnect sits at the right edge.
-        assert_eq!(buttons[6].rect.right(), 1600 - M.gap);
+        assert_eq!(buttons[7].rect.right(), 1800 - M.gap);
         assert_eq!(
             chrome.hit(centre(buttons[0].rect)),
             Hit::Action(Action::DisplayMenu)
@@ -1483,7 +1487,11 @@ mod tests {
             Hit::Action(Action::FrameRateMenu)
         );
         assert_eq!(
-            chrome.hit(centre(buttons[6].rect)),
+            chrome.hit(centre(buttons[5].rect)),
+            Hit::Action(Action::SecureAttention)
+        );
+        assert_eq!(
+            chrome.hit(centre(buttons[7].rect)),
             Hit::Action(Action::Disconnect)
         );
         assert_eq!(chrome.hit((800.0, 500.0)), Hit::Desktop);

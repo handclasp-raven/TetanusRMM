@@ -1,16 +1,19 @@
-//! Input injection on the user's desktop (the session-0 service cannot
-//! inject there). The input helper uses this as SYSTEM, so input reaches
-//! elevated windows; the session helper uses it as a fallback.
+//! Input injection on the desktop the calling thread is attached to (the
+//! session-0 service cannot inject into a user's session). The system
+//! helper uses this as SYSTEM, so input reaches elevated windows and,
+//! since its thread follows the input desktop (see `super::desktop`), the
+//! logon screen, the lock screen and UAC prompts; the session helper uses
+//! it as a fallback.
 //!
 //! Both helpers are per-monitor DPI aware (see `helper::run`), so the virtual
 //! desktop metrics are in physical pixels, the same space DXGI reports
 //! monitor positions in and the viewer's coordinates are based on. Mapping
 //! is in `crate::input` so it is tested on every platform.
 //!
-//! Limits (Phase 9 territory): injection does not reach the secure desktop
-//! (UAC prompts, the lock and login screens). From the session helper,
-//! which runs at the user's integrity level, Windows (UIPI) also drops
-//! input aimed at elevated windows.
+//! Limits: from the session helper, which runs as the user on their own
+//! desktop, injection does not reach the secure desktop, and Windows
+//! (UIPI) drops input aimed at elevated windows. Ctrl+Alt+Del cannot be
+//! injected by anyone this way (see `super::sas`).
 
 use std::time::{Duration, Instant};
 
@@ -43,12 +46,14 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn inject(&mut self, event: InputEvent) {
+    /// Inject `event`. `false` if Windows did not take it: this thread is
+    /// not on the desktop receiving input.
+    pub fn inject(&mut self, event: InputEvent) -> bool {
         let inputs = match event {
             InputEvent::MouseMove { monitor, x, y } => {
                 let Some(m) = self.monitor(monitor) else {
                     debug!(monitor, "pointer move for an unknown monitor");
-                    return;
+                    return true;
                 };
                 let (nx, ny) = absolute(monitor_pixel(&m, x, y), virtual_desktop());
                 vec![mouse(
@@ -95,18 +100,20 @@ impl Injector {
             }
         };
         if inputs.is_empty() {
-            return;
+            return true;
         }
         // SAFETY: `inputs` is a valid slice of initialised INPUT structs.
         let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent as usize != inputs.len() {
-            // Typically the secure desktop (UAC, lock screen) is active.
-            warn!(
+            // Typically another desktop (UAC, lock screen) is active.
+            debug!(
                 ?event,
                 error = %windows::core::Error::from_thread(),
                 "SendInput was blocked"
             );
+            return false;
         }
+        true
     }
 
     /// The monitor with `id`, refreshing the cached layout when it is stale

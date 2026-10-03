@@ -88,7 +88,7 @@ To help someone whose computer has no agent, once:
 You get remote desktop (screen, input, clipboard) and file transfer, running as the user. There is no shell, no scripts and no command buttons, for admins too. Only the technician who made the code, and admins, can use the session. While the program stays open the machine is in the agent table, so a closed viewer can be reopened with `d`; the server forgets the machine two minutes after the program is closed. Codes, their use and the end of each session are in the audit log (`assist.create`, `assist.redeem`, `assist.end`).
 
 > [!IMPORTANT]
-> Windows only. UAC prompts and the lock screen cannot be seen or controlled. With the installer's own CA the user's browser warns about the page's certificate, and Windows SmartScreen warns about the unsigned program; a publicly trusted certificate on the API and a code-signing certificate remove those warnings.
+> Windows only. UAC prompts, the lock screen and Ctrl+Alt+Del cannot be seen or controlled (an installed agent can: it runs a service). With the installer's own CA the user's browser warns about the page's certificate, and Windows SmartScreen warns about the unsigned program; a publicly trusted certificate on the API and a code-signing certificate remove those warnings.
 
 
 ## 📚 Documentation

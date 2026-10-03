@@ -79,6 +79,10 @@ pub enum Control {
     /// Agent -> viewer: how the video is streamed now. Only to viewers
     /// that sent `StreamSettings` (older viewers do not know this record).
     StreamStatus(StreamStatus),
+    /// Viewer -> agent: press Ctrl+Alt+Del on the remote machine (the
+    /// secure attention sequence, which cannot be sent as key events).
+    /// Older agents do not know this record and skip it.
+    SecureAttention,
 }
 
 /// A video key. Keys change when a viewer leaves, so a departed viewer

@@ -735,6 +735,19 @@ impl AgentSession {
                     }
                     Inbound::Record {
                         session_id,
+                        record: Control::SecureAttention,
+                    } => {
+                        let active = lock(&sessions).is_active(session_id);
+                        match &self.desktop {
+                            Some(desktop) if active => {
+                                info!(session_id, "Ctrl+Alt+Del requested");
+                                let _ = desktop.commands.send(DesktopCommand::SecureAttention);
+                            }
+                            _ => debug!(session_id, "Ctrl+Alt+Del for an inactive session dropped"),
+                        }
+                    }
+                    Inbound::Record {
+                        session_id,
                         record: Control::Clipboard(data),
                     } => {
                         let active = lock(&sessions).is_active(session_id);

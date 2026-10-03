@@ -21,7 +21,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use super::bridge::Bridge;
-use super::{acl, pipe, process};
+use super::{acl, desktop, pipe, process};
 use crate::core::{self, CoreOptions};
 use crate::credstore::{Credential, CredentialStore};
 use crate::enroll::{self, EnrollRequest};
@@ -312,9 +312,13 @@ async fn service_body(
     let pids = pipe::HelperPids::default();
     // Screen streaming: the core talks to the helper through the bridge.
     let (media_link, media_source) = media_channel();
-    // Consent, input and clipboard: likewise, through the helper. A user is
-    // "present" (to be asked or told) when someone is logged on at the console.
-    let (desktop_link, desktop_end) = desktop_channel(|| process::console_user_session().is_some());
+    // Consent, input and clipboard: likewise, through the helpers. A user is
+    // "present" (to be asked or told) when someone is logged on at the
+    // console and can see their desktop: on the lock screen there is no
+    // prompt or toast to see.
+    let (desktop_link, desktop_end) = desktop_channel(|| {
+        process::console_user_session().is_some_and(|session| !desktop::session_locked(session))
+    });
     let bridge = Bridge::start(media_source, desktop_end);
     tokio::spawn({
         let pids = pids.clone();
@@ -327,7 +331,7 @@ async fn service_body(
     let (stop_helper_tx, stop_helper_rx) = watch::channel(false);
     let supervisors = [
         (HelperKind::Session, pids.helper),
-        (HelperKind::Input, pids.input),
+        (HelperKind::System, pids.system),
     ]
     .map(|(kind, pid)| {
         tokio::spawn(supervise_helper(
@@ -397,36 +401,46 @@ async fn obtain_credential(state_dir: &Path) -> anyhow::Result<Credential> {
     }
 }
 
-/// The processes the service keeps running in the console user's session.
+/// The processes the service keeps running in the console session.
 #[derive(Debug, Clone, Copy)]
 enum HelperKind {
     /// Tray, prompts, clipboard and capture, as the user.
     Session,
-    /// Input injection, as SYSTEM, so it reaches elevated windows.
-    Input,
+    /// Input injection, and capture of the secure desktop, as SYSTEM.
+    System,
 }
 
 impl HelperKind {
     fn name(self) -> &'static str {
         match self {
             Self::Session => "helper",
-            Self::Input => "input helper",
+            Self::System => "system helper",
+        }
+    }
+
+    /// The session this helper should be running in now, if any. The
+    /// session helper needs a logged-on user to run as; the system helper
+    /// also serves the logon screen.
+    fn session(self) -> Option<u32> {
+        match self {
+            Self::Session => process::console_user_session(),
+            Self::System => process::console_session(),
         }
     }
 
     fn spawn(self, session_id: u32, exe: &Path) -> windows::core::Result<process::HelperProcess> {
         match self {
             Self::Session => process::spawn_in_session(session_id, exe, "helper"),
-            Self::Input => process::spawn_system_in_session(
+            Self::System => process::spawn_system_in_session(
                 session_id,
                 exe,
-                &format!("input-helper --service-pid {}", std::process::id()),
+                &format!("system-helper --service-pid {}", std::process::id()),
             ),
         }
     }
 }
 
-/// Keep a helper of `kind` running in the console user's session (see
+/// Keep a helper of `kind` running in the console session (see
 /// [`crate::session`]). Terminates it when told to stop.
 async fn supervise_helper(
     kind: HelperKind,
@@ -446,7 +460,7 @@ async fn supervise_helper(
             helper = None;
             helper_pid.store(0, Ordering::SeqCst);
         }
-        let console = process::console_user_session();
+        let console = kind.session();
         match supervisor.poll(now, console, running) {
             Action::Idle => {}
             Action::Spawn { session_id } => match kind.spawn(session_id, &exe) {
@@ -472,11 +486,14 @@ async fn supervise_helper(
                     info!(
                         pid = h.pid,
                         session_id = h.session_id,
-                        "console user changed; stopping {name}"
+                        "console session changed; stopping {name}"
                     );
                     h.terminate();
                     helper_pid.store(0, Ordering::SeqCst);
                 }
+                // Start one in the new console session now, not at the
+                // next poll: a technician may be watching the switch.
+                continue;
             }
         }
         tokio::select! {

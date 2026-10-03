@@ -195,6 +195,8 @@ pub enum DesktopCommand {
     Technicians(Vec<String>),
     Input(InputEvent),
     SetClipboard(ClipboardData),
+    /// Ctrl+Alt+Del, which cannot be injected as key events.
+    SecureAttention,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +211,8 @@ pub enum DesktopEvent {
 pub struct DesktopLink {
     pub commands: mpsc::UnboundedSender<DesktopCommand>,
     pub events: Mutex<mpsc::UnboundedReceiver<DesktopEvent>>,
-    /// Whether a user is logged on (to be asked, or told).
+    /// Whether a user is logged on and at an unlocked screen (to be
+    /// asked, or told).
     pub user_present: Box<dyn Fn() -> bool + Send + Sync>,
 }
 

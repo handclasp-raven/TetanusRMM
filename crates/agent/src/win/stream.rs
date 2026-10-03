@@ -1,5 +1,7 @@
-//! The helper's capture worker: screen capture + Media Foundation encode on a
-//! dedicated thread, driven by commands from the service.
+//! A helper's capture worker: screen capture + Media Foundation encode on a
+//! dedicated thread, driven by commands from the service. The session
+//! helper has one for the user's desktop, the system helper one for the
+//! secure desktop ([`Desktops`]).
 //!
 //! Idle (no viewers) it only waits for a command. Streaming, it waits for the
 //! screen to change, encodes at most the frame rate it was given
@@ -24,6 +26,7 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{info, warn};
 
 use super::capture::{self, CaptureError, Captured, ScreenCapture};
+use super::desktop::Follower;
 use super::encoder::H264Encoder;
 use crate::media::pace::{encoder_bitrate, Pacer, ENCODER_FPS};
 use crate::media::rate::{max_bitrate_at, DEFAULT_FPS};
@@ -49,12 +52,31 @@ pub enum WorkerCommand {
     SetFrameRate(u32),
 }
 
+/// Which desktops a worker captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Desktops {
+    /// The one its process was started on: the session helper, on the
+    /// user's desktop.
+    Own,
+    /// Whichever is on screen, the secure desktop included: the system
+    /// helper. The worker's thread follows the input desktop (see
+    /// `super::desktop`).
+    Input,
+}
+
 /// Start the worker thread. Frames and monitor lists go to `out`.
-pub fn spawn(out: mpsc::Sender<IpcMessage>) -> std_mpsc::Sender<WorkerCommand> {
+pub fn spawn(out: mpsc::Sender<IpcMessage>, desktops: Desktops) -> std_mpsc::Sender<WorkerCommand> {
     let (tx, rx) = std_mpsc::channel();
     std::thread::Builder::new()
         .name("capture".into())
-        .spawn(move || Worker { out, commands: rx }.run())
+        .spawn(move || {
+            Worker {
+                out,
+                commands: rx,
+                desktops,
+            }
+            .run()
+        })
         .expect("spawn capture thread");
     tx
 }
@@ -81,8 +103,13 @@ struct Stream {
 }
 
 impl Stream {
-    fn open(monitor: u32, fps: u32, target: Option<u32>) -> Result<Self, CaptureError> {
-        let capture = ScreenCapture::new(monitor)?;
+    fn open(
+        monitor: u32,
+        fps: u32,
+        target: Option<u32>,
+        desktops: Desktops,
+    ) -> Result<Self, CaptureError> {
+        let capture = ScreenCapture::new(monitor, desktops == Desktops::Own)?;
         let (w, h) = (capture.frame().width, capture.frame().height);
         // No frame rate measured yet: the first frame (a keyframe) gets a
         // generous budget.
@@ -192,6 +219,7 @@ impl Stats {
 struct Worker {
     out: mpsc::Sender<IpcMessage>,
     commands: std_mpsc::Receiver<WorkerCommand>,
+    desktops: Desktops,
 }
 
 impl Worker {
@@ -210,6 +238,7 @@ impl Worker {
         // Adaptive-bitrate target from the service, if it lowered it.
         let mut target: Option<u32> = None;
         let mut fps = DEFAULT_FPS;
+        let mut follower = Follower::default();
         loop {
             let frame_interval = Duration::from_secs(1) / fps;
             // Idle: block until told what to do. Streaming: just drain.
@@ -279,9 +308,21 @@ impl Worker {
             }
             let Some(monitor) = wanted else { continue };
 
+            if stream.is_none() && self.desktops == Desktops::Input {
+                // Nothing of the last capture is left on this thread, so
+                // it can move to the desktop that is on screen now.
+                match follower.follow() {
+                    Ok(desktop) => tracing::debug!(desktop, "capturing the input desktop"),
+                    Err(e) => {
+                        warn!("cannot reach the input desktop, retrying: {e}");
+                        std::thread::sleep(RETRY);
+                        continue;
+                    }
+                }
+            }
             let s = match &mut stream {
                 Some(s) => s,
-                None => match Stream::open(monitor, fps, target) {
+                None => match Stream::open(monitor, fps, target, self.desktops) {
                     Ok(s) => stream.insert(s),
                     Err(e) => {
                         warn!(monitor, "cannot start capture, retrying: {e}");

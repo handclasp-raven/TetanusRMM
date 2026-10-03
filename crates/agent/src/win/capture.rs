@@ -163,7 +163,10 @@ pub struct ScreenCapture {
 }
 
 impl ScreenCapture {
-    pub fn new(monitor_id: u32) -> Result<Self, CaptureError> {
+    /// Capture `monitor_id`. `graphics_capture`: use Windows.Graphics.Capture
+    /// where the adapter calls for it. The system helper does not: that
+    /// API is for the user's own desktop, not the secure one.
+    pub fn new(monitor_id: u32, graphics_capture: bool) -> Result<Self, CaptureError> {
         let out = outputs()?
             .into_iter()
             .find(|o| o.info.id == monitor_id)
@@ -196,7 +199,7 @@ impl ScreenCapture {
             let hardware = HARDWARE_GPU_VENDORS.contains(&adapter.VendorId);
             let mut monitor = out.info;
 
-            let graphics = if hardware {
+            let graphics = if hardware || !graphics_capture {
                 None
             } else {
                 match GraphicsCapture::new(&device, out.handle) {

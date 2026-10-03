@@ -1,5 +1,5 @@
 //! Messages on the local named pipe between the agent service (session 0,
-//! SYSTEM) and its helper process in the user's session.
+//! SYSTEM) and its helper processes in the console session.
 //!
 //! Framed with [`crate::framing`] like the network protocol. It carries the
 //! tray status, capture control and frames, and (Phase 6) the consent
@@ -71,6 +71,10 @@ pub enum IpcMessage {
     /// Service to helper: capture at most this many frames a second, from
     /// now on and for streams started later.
     SetFrameRate { fps: u32 },
+    /// System helper to service: which kind of desktop is receiving input
+    /// in its session. `secure` is the logon screen, the lock screen or a
+    /// UAC prompt, which only the system helper can capture.
+    Desktop { secure: bool },
 }
 
 /// An encoded video frame from the helper.
@@ -185,6 +189,7 @@ mod tests {
             IpcMessage::KillSwitch,
             IpcMessage::SetBitrate { bps: 1_500_000 },
             IpcMessage::SetFrameRate { fps: 60 },
+            IpcMessage::Desktop { secure: true },
         ];
         let mut buf = Vec::new();
         for m in &msgs {

@@ -34,11 +34,11 @@ enum Command {
     /// Session helper started by the service in the user's session (internal).
     #[command(hide = true)]
     Helper,
-    /// Input injector started by the service as SYSTEM in the user's
-    /// session (internal).
+    /// Input and secure-desktop capture, started by the service as SYSTEM
+    /// in the console session (internal).
     #[command(hide = true)]
-    InputHelper {
-        /// Only this process may feed it input.
+    SystemHelper {
+        /// Only this process may give it orders.
         #[arg(long)]
         service_pid: u32,
     },
@@ -162,7 +162,7 @@ fn main() -> anyhow::Result<()> {
         // These two set up their own logging (to files) and runtimes.
         Command::Service(ServiceCommand::Run) => service_run(),
         Command::Helper => helper(),
-        Command::InputHelper { service_pid } => input_helper(service_pid),
+        Command::SystemHelper { service_pid } => system_helper(service_pid),
         Command::CaptureTest {
             monitor,
             seconds,
@@ -182,7 +182,7 @@ async fn console(command: Command) -> anyhow::Result<()> {
         Command::Enroll(args) => enroll(args).await,
         Command::Run(args) => run(args).await,
         Command::Service(command) => service(command),
-        Command::Helper | Command::InputHelper { .. } | Command::CaptureTest { .. } => {
+        Command::Helper | Command::SystemHelper { .. } | Command::CaptureTest { .. } => {
             unreachable!()
         }
     }
@@ -290,8 +290,8 @@ fn helper() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn input_helper(service_pid: u32) -> anyhow::Result<()> {
-    agent::win::input_helper::run(service_pid)
+fn system_helper(service_pid: u32) -> anyhow::Result<()> {
+    agent::win::system_helper::run(service_pid)
 }
 
 #[cfg(windows)]
@@ -327,8 +327,8 @@ fn helper() -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn input_helper(_service_pid: u32) -> anyhow::Result<()> {
-    bail!("the input helper is only available on Windows")
+fn system_helper(_service_pid: u32) -> anyhow::Result<()> {
+    bail!("the system helper is only available on Windows")
 }
 
 #[cfg(test)]

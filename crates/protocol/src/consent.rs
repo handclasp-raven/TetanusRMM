@@ -12,6 +12,9 @@
 //! | `require` | prompt: `granted` / `denied` / `timeout` | `on_no_user`: `deny` -> `consent_unavailable`, `allow` -> `bypassed_no_user` |
 //! | `notify` | `notify` (toast) | `notify_no_user` |
 //! | `unattended` | `unattended` (silent) | `unattended` |
+//!
+//! A user who is logged on but whose screen is locked cannot see a prompt
+//! or a toast, so the agent counts a locked console as "no user".
 
 use serde::{Deserialize, Serialize};
 

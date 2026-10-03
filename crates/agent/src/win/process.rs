@@ -1,5 +1,6 @@
-//! Finding the logged-on console user and starting the helpers in their
-//! session: the session helper as the user, the input helper as SYSTEM.
+//! Finding the console session and its logged-on user, and starting the
+//! helpers there: the session helper as the user, the system helper as
+//! SYSTEM.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -44,16 +45,20 @@ fn user_token(session_id: u32) -> windows::core::Result<OwnedHandle> {
     Ok(OwnedHandle(token))
 }
 
+/// The session attached to the physical console, whether or not anyone is
+/// logged on to it (at the logon screen, nobody is).
+pub fn console_session() -> Option<u32> {
+    // SAFETY: no arguments; always safe to call.
+    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    (session_id != NO_CONSOLE_SESSION).then_some(session_id)
+}
+
 /// The console session, if a user is logged on to it.
 ///
 /// A console session exists even at the logon screen, so the session id
 /// alone is not enough: we also need a user token for it.
 pub fn console_user_session() -> Option<u32> {
-    // SAFETY: no arguments; always safe to call.
-    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
-    if session_id == NO_CONSOLE_SESSION {
-        return None;
-    }
+    let session_id = console_session()?;
     user_token(session_id).ok().map(|_| session_id)
 }
 
@@ -115,7 +120,7 @@ impl Drop for EnvironmentBlock {
 /// It runs with the *user's* token rather than SYSTEM's. That is what a
 /// process on the user's desktop should have, and it keeps a compromised
 /// helper from being a SYSTEM process in an unprivileged session. Only the
-/// input helper, which has no windows, runs as SYSTEM (see
+/// system helper, which has no windows, runs as SYSTEM (see
 /// [`spawn_system_in_session`]).
 pub fn spawn_in_session(
     session_id: u32,
@@ -133,13 +138,14 @@ pub fn spawn_in_session(
 }
 
 /// Start `exe args` as SYSTEM, but in `session_id` on its interactive
-/// desktop, suspended like [`spawn_in_session`].
+/// desktop, suspended like [`spawn_in_session`]. Nobody need be logged on
+/// to the session.
 ///
-/// This is for the input helper. Windows drops input from a lower
+/// This is for the system helper. Windows drops input from a lower
 /// integrity level aimed at a higher one (UIPI), so a helper running as the
-/// user cannot type into elevated windows; one running as SYSTEM can.
-/// Moving a token to another session needs SE_TCB_NAME, which LocalSystem
-/// has.
+/// user cannot type into elevated windows; one running as SYSTEM can, and
+/// can move on to the secure desktop (see `super::desktop`). Moving a
+/// token to another session needs SE_TCB_NAME, which LocalSystem has.
 pub fn spawn_system_in_session(
     session_id: u32,
     exe: &Path,

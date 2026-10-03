@@ -35,6 +35,7 @@ enum Seen {
     Technicians(Vec<String>),
     Input(InputEvent),
     SetClipboard(ClipboardData),
+    SecureAttention,
 }
 
 struct FakeDesktop {
@@ -120,6 +121,7 @@ fn run_desktop(mut end: DesktopEnd, fake: Arc<FakeDesktop>) {
                 DesktopCommand::Technicians(list) => Seen::Technicians(list),
                 DesktopCommand::Input(event) => Seen::Input(event),
                 DesktopCommand::SetClipboard(data) => Seen::SetClipboard(data),
+                DesktopCommand::SecureAttention => Seen::SecureAttention,
             };
             fake.seen.lock().unwrap().push(seen);
         }

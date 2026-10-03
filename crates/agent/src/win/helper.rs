@@ -49,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::clipboard::Listener;
 use super::indicator::Indicator;
 use super::input::Injector;
-use super::stream::{self, WorkerCommand};
+use super::stream::{self, Desktops, WorkerCommand};
 use super::{consent, toast};
 use crate::core;
 use crate::interactive::indicator_text;
@@ -200,7 +200,7 @@ impl DesktopCommands {
         Self {
             injector: Injector::default(),
             prompts: HashMap::new(),
-            worker: stream::spawn(out),
+            worker: stream::spawn(out, Desktops::Own),
             ui,
             ctl,
         }
@@ -220,7 +220,9 @@ impl DesktopCommands {
                 return true;
             }
             IpcMessage::Input(event) => {
-                self.injector.inject(event);
+                if !self.injector.inject(event) {
+                    warn!(?event, "input was blocked (secure desktop?)");
+                }
                 return true;
             }
             IpcMessage::SetClipboard(data) => {

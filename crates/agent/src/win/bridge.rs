@@ -1,7 +1,7 @@
 //! Service side: connects the agent core's media and desktop links to
-//! whichever helper is currently attached over the pipe.
+//! whichever helpers are currently attached over the pipe.
 //!
-//! The helper can come and go (logon, logoff, crash, update) independently
+//! The helpers can come and go (logon, logoff, crash, update) independently
 //! of the server connection. The bridge remembers what the server wants
 //! (which monitor, or nothing) and who is connected (the tray list), and
 //! replays both (and any adaptive-bitrate target) to each newly attached
@@ -9,8 +9,16 @@
 //! prompt that cannot reach a helper, or whose helper goes away, is
 //! answered `Unavailable`.
 //!
-//! Input goes to the input helper (SYSTEM, so it reaches elevated windows)
-//! when one is attached, and to the session helper otherwise.
+//! One helper at a time captures the screen: the session helper on the
+//! user's desktop, the system helper on the secure desktop (the logon
+//! screen, the lock screen, UAC prompts) and when nobody is logged on (see
+//! [`capturer`]). The system helper reports which desktop is showing, and
+//! the stream moves between them as it changes; each starts with a
+//! keyframe, so viewers follow.
+//!
+//! Input goes to the system helper (SYSTEM, so it reaches elevated windows
+//! and the secure desktop) when one is attached, and to the session helper
+//! otherwise.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,14 +29,22 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use super::sas;
 use crate::interactive::{DesktopCommand, DesktopEnd, DesktopEvent};
 use crate::media::source::{MediaCommand, MediaEvent, MediaSourceEnd};
+use crate::session::{capturer, HelperRole};
 
 #[derive(Default)]
 struct State {
+    /// The session helper, if attached.
     helper: Option<mpsc::UnboundedSender<IpcMessage>>,
-    /// The input helper, if attached.
-    injector: Option<mpsc::UnboundedSender<IpcMessage>>,
+    /// The system helper, if attached.
+    system: Option<mpsc::UnboundedSender<IpcMessage>>,
+    /// The secure desktop is showing (says the system helper).
+    secure: bool,
+    /// The helper capturing the screen: the only one sent capture
+    /// commands, and the only one whose frames are passed on.
+    capturer: Option<HelperRole>,
     monitor: Option<u32>,
     /// Adaptive-bitrate target, if lowered (cleared by a stop).
     bitrate: Option<u32>,
@@ -41,6 +57,57 @@ struct State {
     technicians: Vec<String>,
     /// Consent prompts on screen, by request id.
     prompts: HashMap<u64, oneshot::Sender<PromptAnswer>>,
+}
+
+impl State {
+    fn helper(&self, role: HelperRole) -> Option<&mpsc::UnboundedSender<IpcMessage>> {
+        match role {
+            HelperRole::User => self.helper.as_ref(),
+            HelperRole::System => self.system.as_ref(),
+        }
+    }
+
+    /// The helper capturing the screen, if any can.
+    fn capturing(&self) -> Option<&mpsc::UnboundedSender<IpcMessage>> {
+        self.capturer.and_then(|role| self.helper(role))
+    }
+
+    /// A helper in `role` attached. If that role was capturing, this is
+    /// its replacement and knows nothing yet.
+    fn attached(&mut self, role: HelperRole) {
+        if self.capturer == Some(role) {
+            self.capturer = None;
+        }
+        self.assign();
+    }
+
+    /// Work out again which helper captures. If that changed, stop the
+    /// one that was and bring the other up to date with what the server
+    /// wants.
+    fn assign(&mut self) {
+        let next = capturer(self.helper.is_some(), self.system.is_some(), self.secure);
+        if next == self.capturer {
+            return;
+        }
+        if let Some(old) = self.capturing() {
+            let _ = old.send(IpcMessage::StopCapture);
+        }
+        info!(from = ?self.capturer, to = ?next, "screen capture handed over");
+        self.capturer = next;
+        let Some(helper) = self.capturing() else {
+            return;
+        };
+        let _ = helper.send(IpcMessage::ListMonitors);
+        if let Some(bps) = self.bitrate {
+            let _ = helper.send(IpcMessage::SetBitrate { bps });
+        }
+        if let Some(fps) = self.frame_rate {
+            let _ = helper.send(IpcMessage::SetFrameRate { fps });
+        }
+        if let Some(monitor) = self.monitor {
+            let _ = helper.send(IpcMessage::StartCapture { monitor });
+        }
+    }
 }
 
 pub struct Bridge {
@@ -107,10 +174,10 @@ impl Bridge {
                 IpcMessage::SetFrameRate { fps }
             }
         };
-        if let Some(helper) = &state.helper {
+        if let Some(helper) = state.capturing() {
             let _ = helper.send(message);
         } else {
-            debug!(?message, "no helper attached; will replay on attach");
+            debug!(?message, "no helper can capture; will replay when one can");
         }
     }
 
@@ -145,35 +212,33 @@ impl Bridge {
                 IpcMessage::Technicians(list)
             }
             DesktopCommand::Input(event) => {
-                if let Some(injector) = &state.injector {
-                    if injector.send(IpcMessage::Input(event)).is_ok() {
+                if let Some(system) = &state.system {
+                    if system.send(IpcMessage::Input(event)).is_ok() {
                         return;
                     }
                 }
                 IpcMessage::Input(event)
             }
             DesktopCommand::SetClipboard(data) => IpcMessage::SetClipboard(data),
+            DesktopCommand::SecureAttention => {
+                // Not a helper's job: only a service may (see `sas`). It
+                // touches the registry, so not on this thread.
+                std::thread::spawn(sas::send);
+                return;
+            }
         };
         if let Some(helper) = &state.helper {
             let _ = helper.send(message);
         }
     }
 
-    /// A helper connected: route commands to it and replay the current state.
+    /// The session helper connected: route commands to it and replay the
+    /// current state.
     pub fn attach(&self, helper: mpsc::UnboundedSender<IpcMessage>) {
         let mut state = self.state();
-        let _ = helper.send(IpcMessage::ListMonitors);
-        if let Some(bps) = state.bitrate {
-            let _ = helper.send(IpcMessage::SetBitrate { bps });
-        }
-        if let Some(fps) = state.frame_rate {
-            let _ = helper.send(IpcMessage::SetFrameRate { fps });
-        }
-        if let Some(monitor) = state.monitor {
-            let _ = helper.send(IpcMessage::StartCapture { monitor });
-        }
         let _ = helper.send(IpcMessage::Technicians(state.technicians.clone()));
         state.helper = Some(helper);
+        state.attached(HelperRole::User);
     }
 
     /// `helper` disconnected. Ignored if another helper has attached since.
@@ -187,6 +252,7 @@ impl Bridge {
             return;
         }
         state.helper = None;
+        state.assign();
         // Their prompts went with the helper.
         for (request_id, reply) in state.prompts.drain() {
             info!(request_id, "helper gone while a consent prompt was open");
@@ -194,26 +260,52 @@ impl Bridge {
         }
     }
 
-    /// An input helper connected: input goes to it from now on.
-    pub fn attach_injector(&self, injector: mpsc::UnboundedSender<IpcMessage>) {
-        self.state().injector = Some(injector);
+    /// The system helper connected: input goes to it from now on, and it
+    /// captures whenever the session helper cannot.
+    pub fn attach_system(&self, system: mpsc::UnboundedSender<IpcMessage>) {
+        let mut state = self.state();
+        state.system = Some(system);
+        // Until it says otherwise.
+        state.secure = false;
+        state.attached(HelperRole::System);
     }
 
-    /// `injector` disconnected: input falls back to the session helper.
-    pub fn detach_injector(&self, injector: &mpsc::UnboundedSender<IpcMessage>) {
+    /// `system` disconnected: input falls back to the session helper.
+    pub fn detach_system(&self, system: &mpsc::UnboundedSender<IpcMessage>) {
         let mut state = self.state();
         if state
-            .injector
+            .system
             .as_ref()
-            .is_some_and(|i| i.same_channel(injector))
+            .is_some_and(|s| s.same_channel(system))
         {
-            state.injector = None;
+            state.system = None;
+            state.secure = false;
+            state.assign();
         }
     }
 
-    /// Something the helper sent.
-    pub async fn from_helper(&self, message: IpcMessage) {
+    /// Something the helper in role `from` sent.
+    pub async fn from_helper(&self, from: HelperRole, message: IpcMessage) {
+        let capturing = self.state().capturer == Some(from);
         match message {
+            IpcMessage::Desktop { secure } if from == HelperRole::System => {
+                let mut state = self.state();
+                if state.secure != secure {
+                    info!(secure, "the desktop on screen changed");
+                    state.secure = secure;
+                    state.assign();
+                }
+            }
+            // From the helper that was capturing until a moment ago.
+            IpcMessage::Monitors(_) | IpcMessage::Frame(_) if !capturing => {}
+            // Only the user's own helper speaks for the user.
+            IpcMessage::ConsentAnswer { .. }
+            | IpcMessage::Clipboard(_)
+            | IpcMessage::KillSwitch
+                if from != HelperRole::User =>
+            {
+                warn!(?from, "ignoring a message only the session helper may send");
+            }
             IpcMessage::Monitors(list) => {
                 let _ = self.events.send(MediaEvent::Monitors(list)).await;
             }
@@ -237,7 +329,7 @@ impl Bridge {
                         let mut state = self.state();
                         if !state.resync_requested {
                             state.resync_requested = true;
-                            if let Some(helper) = &state.helper {
+                            if let Some(helper) = state.capturing() {
                                 let _ = helper.send(IpcMessage::ForceKeyframe);
                             }
                         }
@@ -261,5 +353,149 @@ impl Bridge {
             }
             other => debug!(?other, "ignoring message from helper"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interactive::desktop_channel;
+    use crate::media::source::{media_channel, MediaLink};
+    use protocol::ipc::EncodedFrame;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::time::{timeout, Duration};
+
+    type Helper = UnboundedReceiver<IpcMessage>;
+
+    fn bridge() -> (Arc<Bridge>, MediaLink) {
+        let (media, media_source) = media_channel();
+        let (_desktop, desktop_end) = desktop_channel(|| true);
+        (Bridge::start(media_source, desktop_end), media)
+    }
+
+    fn frame() -> IpcMessage {
+        IpcMessage::Frame(EncodedFrame {
+            monitor: 0,
+            keyframe: true,
+            pts_us: 0,
+            width: 16,
+            height: 16,
+            h264: vec![1],
+        })
+    }
+
+    async fn next(helper: &mut Helper) -> IpcMessage {
+        timeout(Duration::from_secs(5), helper.recv())
+            .await
+            .expect("a message within 5s")
+            .expect("bridge alive")
+    }
+
+    /// Whether a frame from `from` reaches the network side.
+    async fn forwarded(bridge: &Bridge, media: &MediaLink, from: HelperRole) -> bool {
+        bridge.from_helper(from, frame()).await;
+        let mut events = media.events.lock().await;
+        matches!(events.try_recv(), Ok(MediaEvent::Frame(_)))
+    }
+
+    #[tokio::test]
+    async fn capture_moves_to_the_system_helper_on_the_secure_desktop_and_back() {
+        let (bridge, media) = bridge();
+        let (user_tx, mut user) = mpsc::unbounded_channel();
+        let (system_tx, mut system) = mpsc::unbounded_channel();
+        bridge.attach(user_tx);
+        bridge.attach_system(system_tx);
+        assert_eq!(next(&mut user).await, IpcMessage::Technicians(vec![]));
+        assert_eq!(next(&mut user).await, IpcMessage::ListMonitors);
+
+        media
+            .commands
+            .send(MediaCommand::Start { monitor: 1 })
+            .unwrap();
+        assert_eq!(
+            next(&mut user).await,
+            IpcMessage::StartCapture { monitor: 1 }
+        );
+        assert!(forwarded(&bridge, &media, HelperRole::User).await);
+        assert!(!forwarded(&bridge, &media, HelperRole::System).await);
+
+        // The user locks the screen.
+        bridge
+            .from_helper(HelperRole::System, IpcMessage::Desktop { secure: true })
+            .await;
+        assert_eq!(next(&mut user).await, IpcMessage::StopCapture);
+        assert_eq!(next(&mut system).await, IpcMessage::ListMonitors);
+        assert_eq!(
+            next(&mut system).await,
+            IpcMessage::StartCapture { monitor: 1 }
+        );
+        assert!(forwarded(&bridge, &media, HelperRole::System).await);
+        assert!(!forwarded(&bridge, &media, HelperRole::User).await);
+
+        // And unlocks it.
+        bridge
+            .from_helper(HelperRole::System, IpcMessage::Desktop { secure: false })
+            .await;
+        assert_eq!(next(&mut system).await, IpcMessage::StopCapture);
+        assert_eq!(next(&mut user).await, IpcMessage::ListMonitors);
+        assert_eq!(
+            next(&mut user).await,
+            IpcMessage::StartCapture { monitor: 1 }
+        );
+        assert!(forwarded(&bridge, &media, HelperRole::User).await);
+    }
+
+    #[tokio::test]
+    async fn the_system_helper_captures_alone_at_the_logon_screen() {
+        let (bridge, media) = bridge();
+        media
+            .commands
+            .send(MediaCommand::Start { monitor: 0 })
+            .unwrap();
+        // Let the bridge take the command before anything attaches.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (system_tx, mut system) = mpsc::unbounded_channel();
+        bridge.attach_system(system_tx);
+        assert_eq!(next(&mut system).await, IpcMessage::ListMonitors);
+        assert_eq!(
+            next(&mut system).await,
+            IpcMessage::StartCapture { monitor: 0 }
+        );
+        assert!(forwarded(&bridge, &media, HelperRole::System).await);
+
+        // Someone logs on: their helper takes over once their desktop shows.
+        bridge
+            .from_helper(HelperRole::System, IpcMessage::Desktop { secure: true })
+            .await;
+        let (user_tx, mut user) = mpsc::unbounded_channel();
+        bridge.attach(user_tx);
+        assert_eq!(next(&mut user).await, IpcMessage::Technicians(vec![]));
+        assert!(forwarded(&bridge, &media, HelperRole::System).await);
+        bridge
+            .from_helper(HelperRole::System, IpcMessage::Desktop { secure: false })
+            .await;
+        assert_eq!(next(&mut system).await, IpcMessage::StopCapture);
+        assert_eq!(next(&mut user).await, IpcMessage::ListMonitors);
+        assert_eq!(
+            next(&mut user).await,
+            IpcMessage::StartCapture { monitor: 0 }
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_session_helper_speaks_for_the_user() {
+        let (media, media_source) = media_channel();
+        let (desktop, desktop_end) = desktop_channel(|| true);
+        let bridge = Bridge::start(media_source, desktop_end);
+        let _media = media;
+        bridge
+            .from_helper(HelperRole::System, IpcMessage::KillSwitch)
+            .await;
+        bridge
+            .from_helper(HelperRole::User, IpcMessage::KillSwitch)
+            .await;
+        let mut events = desktop.events.lock().await;
+        assert_eq!(events.try_recv(), Ok(DesktopEvent::KillSwitch));
+        assert!(events.try_recv().is_err());
     }
 }

@@ -11,7 +11,8 @@
 //! Input is injected by this process, at whatever integrity level the user
 //! started it with: if they let it elevate, it reaches elevated windows;
 //! the secure desktop (UAC prompts, the lock screen) stays out of reach
-//! either way.
+//! either way, as does Ctrl+Alt+Del: both take a service running as
+//! SYSTEM (see `super::system_helper` and `super::sas`).
 
 use std::sync::{mpsc, Arc};
 
@@ -23,6 +24,7 @@ use super::bridge::Bridge;
 use super::helper::{DesktopCommands, UiEvent};
 use crate::interactive::{desktop_channel, DesktopLink};
 use crate::media::source::{media_channel, MediaLink};
+use crate::session::HelperRole;
 
 /// Frames and monitor lists queued for the bridge (as the helper's queue
 /// for the pipe: if the network side is behind, the worker drops frames).
@@ -75,7 +77,7 @@ pub fn start() -> LocalDesktop {
                 Some(m) = out_rx.recv() => m,
                 else => break,
             };
-            bridge.from_helper(message).await;
+            bridge.from_helper(HelperRole::User, message).await;
         }
     });
 

@@ -352,7 +352,10 @@ impl Peers {
             }
             // Only the viewer sends these; ignore them from it.
             Control::MediaKey(_) | Control::DirectAnswer(_) | Control::StreamStatus(_) => {}
-            record @ (Control::Input(_) | Control::Clipboard(_) | Control::StreamSettings(_)) => {
+            record @ (Control::Input(_)
+            | Control::Clipboard(_)
+            | Control::StreamSettings(_)
+            | Control::SecureAttention) => {
                 let _ = self.inbound.send(Inbound::Record { session_id, record });
             }
         }

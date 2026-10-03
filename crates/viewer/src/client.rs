@@ -188,6 +188,11 @@ impl ViewerHandle {
         self.shared.send_sealed(&Control::Input(event));
     }
 
+    /// Press Ctrl+Alt+Del on the remote machine.
+    pub fn send_secure_attention(&self) {
+        self.shared.send_sealed(&Control::SecureAttention);
+    }
+
     /// Put `data` on the remote clipboard.
     pub fn send_clipboard(&self, data: ClipboardData) {
         self.shared.send_sealed(&Control::Clipboard(data));

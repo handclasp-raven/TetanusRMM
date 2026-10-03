@@ -52,7 +52,10 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 /// - 10: quick assist (appended variant): `AssistEnroll` trades a six-digit
 ///   code for a short-lived certificate (see [`assist`]). Only the quick
 ///   assist client sends it; an older server closes the connection.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// - 11: the logon screen (appended sealed record): viewers may send
+///   `Control::SecureAttention` for Ctrl+Alt+Del. Agents skip sealed
+///   records they do not know, so an older agent just ignores it.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Oldest agent protocol that reports [`AgentStatus`].
 pub const MIN_STATUS_VERSION: u32 = 9;

@@ -1,6 +1,7 @@
-//! Deciding when to (re)start the session helper. Pure logic, no Windows
-//! calls, so it is unit-tested everywhere; `crate::windows::service` feeds it
-//! observations and carries out its actions.
+//! Deciding when to (re)start the helpers, and which of them captures the
+//! screen. Pure logic, no Windows calls, so it is unit-tested everywhere;
+//! `crate::win::service` and `crate::win::bridge` feed it observations and
+//! carry out its actions.
 //!
 //! Why a helper at all: the service runs in session 0, which Windows isolates
 //! from users. Session 0 has its own window station and desktop that nobody
@@ -9,6 +10,10 @@
 //! tray icon. Anything that touches the user's desktop has to run as a
 //! process *inside* the user's session. The service spawns that helper and
 //! keeps it alive.
+//!
+//! The session helper runs as the user, so it needs one logged on. The
+//! system helper runs as SYSTEM and also serves the logon screen, so for it
+//! "a user is logged on" below reads "there is a console session".
 //!
 //! Rules:
 //! - No user logged on at the console: do nothing, and spawn immediately
@@ -157,9 +162,53 @@ impl Supervisor {
     }
 }
 
+/// One of the two helpers in the console session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperRole {
+    /// The session helper, running as the logged-on user.
+    User,
+    /// The system helper, running as SYSTEM.
+    System,
+}
+
+/// Which helper captures the screen, given which are attached and whether
+/// the secure desktop (logon screen, lock screen, UAC prompt) is showing.
+///
+/// The user's helper captures the user's desktop: it runs as the user, so
+/// it is the natural owner, and has the better capture API. It cannot see
+/// the secure desktop, so there the system helper captures, as it does
+/// when nobody is logged on and there is no user helper at all.
+pub fn capturer(user: bool, system: bool, secure: bool) -> Option<HelperRole> {
+    match (user, system, secure) {
+        (_, true, true) => Some(HelperRole::System),
+        (_, false, true) => None,
+        (true, _, false) => Some(HelperRole::User),
+        (false, true, false) => Some(HelperRole::System),
+        (false, false, false) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_system_helper_captures_what_the_user_helper_cannot() {
+        use HelperRole::{System, User};
+        // The user's desktop: the user's helper, whoever else is there.
+        assert_eq!(capturer(true, true, false), Some(User));
+        assert_eq!(capturer(true, false, false), Some(User));
+        // Lock screen or UAC prompt, with a user logged on.
+        assert_eq!(capturer(true, true, true), Some(System));
+        // Logon screen: nobody logged on, so no user helper.
+        assert_eq!(capturer(false, true, true), Some(System));
+        // The user helper is restarting.
+        assert_eq!(capturer(false, true, false), Some(System));
+        // The secure desktop without the system helper: nobody can.
+        assert_eq!(capturer(true, false, true), None);
+        assert_eq!(capturer(false, false, true), None);
+        assert_eq!(capturer(false, false, false), None);
+    }
 
     const S: Duration = Duration::from_secs(1);
 
