@@ -243,6 +243,60 @@ async def test_enrollment_link_sends_only_what_was_chosen(
     assert server.body() == {"platform": "linux-x86_64"}
 
 
+async def test_deployment_keys_are_made_listed_and_revoked(
+    api: ApiClient, server: FakeServer
+) -> None:
+    api.token = "sess"
+    server.on(
+        "POST",
+        "/api/deployment-keys",
+        body={
+            "id": 7,
+            "name": "Acme",
+            "token": "k3y",
+            "expires_at": None,
+            "msi_url": "https://rmm:8443/api/download/windows-x86_64/msi?token=k3y",
+            "server": "rmm:4433",
+            "server_name": "rmm",
+        },
+    )
+    made = await api.create_deployment_key(name="Acme", group_ids=[2], server="rmm:4433")
+    # No lifetime: the key never expires.
+    assert server.body() == {"name": "Acme", "group_ids": [2], "server": "rmm:4433"}
+    assert made.expires_at is None and made.msi_url.endswith("/msi?token=k3y")
+    await api.create_deployment_key(name="Acme", ttl_secs=86400)
+    assert server.body() == {"name": "Acme", "ttl_secs": 86400}
+
+    server.on(
+        "GET",
+        "/api/deployment-keys",
+        body=[
+            {
+                "id": 7,
+                "name": "Acme",
+                "created_by": "alice",
+                "created_at": "2026-10-01T10:00:00Z",
+                "expires_at": None,
+                "revoked_at": "2026-10-02T10:00:00Z",
+                "revoked_by": "sam",
+                "group_ids": [2],
+                "server": "rmm:4433",
+                "server_name": "rmm",
+                "enrolled_count": 12,
+                "last_enrolled_at": "2026-10-01T11:00:00Z",
+            }
+        ],
+    )
+    (key,) = await api.list_deployment_keys()
+    assert (key.name, key.enrolled_count, key.group_ids) == ("Acme", 12, (2,))
+    assert key.expires_at is None and key.revoked_by == "sam"
+    assert key.last_enrolled_at is not None
+
+    server.on("DELETE", "/api/deployment-keys/7", body={})
+    await api.revoke_deployment_key(7)
+    assert server.requests[-1].method == "DELETE"
+
+
 async def test_quick_assist_codes_and_their_status(api: ApiClient, server: FakeServer) -> None:
     api.token = "sess"
     server.on(

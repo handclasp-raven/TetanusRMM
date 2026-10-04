@@ -57,6 +57,8 @@ pub struct InstallOptions {
     pub server_name: String,
     pub server_ca: Option<PathBuf>,
     pub token: Option<String>,
+    /// With a token: keep a credential for the same server, if there is one.
+    pub keep_credential: bool,
     pub start: bool,
 }
 
@@ -72,22 +74,35 @@ pub fn install(opts: InstallOptions) -> anyhow::Result<()> {
 
     match (&opts.token, &opts.server_ca) {
         (Some(token), Some(ca)) => {
-            EnrollRequest {
-                server_addr: opts.server,
-                server_name: opts.server_name.clone(),
-                server_ca_pem: std::fs::read_to_string(ca)
-                    .with_context(|| format!("reading {}", ca.display()))?,
-                token: token.clone(),
-                transport: opts.transport,
+            let server_ca_pem =
+                std::fs::read_to_string(ca).with_context(|| format!("reading {}", ca.display()))?;
+            let store = CredentialStore::new(&state_dir);
+            // A mass-deployed installer runs again on machines that already
+            // have the agent (reinstalls, redeployments): those stay the
+            // agent they were rather than turn up as a new one.
+            let enrolled = opts.keep_credential
+                && store.exists()
+                && store
+                    .load()
+                    .is_ok_and(|c| c.matches(&opts.server_name, &server_ca_pem));
+            if enrolled {
+                info!("already enrolled with this server; keeping the credential");
+            } else {
+                EnrollRequest {
+                    server_addr: opts.server,
+                    server_name: opts.server_name.clone(),
+                    server_ca_pem,
+                    token: token.clone(),
+                    transport: opts.transport,
+                }
+                .save(&state_dir)
+                .context("saving enrollment request")?;
+                // A credential left by an earlier install (uninstalling keeps
+                // the state directory) would win over the request, and the
+                // service would go back to the server it was enrolled with
+                // before.
+                store.remove().context("removing the previous credential")?;
             }
-            .save(&state_dir)
-            .context("saving enrollment request")?;
-            // A credential left by an earlier install (uninstalling keeps the
-            // state directory) would win over the request, and the service
-            // would go back to the server it was enrolled with before.
-            CredentialStore::new(&state_dir)
-                .remove()
-                .context("removing the previous credential")?;
         }
         (Some(_), None) => bail!("--server-ca is required with --token"),
         (None, _) if !CredentialStore::new(&state_dir).exists() => {

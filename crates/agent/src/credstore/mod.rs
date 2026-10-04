@@ -56,6 +56,14 @@ impl std::fmt::Debug for Credential {
 }
 
 impl Credential {
+    /// Whether this credential is for the server an installer points at:
+    /// the same TLS name, trusting the same CA certificate.
+    pub fn matches(&self, server_name: &str, ca_pem: &str) -> bool {
+        let certs = |pem| common::tls::certs_from_pem(pem).ok();
+        self.server_name.eq_ignore_ascii_case(server_name)
+            && certs(&self.ca_pem).is_some_and(|mine| Some(mine) == certs(ca_pem))
+    }
+
     /// Connection settings for the control connection.
     pub fn agent_config(&self, heartbeat_interval: Duration) -> Result<AgentConfig, StoreError> {
         Ok(AgentConfig {
@@ -202,6 +210,19 @@ mod tests {
         assert_eq!(loaded, cred);
         let config = loaded.agent_config(Duration::from_secs(5)).unwrap();
         assert_eq!(config.agent_id, "agt-test");
+    }
+
+    #[test]
+    fn matches_the_server_it_was_enrolled_with() {
+        let cred = sample();
+        // However the same certificate is written out.
+        let ca = cred.ca_pem.replace('\n', "\r\n") + "\r\n";
+        assert!(cred.matches("localhost", &ca));
+        assert!(cred.matches("LOCALHOST", &ca));
+        assert!(!cred.matches("rmm.example.com", &ca));
+        let other = common::devcerts::generate("agt-test").unwrap();
+        assert!(!cred.matches("localhost", &other.ca_cert));
+        assert!(!cred.matches("localhost", "not a certificate"));
     }
 
     #[test]

@@ -16,6 +16,9 @@
 //! | PUT    | /api/agents/{id}/classification | session (admin) |
 //! | POST   | /api/agents/{id}/launch     | `desktop` on the agent |
 //! | POST   | /api/enrollment-links       | session (admin, support_engineer; `group_ids` admin only) |
+//! | GET    | /api/deployment-keys        | session (admin, support_engineer) |
+//! | POST   | /api/deployment-keys        | session (admin, support_engineer; `group_ids` admin only) |
+//! | DELETE | /api/deployment-keys/{id}   | session (admin, support_engineer): revoke |
 //! | POST   | /api/agents/{id}/viewer-sessions | `desktop` on the agent |
 //! | GET    | /api/agents/{id}/shell?cols=&rows= | `shell` on the agent; WebSocket |
 //! | POST   | /api/script-runs            | `script` on every target agent |
@@ -39,6 +42,7 @@
 //! | POST   | /api/groups/{id}/agents     | session (admin): add members |
 //! | DELETE | /api/groups/{id}/agents/{agent_id} | session (admin) |
 //! | GET    | /api/download/{platform}?token= | enrollment token |
+//! | GET    | /api/download/{platform}/msi?token= | enrollment token or deployment key |
 //! | GET    | /api/updates/{platform}/manifest | none (content is signed) |
 //! | GET    | /api/updates/{platform}/binary   | none (content is signed) |
 //! | GET    | /api/updates/{platform}/signature| none |
@@ -83,6 +87,7 @@ use sqlx::PgPool;
 use tracing::error;
 
 mod assist;
+mod deploy;
 mod install;
 mod rbac;
 
@@ -150,6 +155,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/viewer/{platform}/binary", get(viewer_binary))
         .merge(rbac::routes())
         .merge(assist::routes())
+        .merge(deploy::routes())
         .merge(install::routes())
         // Per route, so the route template is known (unmatched requests
         // are not counted).
@@ -818,23 +824,35 @@ async fn download_agent(
     Ok(resp)
 }
 
+/// The first agent version that can keep its identity when a deployment
+/// key's MSI is installed again (`service install --keep-credential`).
+const DEPLOYMENT_MSI_MIN_AGENT: semver::Version = semver::Version::new(0, 1, 6);
+
 /// The latest Windows agent build as an MSI that installs and enrolls it
 /// unattended (see `crate::msi`). Like [`download_agent`], needs a usable
-/// enrollment token and does not consume it.
+/// enrollment token and does not consume it. A usable deployment key gets
+/// the MSI for mass deployment.
 async fn download_msi(
     State(state): State<AppState>,
     Path(platform): Path<String>,
     Query(query): Query<DownloadQuery>,
 ) -> Result<Response, ApiError> {
-    let Some(install) = enroll::usable_install_target(&state.pool, &query.token).await? else {
-        return Err(ApiError::Unauthorized(
-            "download link is invalid or expired",
-        ));
+    let (install, reusable) = match enroll::usable_install_target(&state.pool, &query.token).await?
+    {
+        // Links made before install targets existed get the defaults.
+        Some(install) => (install, false),
+        None => match enroll::usable_deployment_target(&state.pool, &query.token).await? {
+            Some(install) => (Some(install), true),
+            None => {
+                return Err(ApiError::Unauthorized(
+                    "download link is invalid or expired",
+                ))
+            }
+        },
     };
     if platform != MSI_PLATFORM {
         return Err(ApiError::NotFound);
     }
-    // Links made before install targets existed get the defaults.
     let install = match install {
         Some(install) => install,
         None => install_target(&state.public_url, None, None)?,
@@ -842,6 +860,18 @@ async fn download_msi(
     let manifest = updates::load_manifest(&state.updates_dir, &platform)
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::NotFound)?;
+    if reusable
+        && !semver::Version::parse(&manifest.version)
+            .is_ok_and(|version| version >= DEPLOYMENT_MSI_MIN_AGENT)
+    {
+        return Err(ApiError::Status(
+            StatusCode::CONFLICT,
+            format!(
+                "the published agent ({}) is too old for a deployment MSI: publish {} or later",
+                manifest.version, DEPLOYMENT_MSI_MIN_AGENT
+            ),
+        ));
+    }
     let binary = tokio::fs::read(state.updates_dir.join(&platform).join(updates::BINARY_FILE))
         .await
         .map_err(|e| ApiError::Internal(format!("reading the agent build: {e}")))?;
@@ -856,6 +886,7 @@ async fn download_msi(
             server: &install.server,
             server_name: &install.server_name,
             token: &token,
+            reusable,
         })
     })
     .await

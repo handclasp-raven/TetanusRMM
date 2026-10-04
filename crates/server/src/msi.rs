@@ -1,4 +1,5 @@
-//! Windows Installer packages for agent download links, built on the fly.
+//! Windows Installer packages for agent download links and deployment
+//! keys, built on the fly.
 //!
 //! Each MSI carries the published (signed) agent build, the CA certificate
 //! agents must trust, and, as properties, the server address, the TLS name
@@ -7,12 +8,20 @@
 //! the service then enrolls itself (joining the link's groups) on first start.
 //! Uninstalling runs `service uninstall` before the files are removed.
 //!
+//! A deployment key's MSI (`reusable`) is the one to push to many machines
+//! with Group Policy or Intune. It differs in two ways: a machine that is
+//! already enrolled with this server keeps its identity instead of
+//! enrolling again (`--keep-credential`), and its package code follows from
+//! its contents, so every download of it is the same package to Windows
+//! Installer.
+//!
 //! The package is written with the `msi` and `cab` crates, so no Windows
 //! tooling is needed. It is deliberately minimal: no dialogs (msiexec shows
 //! its basic progress UI), per-machine, x64 only. The product code is fixed,
 //! so a second MSI on a machine that already has the agent is refused by
 //! Windows Installer ("another version of this product is already
-//! installed"); agents update themselves after that.
+//! installed"); agents update themselves after that. Deployment tools
+//! detect the agent by that product code and leave such a machine alone.
 //!
 //! The MSI is not Authenticode-signed (the agent binary inside it is
 //! verified by its own update signature only), so Windows SmartScreen may
@@ -63,8 +72,10 @@ pub struct MsiConfig<'a> {
     pub server: &'a str,
     /// Name the server certificate must be valid for.
     pub server_name: &'a str,
-    /// Single-use enrollment token.
+    /// Enrollment token: a link's single-use one, or a deployment key.
     pub token: &'a str,
+    /// For mass deployment with a deployment key (see the module docs).
+    pub reusable: bool,
 }
 
 /// Whether `value` is a plain host name or IP address (it ends up on a
@@ -102,6 +113,24 @@ fn product_version(version: &str) -> String {
     )
 }
 
+/// A package code that follows from what goes into the package.
+fn package_code(config: &MsiConfig) -> Uuid {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in [
+        config.agent_exe,
+        config.ca_pem.as_bytes(),
+        config.server.as_bytes(),
+        config.server_name.as_bytes(),
+        config.token.as_bytes(),
+    ] {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&context.finish().as_ref()[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_owned())
 }
@@ -132,7 +161,12 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
     summary.set_comments("Installs the RMM agent service and enrolls it with the server.");
     summary.set_arch("x64");
     summary.set_languages(&[Language::from_code(1033)]);
-    summary.set_uuid(Uuid::new_v4()); // package code: unique per package
+    // Package code: unique per package.
+    summary.set_uuid(if config.reusable {
+        package_code(config)
+    } else {
+        Uuid::new_v4()
+    });
     summary.set_page_count(500); // Windows Installer 5.0
     summary.set_word_count(2); // long file names, compressed source
     summary.set_doc_security(2);
@@ -344,6 +378,11 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
     )?;
 
     let in_script = EXE_FROM_INSTALLED_FILE | IN_SCRIPT | NO_IMPERSONATE;
+    let keep_credential = if config.reusable {
+        " --keep-credential"
+    } else {
+        ""
+    };
     table(
         &mut package,
         "CustomAction",
@@ -360,7 +399,7 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
                 s(AGENT_FILE),
                 s(&format!(
                     "service install --server [RMM_SERVER] --server-name [RMM_SERVER_NAME] \
-                     --server-ca \"[#{CA_FILE}]\" --token [RMM_TOKEN]"
+                     --server-ca \"[#{CA_FILE}]\" --token [RMM_TOKEN]{keep_credential}"
                 )),
             ],
             // A service removed by hand is not a reason to fail.
@@ -424,6 +463,47 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
             step("ExecuteAction", None, 1300),
         ],
     )?;
+    // Group Policy advertises a package before it installs it.
+    table(
+        &mut package,
+        "AdvtExecuteSequence",
+        sequence_columns(),
+        vec![
+            step("CostInitialize", None, 800),
+            step("CostFinalize", None, 1000),
+            step("InstallValidate", None, 1400),
+            step("InstallInitialize", None, 1500),
+            step("PublishFeatures", None, 6300),
+            step("PublishProduct", None, 6400),
+            step("InstallFinalize", None, 6600),
+        ],
+    )?;
+    table(
+        &mut package,
+        "AdminExecuteSequence",
+        sequence_columns(),
+        vec![
+            step("CostInitialize", None, 800),
+            step("FileCost", None, 900),
+            step("CostFinalize", None, 1000),
+            step("InstallValidate", None, 1400),
+            step("InstallInitialize", None, 1500),
+            step("InstallAdminPackage", None, 3900),
+            step("InstallFiles", None, 4000),
+            step("InstallFinalize", None, 6600),
+        ],
+    )?;
+    table(
+        &mut package,
+        "AdminUISequence",
+        sequence_columns(),
+        vec![
+            step("CostInitialize", None, 800),
+            step("FileCost", None, 900),
+            step("CostFinalize", None, 1000),
+            step("ExecuteAction", None, 1300),
+        ],
+    )?;
 
     package.write_stream(CABINET)?.write_all(&cabinet)?;
     package.flush()?;
@@ -470,7 +550,18 @@ mod tests {
             server: "rmm.example.com:4433",
             server_name: "rmm.example.com",
             token: "0123abcdef",
+            reusable: false,
         }
+    }
+
+    fn install_command(package: &mut Package<Cursor<Vec<u8>>>) -> String {
+        let rows = package.select_rows(Select::table("CustomAction")).unwrap();
+        for row in rows {
+            if row[0].as_str() == Some("RmmInstallService") {
+                return row[3].as_str().unwrap().to_owned();
+            }
+        }
+        panic!("no install action");
     }
 
     fn property(package: &mut Package<Cursor<Vec<u8>>>, name: &str) -> String {
@@ -522,6 +613,29 @@ mod tests {
         let other = build(&config(&exe)).unwrap();
         let other = Package::open(Cursor::new(other)).unwrap();
         assert_ne!(other.summary_info().uuid(), package.summary_info().uuid());
+
+        assert!(install_command(&mut package).ends_with("--token [RMM_TOKEN]"));
+        // Group Policy can advertise it.
+        for sequence in ["AdvtExecuteSequence", "AdminExecuteSequence"] {
+            assert!(package.has_table(sequence), "{sequence}");
+        }
+    }
+
+    #[test]
+    fn a_reusable_package_keeps_an_enrolled_machine_and_is_the_same_each_time() {
+        let exe = [0x4d, 0x5a, 1, 2, 3].repeat(100);
+        let mut config = config(&exe);
+        config.reusable = true;
+        let open = |config: &MsiConfig| Package::open(Cursor::new(build(config).unwrap())).unwrap();
+        let mut package = open(&config);
+        assert!(install_command(&mut package).ends_with("--token [RMM_TOKEN] --keep-credential"));
+
+        // Same contents, same package code; another key, another package.
+        let code = package.summary_info().uuid();
+        assert!(code.is_some());
+        assert_eq!(open(&config).summary_info().uuid(), code);
+        config.token = "fedcba3210";
+        assert_ne!(open(&config).summary_info().uuid(), code);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Agent enrollment: one-time tokens and the internal CA that issues
-//! per-agent client certificates.
+//! Agent enrollment: one-time tokens, reusable deployment keys, and the
+//! internal CA that issues per-agent client certificates.
 //!
 //! 1. A user creates a download link ([`create_token`]). The link carries a
 //!    random token; only its SHA-256 is stored, with an expiry.
@@ -10,6 +10,10 @@
 //!    fingerprint to the agent in the registry. All in one transaction.
 //! 4. The agent reconnects with the certificate; `Hello` is accepted only if
 //!    the certificate's fingerprint matches the pinned one.
+//!
+//! A deployment key ([`create_deployment_key`]) takes the token's place in
+//! step 2 for MSIs pushed to many machines: it is not consumed, and works
+//! until it expires or is revoked.
 
 use std::time::Duration;
 
@@ -249,9 +253,164 @@ pub async fn token_is_usable(pool: &PgPool, token: &str) -> sqlx::Result<bool> {
     .await
 }
 
+/// Longest lifetime of a deployment key that expires at all.
+pub const MAX_DEPLOYMENT_KEY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Longest name of a deployment key, in characters.
+pub const MAX_DEPLOYMENT_KEY_NAME: usize = 64;
+
+/// A reusable enrollment key, as listed. The key itself is shown once,
+/// when it is made.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct DeploymentKey {
+    pub id: i64,
+    pub name: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// `None`: never.
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<String>,
+    pub group_ids: Vec<i64>,
+    /// What an agent installed from the key's MSI connects to.
+    pub server: String,
+    pub server_name: String,
+    /// How many agents have enrolled with it.
+    pub enrolled_count: i64,
+    pub last_enrolled_at: Option<DateTime<Utc>>,
+}
+
+/// `$before`, the columns of a [`DeploymentKey`], then `$after`, as a
+/// static string.
+macro_rules! deployment_key_columns {
+    ($before:literal, $after:literal) => {
+        concat!(
+            $before,
+            " id, name, created_by, created_at, expires_at, revoked_at, revoked_by, group_ids,
+              install_server AS server, install_server_name AS server_name,
+              enrolled_count, last_enrolled_at ",
+            $after
+        )
+    };
+}
+
+/// Mint a deployment key that expires after `ttl` (`None`: never). The
+/// caller validates `name` and `install`, and checks the groups as for
+/// [`create_token_in_groups`]. Audited as `deployment_key.create`.
+pub async fn create_deployment_key(
+    pool: &PgPool,
+    actor: &str,
+    name: &str,
+    ttl: Option<Duration>,
+    group_ids: &[i64],
+    install: &InstallTarget,
+) -> sqlx::Result<(DeploymentKey, String)> {
+    let token = new_token();
+    let mut tx = pool.begin().await?;
+    // make_interval is strict: no lifetime, no expiry.
+    let key: DeploymentKey = sqlx::query_as(deployment_key_columns!(
+        "INSERT INTO deployment_keys
+             (token_hash, name, created_by, expires_at, group_ids,
+              install_server, install_server_name)
+         VALUES ($1, $2, $3, now() + make_interval(secs => $4), $5, $6, $7)
+         RETURNING",
+        ""
+    ))
+    .bind(token_hash(&token))
+    .bind(name)
+    .bind(actor)
+    .bind(ttl.map(|ttl| ttl.as_secs_f64()))
+    .bind(group_ids)
+    .bind(&install.server)
+    .bind(&install.server_name)
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut detail = json!({
+        "deployment_key_id": key.id,
+        "name": key.name,
+        "expires_at": key.expires_at,
+        "server": key.server,
+        "server_name": key.server_name,
+    });
+    if !group_ids.is_empty() {
+        detail["group_ids"] = json!(group_ids);
+    }
+    audit::append(
+        &mut tx,
+        NewEntry::new(actor, Action::DeploymentKeyCreate).detail(detail),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((key, token))
+}
+
+/// Every deployment key, newest first.
+pub async fn list_deployment_keys(pool: &PgPool) -> sqlx::Result<Vec<DeploymentKey>> {
+    sqlx::query_as(deployment_key_columns!(
+        "SELECT",
+        "FROM deployment_keys ORDER BY id DESC"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
+/// Revoke a key: no more agents enroll with it (those that did stay).
+/// `None` if there is no such key or it was revoked already. Audited as
+/// `deployment_key.revoke`.
+pub async fn revoke_deployment_key(
+    pool: &PgPool,
+    actor: &str,
+    id: i64,
+) -> sqlx::Result<Option<DeploymentKey>> {
+    let mut tx = pool.begin().await?;
+    let key: Option<DeploymentKey> = sqlx::query_as(deployment_key_columns!(
+        "UPDATE deployment_keys SET revoked_at = now(), revoked_by = $2
+         WHERE id = $1 AND revoked_at IS NULL
+         RETURNING",
+        ""
+    ))
+    .bind(id)
+    .bind(actor)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(key) = &key {
+        audit::append(
+            &mut tx,
+            NewEntry::new(actor, Action::DeploymentKeyRevoke).detail(json!({
+                "deployment_key_id": key.id,
+                "name": key.name,
+                "enrolled_count": key.enrolled_count,
+            })),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(key)
+}
+
+/// A usable (unrevoked, unexpired) deployment key's install target.
+pub async fn usable_deployment_target(
+    pool: &PgPool,
+    token: &str,
+) -> sqlx::Result<Option<InstallTarget>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT install_server, install_server_name FROM deployment_keys
+         WHERE token_hash = $1 AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > now())",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(server, server_name)| InstallTarget {
+        server,
+        server_name,
+    }))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnrollError {
-    /// Unknown, expired or already-used token. Deliberately indistinguishable.
+    /// Unknown, expired, revoked or already-used token. Deliberately
+    /// indistinguishable.
     #[error("enrollment token is invalid, expired or already used")]
     InvalidToken,
     #[error(transparent)]
@@ -268,9 +427,17 @@ pub struct Enrollment {
     pub fingerprint: String,
 }
 
-/// Consume `token` and issue a certificate for the CSR. Single-use: of any
-/// number of concurrent or repeated calls with the same token, exactly one
-/// succeeds. Audited as `agent.enroll`.
+/// What an enrollment was allowed by.
+enum Source {
+    /// A download link's token, consumed by this enrollment.
+    Link(i64),
+    DeploymentKey(i64),
+}
+
+/// Check `token` and issue a certificate for the CSR. A download link's
+/// token is consumed: of any number of concurrent or repeated calls with
+/// it, exactly one succeeds. A deployment key is only counted. Audited as
+/// `agent.enroll`.
 pub async fn enroll(
     pool: &PgPool,
     ca: &AgentCa,
@@ -289,7 +456,23 @@ pub async fn enroll(
     .bind(token_hash(token))
     .fetch_optional(&mut *tx)
     .await?;
-    let (token_id, group_ids) = row.ok_or(EnrollError::InvalidToken)?;
+    let (source, group_ids) = match row {
+        Some((id, group_ids)) => (Source::Link(id), group_ids),
+        None => {
+            let row: Option<(i64, Vec<i64>)> = sqlx::query_as(
+                "UPDATE deployment_keys
+                 SET enrolled_count = enrolled_count + 1, last_enrolled_at = now()
+                 WHERE token_hash = $1 AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > now())
+                 RETURNING id, group_ids",
+            )
+            .bind(token_hash(token))
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (id, group_ids) = row.ok_or(EnrollError::InvalidToken)?;
+            (Source::DeploymentKey(id), group_ids)
+        }
+    };
 
     let agent_id = new_agent_id();
     let cert_pem = ca.issue(&agent_id, csr_der)?;
@@ -298,11 +481,13 @@ pub async fn enroll(
     );
 
     registry::insert_enrolled(&mut tx, &agent_id, &fingerprint).await?;
-    sqlx::query("UPDATE enrollment_tokens SET used_at = now(), agent_id = $2 WHERE id = $1")
-        .bind(token_id)
-        .bind(&agent_id)
-        .execute(&mut *tx)
-        .await?;
+    if let Source::Link(token_id) = source {
+        sqlx::query("UPDATE enrollment_tokens SET used_at = now(), agent_id = $2 WHERE id = $1")
+            .bind(token_id)
+            .bind(&agent_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let joined: Vec<i64> = sqlx::query_scalar(
         "INSERT INTO agent_group_members (group_id, agent_id)
          SELECT id, $2 FROM agent_groups WHERE id = ANY($1)
@@ -312,7 +497,11 @@ pub async fn enroll(
     .bind(&agent_id)
     .fetch_all(&mut *tx)
     .await?;
-    let mut detail = json!({ "token_id": token_id, "cert_fingerprint": fingerprint });
+    let mut detail = match source {
+        Source::Link(id) => json!({ "token_id": id }),
+        Source::DeploymentKey(id) => json!({ "deployment_key_id": id }),
+    };
+    detail["cert_fingerprint"] = json!(fingerprint);
     if !joined.is_empty() {
         detail["group_ids"] = json!(joined);
     }

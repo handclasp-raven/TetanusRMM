@@ -28,6 +28,9 @@ directly. What it does:
 - **Quick assist:** help someone whose computer has no agent, for one
   session: a six-digit code they type into a program they download from
   the server. The viewer opens when they have.
+- **Deployment MSI:** one MSI for many PCs, to push with Group Policy or
+  Intune. It installs silently and enrolls each PC with a reusable key
+  that you can revoke.
 - **Groups:** view groups and their members. Admins can also create, rename,
   delete and fill them. The group list beside the agent table filters it,
   and the search box above it filters by hostname, IP address or group
@@ -209,6 +212,7 @@ server-side session then expires on its own.
 | `k` | Classify the selected agent as server, desktop or other (admins) |
 | `g` | Groups |
 | `u` | Users: accounts, roles, access and passwords (admins; hidden otherwise) |
+| `i` | Deployment MSI: a reusable MSI for Group Policy or Intune (admins and support engineers) |
 | `a` | Audit log (admins and auditors) |
 | `c` | Choose columns |
 | `p` | Show or hide the stats panel (kept between runs) |
@@ -315,6 +319,45 @@ highlighted group's members with online dots. Admins get:
 - `e` rename / change description
 - `m` members: tick agents with `Space`
 - `Del` delete: its agents stay but lose access granted through it
+
+**Deployment MSI** (`i`): one MSI for as many PCs as you push it to. It
+carries a deployment key instead of a single-use link, so every PC that
+installs it enrolls as its own agent.
+1. Say what the key is for (e.g. the customer), and check **Server address**
+   and **TLS name** as for a new agent.
+2. Choose how long the key is valid (30 days, 90 days, 1 year or never). As
+   an admin, you can also tick groups the agents join.
+3. Press **Create key** (`Ctrl+G`), then **Save MSI**. The key is shown only
+   this once: the MSI cannot be fetched again later, so make a new key if
+   you lose it.
+
+Deploying it:
+- **By hand or script:** `msiexec /i rmm-agent-deploy.msi /qn /norestart`
+  from an elevated prompt. No dialogs; the agent service is installed,
+  started and enrolled.
+- **Group Policy:** put the MSI on a share that *Domain Computers* can read,
+  then *Computer Configuration → Policies → Software Settings → Software
+  installation → New → Package*, **Assigned**. It installs at the next boot.
+- **Intune:** *Apps → Windows → Add → Line-of-business app*, upload the MSI,
+  and assign it as **Required** to a device group. It installs in the device
+  context.
+
+The table at the top lists the keys with how many agents each has enrolled.
+`Delete` revokes the highlighted key: its MSI enrolls nothing more, and the
+agents already enrolled keep working. Anyone holding the MSI can enroll
+agents until then, so treat it like a password.
+
+Good to know:
+- Installing it again on a PC that is already enrolled with this server
+  (a redeployment, or uninstall then install) keeps the PC's existing agent.
+  A PC whose agent was deleted on the server stays locked out: remove
+  `C:\ProgramData\RMM\agent` on it before deploying again.
+- Agents update themselves, so don't replace the package with a newer MSI in
+  Intune or Group Policy: Windows Installer refuses a second MSI where the
+  agent is already installed.
+- The server's name is looked up when the MSI runs, so the PC needs the
+  network (and DNS) at that point.
+- It needs agent 0.1.6 or later published on the server.
 
 **Users** (`u`, admins only): every user with their role and what they can
 reach.

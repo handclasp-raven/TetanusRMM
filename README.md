@@ -56,6 +56,7 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 -  **Speeeeed:** If your NAT allows for it, the server will broker a direct connection from your viewer to the agent so there is no middle man to slow things down.
 -  **User management and RBAC:** Create and administrate users, give them access to certain functions for certain groups.
 -  **Painless Agent Install:** Generate a URL, open it on the remote PC, Download an MSI, Install - done.
+-  **Mass Agent Deployment:** Generate one MSI with a reusable, revocable key and push it with Intune or a GPO. It installs silently and each PC enrolls itself.
 -  **Quick Support:** For when you just need to fix something for someone but don't need an agent. Give them a link, Give them a code and you're connected!
 -  **Remote Shell:** Need to just fire some commands without bugging the user? Say less.
 -  **Scripts:** Add scripts, choose target devices or a group and hit run. Easy.
@@ -67,7 +68,6 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 ## 🤔 Still To Come
 - [ ] **Handle Login Screens and UAC:** currently you can interact with elevated windows, however the user still needs to handle the login screen and UAC prompts.
 - [ ] **Password Manager Integration:** Integrate a password manager into the Remote Session Viewer to save you having to copy/paste everything
-- [ ] **Mass Agent Deployment:** An MSI that can be reused for Intune or GPOs for mass deployment.
 - [ ] **Cred Cache:** Prompt users for a credential so you can log into things without them, all without them actually giving you the credential!
 - [ ] **Better Monitoring:** Sysmon and a sane config by default + log shipping.
 - [ ] **Tunnelling and Remote Apps:** Create temporary tunnels and access devices within the customer's network like admin pages, printers, etc from your local browser.

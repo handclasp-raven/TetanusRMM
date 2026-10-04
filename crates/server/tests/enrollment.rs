@@ -515,3 +515,219 @@ async fn msi_links_install_to_the_chosen_server() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn a_deployment_key_enrolls_many_agents_until_it_is_revoked() {
+    let db = start_db().await;
+    let certs = common::devcerts::generate("unused").unwrap();
+    let admin = create_user(&db.pool, "alice", Role::Admin).await;
+    let engineer = create_user(&db.pool, "sam", Role::SupportEngineer).await;
+    let auditor = create_user(&db.pool, "carol", Role::Auditor).await;
+    let group = server::groups::create(&db.pool, "alice", "Acme", "")
+        .await
+        .unwrap();
+
+    let updates = tempfile::tempdir().unwrap();
+    let build = updates.path().join("build.exe");
+    std::fs::write(&build, b"MZ agent build bytes").unwrap();
+    let key = server::updates::generate_key();
+    server::updates::write_key_pair(updates.path(), &key).unwrap();
+    let publish = |version: &'static str| {
+        server::updates::sign_file(
+            &updates.path().join(server::updates::SIGNING_KEY_FILE),
+            &build,
+            "windows-x86_64",
+            version,
+        )
+        .unwrap();
+        server::updates::publish(updates.path(), &build, "windows-x86_64", version).unwrap();
+    };
+    publish("0.1.5");
+
+    let api = start_api_with(db.pool.clone(), &certs, updates.path().to_owned()).await;
+    let admin = api.session("alice", &admin.totp_secret).await;
+    let engineer = api.session("sam", &engineer.totp_secret).await;
+    let auditor = api.session("carol", &auditor.totp_secret).await;
+    let create = |session: &str, body: Value| {
+        api.client
+            .post(api.url("/api/deployment-keys"))
+            .bearer_auth(session)
+            .json(&body)
+            .send()
+    };
+    let list = |session: &str| {
+        api.client
+            .get(api.url("/api/deployment-keys"))
+            .bearer_auth(session)
+            .send()
+    };
+
+    // Auditors have nothing to do with keys; engineers make them, but only
+    // admins choose groups.
+    assert_eq!(
+        create(&auditor, json!({ "name": "x" }))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        list(&auditor).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        create(&engineer, json!({ "name": "x", "group_ids": [group.id] }))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for body in [
+        json!({ "name": "  " }),
+        json!({ "name": "x", "ttl_secs": 0 }),
+        json!({ "name": "x", "ttl_secs": 366 * 86400 }),
+        json!({ "name": "x", "server": "rmm.lan:4433 --token x" }),
+    ] {
+        let resp = create(&engineer, body.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let resp = create(&engineer, json!({ "name": "Lab", "ttl_secs": 86400 }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let lab: Value = resp.json().await.unwrap();
+    assert!(lab["expires_at"].is_string());
+
+    let made: Value = create(
+        &admin,
+        json!({ "name": " Acme PCs ", "group_ids": [group.id], "server": "rmm.lan:5443" }),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(made["name"], "Acme PCs");
+    assert!(made["expires_at"].is_null());
+    assert_eq!(
+        (&made["server"], &made["server_name"]),
+        (&json!("rmm.lan:5443"), &json!("rmm.lan"))
+    );
+    let token = made["token"].as_str().unwrap();
+    let msi_url = made["msi_url"].as_str().unwrap();
+    assert_eq!(
+        msi_url,
+        format!("{}/api/download/windows-x86_64/msi?token={token}", api.base)
+    );
+
+    // The MSI needs an agent build that knows `--keep-credential`.
+    let resp = api.client.get(msi_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    publish("0.1.6");
+    let resp = api.client.get(msi_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.bytes().await.unwrap();
+    let props = msi_properties(&bytes);
+    assert_eq!(props["RMM_SERVER"], "rmm.lan:5443");
+    assert_eq!(props["RMM_SERVER_NAME"], "rmm.lan");
+    assert_eq!(props["RMM_TOKEN"], token);
+    let mut package = msi::Package::open(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    let install = package
+        .select_rows(msi::Select::table("CustomAction"))
+        .unwrap()
+        .find(|row| row[0].as_str() == Some("RmmInstallService"))
+        .map(|row| row[3].as_str().unwrap().to_owned())
+        .unwrap();
+    assert!(install.ends_with("--keep-credential"), "{install}");
+    // A key is not a download link for the bare binary.
+    let resp = api
+        .client
+        .get(api.url(&format!("/api/download/windows-x86_64?token={token}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The same key enrolls agent after agent, each into the key's groups.
+    let ca = enroll::AgentCa::from_pem(&certs.ca_cert, &certs.ca_key).unwrap();
+    let csr = || {
+        rcgen::CertificateParams::default()
+            .serialize_request(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+    };
+    let first = enroll::enroll(&db.pool, &ca, token, csr().der())
+        .await
+        .unwrap();
+    let second = enroll::enroll(&db.pool, &ca, token, csr().der())
+        .await
+        .unwrap();
+    assert_ne!(first.agent_id, second.agent_id);
+    let members = server::groups::get(&db.pool, group.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expected = vec![first.agent_id.clone(), second.agent_id.clone()];
+    expected.sort();
+    assert_eq!(members.agent_ids, expected);
+
+    let keys: Value = list(&engineer).await.unwrap().json().await.unwrap();
+    let keys = keys.as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0]["id"], made["id"], "newest first");
+    assert_eq!(keys[0]["enrolled_count"], 2);
+    assert!(keys[0]["last_enrolled_at"].is_string());
+    assert_eq!(keys[0]["group_ids"], json!([group.id]));
+    assert_eq!(keys[1]["enrolled_count"], 0);
+    assert!(keys[0].get("token").is_none() && keys[0].get("token_hash").is_none());
+
+    // Revoked: no more enrollments, no more MSI. The agents stay.
+    let revoke = |id: &Value| {
+        api.client
+            .delete(api.url(&format!("/api/deployment-keys/{id}")))
+            .bearer_auth(&engineer)
+            .send()
+    };
+    let resp = revoke(&made["id"]).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let revoked: Value = resp.json().await.unwrap();
+    assert_eq!(revoked["revoked_by"], "sam");
+    assert_eq!(
+        revoke(&made["id"]).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(matches!(
+        enroll::enroll(&db.pool, &ca, token, csr().der()).await,
+        Err(enroll::EnrollError::InvalidToken)
+    ));
+    let resp = api.client.get(msi_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let agents = registry::list_agents(&db.pool).await.unwrap();
+    assert_eq!(agents.len(), 2);
+    assert!(agents
+        .iter()
+        .all(|a| a.enrollment_state == EnrollmentState::Enrolled));
+
+    // An expired key is as dead as a revoked one.
+    let lab_token = lab["token"].as_str().unwrap();
+    sqlx::query(
+        "UPDATE deployment_keys SET expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(lab["id"].as_i64().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        enroll::enroll(&db.pool, &ca, lab_token, csr().der()).await,
+        Err(enroll::EnrollError::InvalidToken)
+    ));
+
+    let actions = audit_actions(&db.pool).await;
+    let count = |action: &str| actions.iter().filter(|a| *a == action).count();
+    assert_eq!(count("deployment_key.create"), 2);
+    assert_eq!(count("deployment_key.revoke"), 1);
+    assert_eq!(count("agent.enroll"), 2);
+    assert!(matches!(
+        audit::verify(&db.pool).await.unwrap(),
+        Verification::Valid { .. }
+    ));
+}

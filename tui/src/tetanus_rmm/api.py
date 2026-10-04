@@ -370,6 +370,70 @@ class EnrollmentLink:
 
 
 @dataclass(frozen=True)
+class NewDeploymentKey:
+    """A deployment key as it is made: the only time its key and MSI link
+    are available."""
+
+    id: int
+    name: str
+    token: str
+    #: ``None``: never.
+    expires_at: datetime | None
+    msi_url: str
+    server: str
+    server_name: str
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> NewDeploymentKey:
+        return cls(
+            id=int(d["id"]),
+            name=d["name"],
+            token=d["token"],
+            expires_at=parse_time(d.get("expires_at")),
+            msi_url=d["msi_url"],
+            server=d.get("server", ""),
+            server_name=d.get("server_name", ""),
+        )
+
+
+@dataclass(frozen=True)
+class DeploymentKey:
+    """A reusable enrollment key, for an MSI pushed to many machines."""
+
+    id: int
+    name: str
+    created_by: str
+    created_at: datetime | None
+    #: ``None``: never.
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    revoked_by: str | None
+    group_ids: tuple[int, ...]
+    server: str
+    server_name: str
+    #: How many agents have enrolled with it.
+    enrolled_count: int
+    last_enrolled_at: datetime | None
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> DeploymentKey:
+        return cls(
+            id=int(d["id"]),
+            name=d["name"],
+            created_by=d.get("created_by", ""),
+            created_at=parse_time(d.get("created_at")),
+            expires_at=parse_time(d.get("expires_at")),
+            revoked_at=parse_time(d.get("revoked_at")),
+            revoked_by=d.get("revoked_by"),
+            group_ids=tuple(d.get("group_ids") or ()),
+            server=d.get("server", ""),
+            server_name=d.get("server_name", ""),
+            enrolled_count=int(d.get("enrolled_count", 0)),
+            last_enrolled_at=parse_time(d.get("last_enrolled_at")),
+        )
+
+
+@dataclass(frozen=True)
 class AssistCode:
     """A quick assist code: six digits to read out to a user, who types
     them into the quick assist program from ``url``."""
@@ -740,6 +804,35 @@ class ApiClient:
             body["server_name"] = server_name
         response = await self._request("POST", "/api/enrollment-links", json=body)
         return EnrollmentLink.from_json(response.json())
+
+    async def create_deployment_key(
+        self,
+        *,
+        name: str,
+        ttl_secs: int | None = None,
+        group_ids: list[int] | None = None,
+        server: str | None = None,
+        server_name: str | None = None,
+    ) -> NewDeploymentKey:
+        """A reusable key and its MSI. Without ``ttl_secs`` it never expires."""
+        body: dict[str, Any] = {"name": name}
+        if ttl_secs is not None:
+            body["ttl_secs"] = ttl_secs
+        if group_ids:
+            body["group_ids"] = group_ids
+        if server:
+            body["server"] = server
+        if server_name:
+            body["server_name"] = server_name
+        response = await self._request("POST", "/api/deployment-keys", json=body)
+        return NewDeploymentKey.from_json(response.json())
+
+    async def list_deployment_keys(self) -> list[DeploymentKey]:
+        response = await self._request("GET", "/api/deployment-keys")
+        return [DeploymentKey.from_json(d) for d in response.json()]
+
+    async def revoke_deployment_key(self, key_id: int) -> None:
+        await self._request("DELETE", f"/api/deployment-keys/{key_id}")
 
     async def download(self, url: str, dest: Path) -> int:
         """Save a download link (its token is in the URL) to ``dest`` via

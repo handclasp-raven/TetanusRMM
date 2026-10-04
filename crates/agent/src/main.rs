@@ -115,6 +115,10 @@ struct InstallArgs {
     /// Enrollment token from the download link.
     #[arg(long, env = "RMM_ENROLL_TOKEN", hide_env_values = true)]
     token: Option<String>,
+    /// With --token: if this machine is already enrolled with that server,
+    /// stay the same agent instead of enrolling again.
+    #[arg(long, requires = "token")]
+    keep_credential: bool,
     /// Install without starting.
     #[arg(long)]
     no_start: bool,
@@ -269,6 +273,7 @@ fn service(command: ServiceCommand) -> anyhow::Result<()> {
             server_name: args.server.server_name,
             server_ca: args.server_ca,
             token: args.token,
+            keep_credential: args.keep_credential,
             start: !args.no_start,
         }),
         ServiceCommand::Uninstall => service::uninstall(),

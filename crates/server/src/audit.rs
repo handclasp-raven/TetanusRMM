@@ -35,6 +35,9 @@ pub enum Action {
     Logout,
     PolicyUpdate,
     EnrollmentCreate,
+    /// A reusable deployment key (for a mass-deployment MSI) was made.
+    DeploymentKeyCreate,
+    DeploymentKeyRevoke,
     AgentEnroll,
     ViewerSessionCreate,
     ViewerConnect,
@@ -109,6 +112,8 @@ impl Action {
             Action::ViewerSessionCreate => "viewer.session_create",
             Action::ViewerConnect => "viewer.connect",
             Action::ViewerDisconnect => "viewer.disconnect",
+            Action::DeploymentKeyCreate => "deployment_key.create",
+            Action::DeploymentKeyRevoke => "deployment_key.revoke",
             Action::PolicyDefault => "policy.default",
             Action::SessionStart => "session.start",
             Action::SessionUserTerminated => "session.user_terminated",

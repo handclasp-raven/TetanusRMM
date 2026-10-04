@@ -346,6 +346,61 @@ ColumnsScreen, NewScriptScreen, CommandsScreen {
     min-width: 8;
 }
 
+/* --- deployment MSI --------------------------------------------------------- */
+
+#deploy {
+    padding: 0 2;
+}
+
+#deploy > Label {
+    margin-top: 1;
+}
+
+#dp-intro {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#dp-keys {
+    height: auto;
+    max-height: 12;
+    margin-top: 1;
+}
+
+#deploy > Select, #deploy > Input {
+    width: 80;
+}
+
+#dp-groups {
+    width: 80;
+    height: auto;
+    max-height: 10;
+}
+
+#dp-groups-note {
+    color: $text-muted;
+}
+
+#dp-actions {
+    height: 3;
+    margin-top: 1;
+}
+
+#dp-status {
+    padding: 1 2 0 2;
+}
+
+#dp-result {
+    height: auto;
+    margin: 1 0;
+    padding: 0 1;
+    border: round $success;
+}
+
+#dp-summary {
+    margin-bottom: 1;
+}
+
 /* --- quick assist ----------------------------------------------------------- */
 
 #quick-assist {

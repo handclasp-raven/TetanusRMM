@@ -1084,6 +1084,149 @@ async def test_new_agent_makes_an_msi_link_in_a_group_and_saves_it(tmp_path) -> 
         )
 
 
+def deployment_key_json(**overrides) -> dict:
+    return {
+        "id": 7,
+        "name": "Acme PCs",
+        "created_by": "alice",
+        "created_at": "2026-10-01T10:00:00Z",
+        "expires_at": None,
+        "revoked_at": None,
+        "revoked_by": None,
+        "group_ids": [2],
+        "server": "10.0.0.9:4433",
+        "server_name": "rmm.test",
+        "enrolled_count": 3,
+        "last_enrolled_at": "2026-10-02T10:00:00Z",
+        **overrides,
+    }
+
+
+async def test_deployment_makes_a_key_saves_its_msi_and_revokes_it(tmp_path) -> None:
+    from tetanus_rmm.groups import ConfirmScreen
+
+    server = FakeServer()
+    app = signed_in_app(server, tmp_path)
+    keys: list[dict] = []
+    server.on("GET", "/api/deployment-keys", handler=lambda _req: httpx.Response(200, json=keys))
+
+    def create(_req: httpx.Request) -> httpx.Response:
+        keys.append(deployment_key_json())
+        return httpx.Response(
+            200,
+            json={
+                "id": 7,
+                "name": "Acme PCs",
+                "token": "k3y",
+                "expires_at": None,
+                "msi_url": "https://pub:8443/api/download/windows-x86_64/msi?token=k3y",
+                "server": "10.0.0.9:4433",
+                "server_name": "rmm.test",
+            },
+        )
+
+    def revoke(_req: httpx.Request) -> httpx.Response:
+        keys[0] = deployment_key_json(revoked_at="2026-10-03T10:00:00Z", revoked_by="alice")
+        return httpx.Response(200, json=keys[0])
+
+    server.on("POST", "/api/deployment-keys", handler=create)
+    server.on("DELETE", "/api/deployment-keys/7", handler=revoke)
+    server.on(
+        "GET",
+        "/api/download/windows-x86_64/msi",
+        handler=lambda _req: httpx.Response(200, content=b"MSI-BYTES"),
+    )
+    async with app.run_test(size=(160, 60)) as pilot:
+        await main_screen(pilot, app)
+        await pilot.press("i")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "DeploymentScreen")
+        screen = app.screen
+        table = screen.query_one("#dp-keys", DataTable)
+        groups = screen.query_one("#dp-groups", SelectionList)
+        await wait_for(pilot, lambda: groups.option_count == 2)
+        assert table.row_count == 0
+        assert screen.query_one("#dp-server", Input).value == "127.0.0.1:4433"
+
+        # A key needs a name.
+        await pilot.press("ctrl+g")
+        await pilot.pause(0.1)
+        assert not any(r.method == "POST" and "deployment" in r.url.path for r in server.requests)
+
+        screen.query_one("#dp-name", Input).value = "Acme PCs"
+        screen.query_one("#dp-server", Input).value = "10.0.0.9:4433"
+        screen.query_one("#dp-ttl").value = 0  # never expires
+        groups.select(2)
+        await pilot.press("ctrl+g")
+        await wait_for(pilot, lambda: screen.made is not None)
+        body = server.body(
+            next(
+                i
+                for i, r in enumerate(server.requests)
+                if r.method == "POST" and r.url.path == "/api/deployment-keys"
+            )
+        )
+        assert body == {
+            "name": "Acme PCs",
+            "group_ids": [2],
+            "server": "10.0.0.9:4433",
+            "server_name": "rmm.test",
+        }
+        summary = str(screen.query_one("#dp-summary", Static).render())
+        assert "never expires" in summary and "only once" in summary
+        assert screen.query_one("#dp-msi-url", Input).value.endswith("/msi?token=k3y")
+
+        target = tmp_path / "out" / "acme.msi"
+        target.parent.mkdir()
+        screen.query_one("#dp-save-path", Input).value = str(target)
+        screen.query_one("#dp-save").press()
+        await wait_for(pilot, lambda: target.exists())
+        assert target.read_bytes() == b"MSI-BYTES"
+        await wait_for(
+            pilot,
+            lambda: (
+                screen.query_one("#dp-command", Input).value == "msiexec /i acme.msi /qn /norestart"
+            ),
+        )
+
+        # The new key is listed, with the group's name.
+        await wait_for(pilot, lambda: table.row_count == 1)
+        row = [str(cell) for cell in table.get_row("7")]
+        assert row[0] == "Acme PCs" and row[3] == "3" and row[5] == "Servers"
+        assert "Active" in row[6]
+
+        table.focus()
+        await pilot.press("delete")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        await pilot.click("#confirm-ok")
+        await wait_for(pilot, lambda: any(r.method == "DELETE" for r in server.requests))
+        await wait_for(pilot, lambda: "Revoked" in str(table.get_row("7")[6]))
+        # Nothing left to revoke.
+        assert screen.check_action("revoke", ()) is None
+
+
+async def test_engineers_deploy_without_groups_and_auditors_cannot(tmp_path) -> None:
+    server = FakeServer()
+    server.on("GET", "/api/deployment-keys", body=[deployment_key_json()])
+    app = signed_in_app(server, tmp_path, USER)
+    async with app.run_test(size=(160, 60)) as pilot:
+        screen = await main_screen(pilot, app)
+        assert screen.check_action("deployment", ()) is True
+        await pilot.press("i")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "DeploymentScreen")
+        assert not app.screen.query("#dp-groups")
+        table = app.screen.query_one("#dp-keys", DataTable)
+        await wait_for(pilot, lambda: table.row_count == 1)
+
+    server = FakeServer()
+    app = signed_in_app(server, tmp_path, AUDITOR)
+    async with app.run_test(size=(160, 60)) as pilot:
+        screen = await main_screen(pilot, app)
+        assert not screen.check_action("deployment", ())
+        await pilot.press("i")
+        await pilot.pause(0.1)
+        assert app.screen is screen
+
+
 async def test_engineers_make_links_without_groups_and_auditors_cannot(tmp_path) -> None:
     server = FakeServer()
     app = signed_in_app(server, tmp_path, USER)
@@ -1523,6 +1666,7 @@ async def test_the_menu_bar_runs_the_agent_tables_actions(tmp_path) -> None:
             "scripts",
             "classify",
             "new_agent",
+            "deployment",
             "quick_assist",
         ]
         assert str(items.get_option_at_index(0).prompt).split() == ["Remote", "desktop", "d"]

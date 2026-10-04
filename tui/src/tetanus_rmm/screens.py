@@ -345,6 +345,7 @@ class MainScreen(Screen):
         Binding("r", "scripts", "Scripts", show=False),
         Binding("n", "new_agent", "New agent", show=False),
         Binding("h", "quick_assist", "Quick assist", show=False),
+        Binding("i", "deployment", "Deployment MSI", show=False),
         Binding("k", "classify", "Classify", show=False),
         Binding("g", "groups", "Groups", show=False),
         Binding("u", "users", "Users", show=False),
@@ -364,7 +365,15 @@ class MainScreen(Screen):
 
     #: The menu bar: each menu's name and the actions in it.
     MENUS = {
-        "Agent": ["desktop", "shell", "scripts", "classify", "new_agent", "quick_assist"],
+        "Agent": [
+            "desktop",
+            "shell",
+            "scripts",
+            "classify",
+            "new_agent",
+            "deployment",
+            "quick_assist",
+        ],
         "View": ["search", "filter", "columns", "stats", "app.change_theme", "themes", "refresh"],
         "Manage": ["groups", "users", "audit", "viewer_commands"],
         "Session": ["logout", "app.quit"],
@@ -456,7 +465,7 @@ class MainScreen(Screen):
             return bool(user and user.can_control)
         if action == "audit":
             return bool(user and user.can_read_audit)
-        if action == "new_agent":
+        if action in ("new_agent", "deployment"):
             return bool(user and user.can_enroll)
         if action == "quick_assist":
             return bool(user and user.can_control)
@@ -847,6 +856,11 @@ class MainScreen(Screen):
 
     def action_quick_assist(self) -> None:
         from .assist import QuickAssistScreen
+
+    def action_deployment(self) -> None:
+        from .deploy import DeploymentScreen
+
+        self.app.push_screen(DeploymentScreen())
 
         self.app.push_screen(QuickAssistScreen())
 
