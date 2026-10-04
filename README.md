@@ -67,10 +67,7 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 
 
 ## 🤔 Still To Come
-- [ ] **Handle Login Screens and UAC:** currently you can interact with elevated windows, however the user still needs to handle the login screen and UAC prompts.
-- [x] **Password Manager Integration:** Bitwarden, in the Remote Session Viewer, to save you having to copy/paste everything
-- [ ] **Cred Cache:** Prompt users for a credential so you can log into things without them, all without them actually giving you the credential!
-- [ ] **Better Monitoring:** Sysmon and a sane config by default + log shipping.
+- [ ] **Better Monitoring:** Sysmon and a sane config by default, log shipping and alerting.
 - [ ] **Tunnelling and Remote Apps:** Create temporary tunnels and access devices within the customer's network like admin pages, printers, etc from your local browser.
 - [ ] **More Agent Platform Support:** Linux (X and Wayland), MacOS and older versions of Windows (Currently untested but may work).
 - [ ] **E-mail password reset self service:** Currently all administration is performed on the platform itself through the TUI and no E-mails are tied to user accounts.
