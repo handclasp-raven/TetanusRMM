@@ -1,0 +1,9 @@
+[package]
+name = "brand"
+description = "TetanusRMM's look: palette, light and dark themes, the mark, icons. No dependencies, so build scripts can use it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

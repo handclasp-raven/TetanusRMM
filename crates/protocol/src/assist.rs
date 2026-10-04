@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::brand::Branding;
+
 /// Digits in a quick assist code.
 pub const CODE_LEN: usize = 6;
 
@@ -30,8 +32,9 @@ pub const REJECT_CODE: &str = "invalid quick assist code";
 /// many wrong codes.
 pub const REJECT_TOO_MANY: &str = "too many wrong quick assist codes; try again later";
 
-/// Largest config accepted (a CA certificate is a few kilobytes).
-pub const MAX_CONFIG_LEN: usize = 64 * 1024;
+/// Largest config accepted (a CA certificate is a few kilobytes; a
+/// company's logo, as base64, up to 175).
+pub const MAX_CONFIG_LEN: usize = 256 * 1024;
 
 /// Where a quick assist client connects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +45,11 @@ pub struct AssistConfig {
     pub server_name: String,
     /// PEM CA the server certificate must chain to.
     pub ca_pem: String,
+    /// The company's branding, if the server has one (see
+    /// [`crate::brand`]). It comes with the download because the first
+    /// window is shown before anything touches the network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branding: Option<Branding>,
 }
 
 /// The bytes to append to the executable for `config`.
@@ -82,20 +90,34 @@ pub fn normalize_code(code: &str) -> Option<String> {
 /// Seconds the scam warning must be on screen before it can be accepted.
 pub const WARNING_DELAY_SECS: u32 = 5;
 
-/// What the user must accept before a quick assist client will take a code.
-pub const SCAM_WARNING: &str = "Only continue if you know and trust the person supporting you.\n\n\
-     A real business will never ask you to pay for anything with gift cards or \
-     cryptocurrency. Only scammers do this.\n\n\
-     If someone contacted you unexpectedly, close this window now.";
+/// What the user must accept before a quick assist client will take a
+/// code: the question, what to do about it, and the two things that give
+/// a scam away. `**` marks words to stress.
+pub const WARNING_TITLE: &str = "Do you know who's helping you?";
+pub const WARNING_SUBTITLE: &str = "Only continue if you know and trust them.";
+pub const WARNING_PAYMENT: &str = "A real business will **never** ask you to pay with gift \
+     cards or cryptocurrency. Only scammers do this.";
+pub const WARNING_UNEXPECTED: &str =
+    "If someone contacted you unexpectedly, close this window now.";
 
 /// The accept button's label and whether it can be pressed, with
 /// `remaining` seconds of the delay left.
 pub fn accept_button(remaining: u32) -> (String, bool) {
     if remaining == 0 {
-        ("I understand".to_owned(), true)
+        ("I trust this person".to_owned(), true)
     } else {
-        (format!("I understand ({remaining})"), false)
+        (format!("I trust this person ({remaining})"), false)
     }
+}
+
+/// `text` as runs to draw, each stressed or not: `a **b** c` is `a `,
+/// **`b`**, ` c`.
+pub fn stressed(text: &str) -> Vec<(&str, bool)> {
+    text.split("**")
+        .enumerate()
+        .filter(|(_, run)| !run.is_empty())
+        .map(|(i, run)| (run, i % 2 == 1))
+        .collect()
 }
 
 #[cfg(test)]
@@ -107,6 +129,7 @@ mod tests {
             server: "rmm.example.com:4433".into(),
             server_name: "rmm.example.com".into(),
             ca_pem: "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n".into(),
+            branding: None,
         }
     }
 
@@ -150,9 +173,18 @@ mod tests {
         for remaining in 1..=WARNING_DELAY_SECS {
             let (label, enabled) = accept_button(remaining);
             assert!(!enabled);
-            assert_eq!(label, format!("I understand ({remaining})"));
+            assert_eq!(label, format!("I trust this person ({remaining})"));
         }
-        assert_eq!(accept_button(0), ("I understand".to_owned(), true));
-        assert!(SCAM_WARNING.contains("gift cards") && SCAM_WARNING.contains("cryptocurrency"));
+        assert_eq!(accept_button(0), ("I trust this person".to_owned(), true));
+        assert!(WARNING_PAYMENT.contains("gift") && WARNING_PAYMENT.contains("cryptocurrency"));
+        assert_eq!(
+            stressed("A real business will **never** ask"),
+            [
+                ("A real business will ", false),
+                ("never", true),
+                (" ask", false)
+            ]
+        );
+        assert_eq!(stressed(WARNING_UNEXPECTED), [(WARNING_UNEXPECTED, false)]);
     }
 }

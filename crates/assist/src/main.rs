@@ -46,6 +46,7 @@ fn load_config() -> Option<AssistConfig> {
             server,
             server_name,
             ca_pem,
+            branding: None,
         })
     })
 }

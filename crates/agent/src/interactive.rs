@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use protocol::brand::Branding;
 use protocol::clipboard::ClipboardData;
 use protocol::consent::{ConsentMode, Outcome, PromptAnswer};
 use protocol::credential::CredentialEvent;
@@ -163,10 +164,11 @@ impl Sessions {
 /// Most names the on-screen indicator lists before "+N more".
 const INDICATOR_NAMES: usize = 3;
 
-/// The on-screen session indicator's text for the technicians the user
-/// should see (see [`Sessions::technicians`]), or `None` to hide it.
-/// A technician with several viewers open is named once.
-pub fn indicator_text(technicians: &[String]) -> Option<String> {
+/// Who the on-screen session bar names, for the technicians the user
+/// should see (see [`Sessions::technicians`]): their names, and whether
+/// there is more than one ("jane **is**", "jane, sam **are**"). `None` to
+/// hide the bar. A technician with several viewers open is named once.
+pub fn indicator_who(technicians: &[String]) -> Option<(String, bool)> {
     let mut names: Vec<&str> = Vec::new();
     for t in technicians {
         if !names.contains(&t.as_str()) {
@@ -180,9 +182,7 @@ pub fn indicator_text(technicians: &[String]) -> Option<String> {
     if names.len() > INDICATOR_NAMES {
         who += &format!(" +{} more", names.len() - INDICATOR_NAMES);
     }
-    Some(format!(
-        "Remote support session: {who} \u{b7} Ctrl+F12 to end"
-    ))
+    Some((who, names.len() > 1))
 }
 
 /// Commands for whatever owns the user's desktop.
@@ -233,6 +233,9 @@ pub enum DesktopCommand {
         text: Secret,
         reply: oneshot::Sender<bool>,
     },
+    /// What the user sees from now on wears this company's branding (see
+    /// [`protocol::brand`]), or TetanusRMM's own for `None`.
+    Branding(Option<Branding>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,14 +440,18 @@ mod tests {
     #[test]
     fn indicator_names_each_technician_once_and_hides_when_nobody_is_there() {
         let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(indicator_text(&[]), None);
+        assert_eq!(indicator_who(&[]), None);
         assert_eq!(
-            indicator_text(&names(&["jane", "sam", "jane"])).as_deref(),
-            Some("Remote support session: jane, sam \u{b7} Ctrl+F12 to end")
+            indicator_who(&names(&["jane"])),
+            Some(("jane".to_owned(), false))
         );
         assert_eq!(
-            indicator_text(&names(&["a", "b", "c", "d", "e", "a"])).as_deref(),
-            Some("Remote support session: a, b, c +2 more \u{b7} Ctrl+F12 to end")
+            indicator_who(&names(&["jane", "sam", "jane"])),
+            Some(("jane, sam".to_owned(), true))
+        );
+        assert_eq!(
+            indicator_who(&names(&["a", "b", "c", "d", "e", "a"])),
+            Some(("a, b, c +2 more".to_owned(), true))
         );
     }
 

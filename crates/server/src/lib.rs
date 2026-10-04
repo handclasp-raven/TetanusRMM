@@ -24,6 +24,7 @@ pub mod api;
 pub mod assist;
 pub mod audit;
 pub mod auth;
+pub mod branding;
 pub mod config;
 pub mod db;
 pub mod enroll;

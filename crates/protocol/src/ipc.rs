@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+use crate::brand::Branding;
 use crate::clipboard::ClipboardData;
 use crate::consent::PromptAnswer;
 use crate::input::InputEvent;
@@ -92,6 +93,10 @@ pub enum IpcMessage {
     },
     /// Service to helper: type this where the keyboard focus is.
     TypeText(Secret),
+    /// Service to helper: the company's branding for everything the helper
+    /// shows (see [`crate::brand`]), or `None` for TetanusRMM's own. Sent
+    /// when the server has said, and again when it changes.
+    Branding(Option<Branding>),
 }
 
 /// Text that must not be seen: a password, as UTF-16 units (what Windows'
@@ -156,21 +161,26 @@ pub struct AgentStatus {
 }
 
 impl AgentStatus {
-    /// One-line summary for the tray tooltip.
-    pub fn tooltip(&self) -> String {
-        let state = match (&self.agent_id, self.connected) {
-            (None, _) => "not enrolled".to_owned(),
-            (Some(_), true) => "connected".to_owned(),
-            (Some(_), false) => "disconnected".to_owned(),
-        };
-        format!("RMM Agent {} - {state}", self.version)
+    /// What the agent's connection is doing, in a word or two.
+    pub fn state(&self) -> &'static str {
+        match (&self.agent_id, self.connected) {
+            (None, _) => "Not enrolled",
+            (Some(_), true) => "Connected",
+            (Some(_), false) => "Disconnected",
+        }
+    }
+
+    /// One-line summary for the tray tooltip. `name` is what the agent is
+    /// called (the product's name, or a company's).
+    pub fn tooltip(&self, name: &str) -> String {
+        format!("{name} {} - {}", self.version, self.state().to_lowercase())
     }
 
     /// The tray tooltip, naming everyone connected. Windows truncates
     /// tooltips at [`TOOLTIP_MAX`] characters, so a long list is cut with
     /// "+N more" rather than mid-name.
-    pub fn tooltip_with(&self, technicians: &[String]) -> String {
-        let base = self.tooltip();
+    pub fn tooltip_with(&self, name: &str, technicians: &[String]) -> String {
+        let base = self.tooltip(name);
         if technicians.is_empty() {
             return base;
         }
@@ -279,6 +289,8 @@ mod tests {
         assert!(!format!("{:?}", IpcMessage::TypeText(secret)).contains("104"));
     }
 
+    const NAME: &str = "TetanusRMM Agent";
+
     #[test]
     fn tooltip_lists_technicians_within_the_windows_limit() {
         let s = AgentStatus {
@@ -286,21 +298,24 @@ mod tests {
             connected: true,
             version: "1.0.0".into(),
         };
-        assert_eq!(s.tooltip_with(&[]), "RMM Agent 1.0.0 - connected");
+        assert_eq!(
+            s.tooltip_with(NAME, &[]),
+            "TetanusRMM Agent 1.0.0 - connected"
+        );
         let two = ["jane".to_owned(), "sam".to_owned()];
         assert_eq!(
-            s.tooltip_with(&two),
-            "RMM Agent 1.0.0 - connected\nConnected: jane, sam"
+            s.tooltip_with(NAME, &two),
+            "TetanusRMM Agent 1.0.0 - connected\nConnected: jane, sam"
         );
         let many: Vec<String> = (0..20).map(|i| format!("technician-{i:02}")).collect();
-        let tip = s.tooltip_with(&many);
+        let tip = s.tooltip_with(NAME, &many);
         assert!(tip.chars().count() <= TOOLTIP_MAX, "{tip}");
         assert!(
             tip.contains("technician-00, ") && tip.ends_with(" more"),
             "{tip}"
         );
         let huge = vec!["x".repeat(200)];
-        let tip = s.tooltip_with(&huge);
+        let tip = s.tooltip_with(NAME, &huge);
         assert!(tip.ends_with("1 technicians") && tip.chars().count() <= TOOLTIP_MAX);
     }
 
@@ -311,10 +326,10 @@ mod tests {
             connected: false,
             version: "1.0.0".into(),
         };
-        assert_eq!(s.tooltip(), "RMM Agent 1.0.0 - not enrolled");
+        assert_eq!(s.tooltip(NAME), "TetanusRMM Agent 1.0.0 - not enrolled");
         s.agent_id = Some("agt-1".into());
-        assert_eq!(s.tooltip(), "RMM Agent 1.0.0 - disconnected");
+        assert_eq!(s.tooltip(NAME), "TetanusRMM Agent 1.0.0 - disconnected");
         s.connected = true;
-        assert_eq!(s.tooltip(), "RMM Agent 1.0.0 - connected");
+        assert_eq!(s.tooltip(NAME), "TetanusRMM Agent 1.0.0 - connected");
     }
 }

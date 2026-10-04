@@ -497,6 +497,22 @@ impl AgentSession {
                         credential_reports.store(true, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
+                    Message::Branding(branding) => {
+                        // Not on the server's word alone: a branding that
+                        // cannot be shown is none.
+                        let branding = branding.filter(|b| match b.validate() {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!("branding from the server ignored: {e}");
+                                false
+                            }
+                        });
+                        info!(?branding, "branding from server");
+                        if let Some(desktop) = &self.desktop {
+                            let _ = desktop.commands.send(DesktopCommand::Branding(branding));
+                        }
+                        continue;
+                    }
                     Message::PeerConfig { direct, stun_port } => {
                         info!(direct, ?stun_port, "direct-path policy from server");
                         peers.set_policy(direct, stun_port);

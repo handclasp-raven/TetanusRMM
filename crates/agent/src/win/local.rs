@@ -55,7 +55,8 @@ pub fn start() -> LocalDesktop {
     let (ctl, mut ctl_rx) = unbounded_channel::<IpcMessage>();
     let (out_tx, mut out_rx) = channel::<IpcMessage>(OUT_QUEUE);
     let (to_desktop, mut commands_rx) = unbounded_channel::<IpcMessage>();
-    let mut commands = DesktopCommands::new(ui_tx, ctl.clone(), out_tx);
+    // Quick assist leaves nothing behind: the branding is not kept.
+    let mut commands = DesktopCommands::new(ui_tx, ctl.clone(), out_tx).without_brand_cache();
     bridge.attach(to_desktop);
 
     // Bridge to desktop. Consent prompts and capture have threads of their

@@ -7,6 +7,7 @@ to an agent directly and never needs the viewer for shells or scripts.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import ssl
@@ -532,6 +533,33 @@ class ViewerBuild:
 
 
 @dataclass(frozen=True)
+class Branding:
+    """The server's company branding (see ``branding``)."""
+
+    name: str
+    #: ``#RRGGBB``; ``None`` for TetanusRMM's rust.
+    accent: str | None = None
+    #: A PNG; ``None`` for the TetanusRMM mark.
+    logo_png: bytes | None = None
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Branding:
+        logo = d.get("logo_png")
+        return cls(
+            name=d["name"],
+            accent=d.get("accent"),
+            logo_png=base64.b64decode(logo, validate=True) if logo else None,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "accent": self.accent,
+            "logo_png": base64.b64encode(self.logo_png).decode() if self.logo_png else None,
+        }
+
+
+@dataclass(frozen=True)
 class TuiBuild:
     """The TUI wheel the server publishes."""
 
@@ -908,6 +936,31 @@ class ApiClient:
             return ViewerBuild.from_json(response.json())
         except (ValueError, KeyError, TypeError) as e:
             raise ApiError(0, "the server sent a malformed viewer manifest") from e
+
+    async def branding(self) -> Branding | None:
+        """The company branding in force; ``None`` if it is TetanusRMM's own
+        (or the server is too old to have any)."""
+        try:
+            response = await self._request("GET", "/api/branding", auth=False)
+        except ApiError as e:
+            if e.status == 404:
+                return None
+            raise
+        try:
+            # `null` (or nothing at all) when none is set.
+            body = response.json() if response.content.strip() else None
+            return Branding.from_json(body) if body else None
+        except (ValueError, KeyError, TypeError) as e:
+            raise ApiError(0, "the server sent malformed branding") from e
+
+    async def set_branding(self, branding: Branding) -> Branding:
+        """Set the company branding (admins). Returns it as the server kept it."""
+        response = await self._request("PUT", "/api/branding", json=branding.to_json())
+        return Branding.from_json(response.json())
+
+    async def reset_branding(self) -> None:
+        """Back to TetanusRMM's own look (admins)."""
+        await self._request("DELETE", "/api/branding")
 
     async def tui_build(self) -> TuiBuild | None:
         """The TUI wheel the server publishes; ``None`` if there is none (or

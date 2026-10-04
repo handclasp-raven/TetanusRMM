@@ -659,6 +659,13 @@ async fn serve_agent(
     if version >= protocol::MIN_CREDENTIAL_VERSION && hooks.registry.is_some() {
         let _ = to_agent.send(Message::EnableCredentialReports);
     }
+    // What its user should see: the company's branding, or none.
+    if version >= protocol::MIN_BRANDING_VERSION {
+        if let Some(registry) = &hooks.registry {
+            let branding = crate::branding::load_or_default(&registry.pool).await;
+            let _ = to_agent.send(Message::Branding(branding));
+        }
+    }
     // Where the agent connects from; re-recorded when that changes.
     let mut remote_ip = None;
 

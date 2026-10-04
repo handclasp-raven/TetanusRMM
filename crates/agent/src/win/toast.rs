@@ -17,11 +17,27 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 
-/// Our AppUserModelID; the toast's source line shows [`DISPLAY_NAME`].
-const APP_ID: &str = "RMM.Agent";
-const DISPLAY_NAME: &str = "RMM Agent";
+/// Our AppUserModelID, whose registered name is the toast's source line.
+/// Windows remembers the name it first saw for an id, so each name the
+/// agent goes by (TetanusRMM's, or a company's) has an id of its own.
+fn app_id(name: &str) -> String {
+    if name == brand::AGENT_NAME {
+        return "TetanusRMM.Agent".to_owned();
+    }
+    // FNV-1a: stable from run to run, which is all that is needed.
+    let hash = name.bytes().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    format!("TetanusRMM.Agent.{hash:08x}")
+}
 
-/// Register the AppUserModelID (idempotent). Call once at helper start.
+/// What the agent is called now.
+fn agent_name() -> String {
+    super::ui::look::Look::current().agent_name()
+}
+
+/// Register the AppUserModelID under the agent's current name
+/// (idempotent). Call at helper start, and when the branding changes.
 pub fn register() {
     if let Err(e) = register_app_id() {
         warn!("registering toast app id: {e}");
@@ -29,7 +45,11 @@ pub fn register() {
 }
 
 fn register_app_id() -> Result<()> {
-    let path = HSTRING::from(format!(r"Software\Classes\AppUserModelId\{APP_ID}"));
+    let name = agent_name();
+    let path = HSTRING::from(format!(
+        r"Software\Classes\AppUserModelId\{}",
+        app_id(&name)
+    ));
     let mut key = HKEY::default();
     // SAFETY: creating/opening a key under HKCU with an owned path; the
     // value is a NUL-terminated UTF-16 string of the stated length.
@@ -46,7 +66,7 @@ fn register_app_id() -> Result<()> {
             None,
         )
         .ok()?;
-        let name: Vec<u16> = DISPLAY_NAME.encode_utf16().chain([0]).collect();
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let bytes = std::slice::from_raw_parts(name.as_ptr().cast::<u8>(), name.len() * 2);
         let set = RegSetValueExW(
             key,
@@ -84,7 +104,8 @@ fn show(technician: &str) -> Result<()> {
     let doc = XmlDocument::new()?;
     doc.LoadXml(&HSTRING::from(xml))?;
     let toast = ToastNotification::CreateToastNotification(&doc)?;
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?.Show(&toast)
+    let id = app_id(&agent_name());
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(id))?.Show(&toast)
 }
 
 /// Minimal XML text escaping for a user name.
@@ -98,6 +119,16 @@ fn escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_name_has_its_own_stable_id() {
+        use super::app_id;
+        assert_eq!(app_id("TetanusRMM Agent"), "TetanusRMM.Agent");
+        let contoso = app_id("Contoso IT Support Agent");
+        assert!(contoso.starts_with("TetanusRMM.Agent.") && contoso.len() == 25);
+        assert_eq!(contoso, app_id("Contoso IT Support Agent"));
+        assert_ne!(contoso, app_id("Fabrikam Support Agent"));
+    }
+
     #[test]
     fn names_are_escaped() {
         assert_eq!(super::escape("A&B <x>"), "A&amp;B &lt;x&gt;");

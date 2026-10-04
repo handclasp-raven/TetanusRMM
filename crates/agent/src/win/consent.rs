@@ -1,42 +1,88 @@
-//! The blocking consent prompt (`require` mode): a topmost Yes/No message
-//! box on the user's desktop. It runs on its own thread so the tray, the
-//! Ctrl+F12 hotkey and other prompts keep working. A timer thread closes it
-//! as "no" when the timeout passes (answer: timed out) or when the server
-//! withdraws the request (no answer is sent).
+//! The blocking consent prompt (`require` mode): a topmost dialog on the
+//! user's desktop naming the technician, what allowing them means, and a
+//! bar that runs down to the moment it declines by itself. It runs on its
+//! own thread so the tray, the Ctrl+F12 hotkey and other prompts keep
+//! working. It closes as "no" when the timeout passes (answer: timed out)
+//! or when the server withdraws the request (no answer is sent).
+//!
+//! Allow is the dialog's main button, but the keyboard starts on Decline:
+//! Enter, or a stray key meant for another window, never lets anyone in.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
+use brand::icons;
 use protocol::consent::PromptAnswer;
 use tracing::{info, warn};
-use windows::core::{BOOL, HSTRING};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, MessageBoxW, PostMessageW, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION,
-    MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, WM_COMMAND,
+
+use super::ui::dialog::{
+    self, Block, Button, Dialog, Event, Focus, Lead, Options, Row, Spec, Tone,
 };
+use super::ui::look::Look;
 
-const OPEN: u8 = 0;
-const TIMED_OUT: u8 = 1;
-const CANCELLED: u8 = 2;
+const ALLOW: u32 = 1;
+const DECLINE: u32 = 2;
 
-enum Control {
-    Answered,
-    Cancel,
-}
+/// Longest technician name shown.
+const NAME_CHARS: usize = 64;
 
 /// A prompt on screen. Dropping it does not close it; [`Prompt::cancel`] does.
 pub struct Prompt {
-    control: mpsc::Sender<Control>,
+    cancel: mpsc::Sender<()>,
 }
 
 impl Prompt {
     /// Withdraw the prompt (the technician left, or the user pressed Ctrl+F12).
     pub fn cancel(&self) {
-        let _ = self.control.send(Control::Cancel);
+        let _ = self.cancel.send(());
+    }
+}
+
+/// A technician's initial, for their avatar.
+pub fn initial(name: &str) -> String {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+fn spec(name: &str, remaining: Duration, timeout: Duration) -> Spec {
+    let look = Look::current();
+    // Whole seconds left, counting the one in progress.
+    let secs = remaining.as_millis().div_ceil(1000);
+    Spec {
+        title: "Remote support request".into(),
+        blocks: vec![
+            Block::Header {
+                lead: Lead::Avatar(initial(name)),
+                title: format!("{name} wants to control this PC"),
+                subtitle: format!("From {}", look.team()),
+            },
+            Block::Label(format!("If you allow it, {name} can:")),
+            Block::Rows(vec![
+                Row {
+                    icon: icons::VIEW,
+                    tone: Tone::Accent,
+                    text: "See everything on your screen".into(),
+                },
+                Row {
+                    icon: icons::REMOTE,
+                    tone: Tone::Accent,
+                    text: "Use your mouse and keyboard".into(),
+                },
+            ]),
+            Block::Countdown {
+                fraction: remaining.as_secs_f32() / timeout.as_secs_f32().max(1.0),
+                left: format!("Declines automatically in {secs} s"),
+            },
+        ],
+        buttons: vec![
+            Button::new(DECLINE, "Decline"),
+            Button::new(ALLOW, "Allow").primary(),
+        ],
+        focus: Focus::Button(DECLINE),
+        default: None,
+        cancel: Some(DECLINE),
     }
 }
 
@@ -47,81 +93,81 @@ pub fn show(
     timeout: Duration,
     answer: impl FnOnce(PromptAnswer) + Send + 'static,
 ) -> Prompt {
-    let (control, control_rx) = mpsc::channel();
-    let state = Arc::new(AtomicU8::new(OPEN));
-    let thread_id = Arc::new(AtomicU32::new(0));
-    let text = format!(
-        "{technician} from your IT support team wants to connect to this computer \
-         and control it remotely.\n\n\
-         Allow the remote session?\n\n\
-         If you do not answer within {} seconds, the request is declined.\n\
-         You can end remote sessions at any time with Ctrl+F12.",
-        timeout.as_secs()
-    );
-
+    let (cancel, cancelled) = mpsc::channel();
+    let name: String = technician.chars().take(NAME_CHARS).collect();
     std::thread::Builder::new()
         .name("consent-prompt".into())
-        .spawn({
-            let state = state.clone();
-            let thread_id = thread_id.clone();
-            let control = control.clone();
-            move || {
-                // SAFETY: plain thread id query.
-                thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
-                // SAFETY: modal message box with owned strings; blocks this
-                // thread only.
-                let result = unsafe {
-                    MessageBoxW(
-                        None,
-                        &HSTRING::from(text),
-                        &HSTRING::from("Remote support request"),
-                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND,
-                    )
-                };
-                let _ = control.send(Control::Answered);
-                let reply = match (result, state.load(Ordering::SeqCst)) {
-                    (_, CANCELLED) => None,
-                    (IDYES, _) => Some(PromptAnswer::Accepted),
-                    (_, TIMED_OUT) => Some(PromptAnswer::TimedOut),
-                    _ => Some(PromptAnswer::Declined),
-                };
-                info!(?result, ?reply, "consent prompt closed");
-                if let Some(reply) = reply {
-                    answer(reply);
+        .spawn(move || {
+            let deadline = Instant::now() + timeout;
+            let options = Options {
+                topmost: true,
+                ..Default::default()
+            };
+            let dialog = match Dialog::open(spec(&name, timeout, timeout), options) {
+                Ok(dialog) => dialog,
+                Err(e) => {
+                    // Nothing was shown, so nobody could say yes.
+                    warn!("the consent prompt could not be shown: {e}");
+                    return answer(PromptAnswer::Unavailable);
                 }
+            };
+            let mut reply = None;
+            dialog::run(&dialog, |dialog, events| {
+                if cancelled.try_recv() != Err(mpsc::TryRecvError::Empty) {
+                    // Withdrawn (or its owner is gone): no answer.
+                    return false;
+                }
+                if let Some(event) = events.first() {
+                    reply = Some(match event {
+                        Event::Button(ALLOW) => PromptAnswer::Accepted,
+                        _ => PromptAnswer::Declined,
+                    });
+                    return false;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    reply = Some(PromptAnswer::TimedOut);
+                    return false;
+                }
+                dialog.set(spec(&name, remaining, timeout));
+                true
+            });
+            drop(dialog);
+            info!(?reply, "consent prompt closed");
+            if let Some(reply) = reply {
+                answer(reply);
             }
         })
         .expect("spawn consent prompt thread");
-
-    std::thread::Builder::new()
-        .name("consent-timer".into())
-        .spawn(move || {
-            let close_as = match control_rx.recv_timeout(timeout) {
-                Ok(Control::Answered) | Err(RecvTimeoutError::Disconnected) => return,
-                Ok(Control::Cancel) => CANCELLED,
-                Err(RecvTimeoutError::Timeout) => TIMED_OUT,
-            };
-            state.store(close_as, Ordering::SeqCst);
-            close_windows_of(thread_id.load(Ordering::SeqCst));
-        })
-        .expect("spawn consent timer thread");
-
-    Prompt { control }
+    Prompt { cancel }
 }
 
-/// Press "No" on the message box owned by `thread_id`.
-fn close_windows_of(thread_id: u32) {
-    extern "system" fn press_no(hwnd: HWND, _: LPARAM) -> BOOL {
-        // SAFETY: posting a command to a window we enumerated.
-        if let Err(e) =
-            unsafe { PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(IDNO.0 as usize), LPARAM(0)) }
-        {
-            warn!("closing consent prompt: {e}");
-        }
-        true.into()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatars_show_the_first_letter() {
+        assert_eq!(initial("roker"), "R");
+        assert_eq!(initial(" jane doe"), "J");
+        assert_eq!(initial("9lives"), "9");
+        assert_eq!(initial("--"), "?");
+        assert_eq!(initial(""), "?");
     }
-    if thread_id != 0 {
-        // SAFETY: enumerates that thread's windows with a valid callback.
-        let _ = unsafe { EnumThreadWindows(thread_id, Some(press_no), LPARAM(0)) };
+
+    #[test]
+    fn the_keyboard_starts_on_decline() {
+        let spec = spec(
+            "roker",
+            Duration::from_millis(47_200),
+            Duration::from_secs(60),
+        );
+        assert_eq!(spec.focus, Focus::Button(DECLINE));
+        assert_eq!((spec.default, spec.cancel), (None, Some(DECLINE)));
+        let Block::Countdown { fraction, left } = &spec.blocks[3] else {
+            panic!("no countdown")
+        };
+        assert_eq!(left, "Declines automatically in 48 s");
+        assert!((fraction - 0.787).abs() < 0.01);
     }
 }

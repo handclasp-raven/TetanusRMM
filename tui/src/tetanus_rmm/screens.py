@@ -363,6 +363,7 @@ class MainScreen(Screen):
         Binding("e", "themes", "Edit themes", show=False),
         Binding("v", "viewer_commands", "Viewer buttons", show=False),
         Binding("b", "bitwarden", "Bitwarden: unlock / lock", show=False),
+        Binding("B", "branding", "Company branding", show=False),
         Binding("U", "check_updates", "Check for updates", show=False),
         Binding("f5", "refresh", "Refresh", show=False),
         Binding("l", "logout", "Sign out", show=False),
@@ -382,7 +383,7 @@ class MainScreen(Screen):
             "quick_assist",
         ],
         "View": ["search", "filter", "columns", "stats", "app.change_theme", "themes", "refresh"],
-        "Manage": ["groups", "users", "audit", "viewer_commands"],
+        "Manage": ["groups", "users", "audit", "viewer_commands", "branding"],
         "Session": ["bitwarden", "check_updates", "logout", "app.quit"],
     }
 
@@ -508,7 +509,7 @@ class MainScreen(Screen):
             return bool(user and user.can_enroll)
         if action == "quick_assist":
             return bool(user and user.can_control)
-        if action in ("classify", "users"):
+        if action in ("classify", "users", "branding"):
             return bool(user and user.is_admin)
         return True
 
@@ -917,6 +918,11 @@ class MainScreen(Screen):
         from .users import UsersScreen
 
         self.app.push_screen(UsersScreen(list(self.agents.values())))
+
+    def action_branding(self) -> None:
+        from .branding import BrandingScreen
+
+        self.app.push_screen(BrandingScreen(self.app.session.api))
 
     def action_bitwarden(self) -> None:
         """Unlock the Bitwarden vault for the viewers, or lock it again."""

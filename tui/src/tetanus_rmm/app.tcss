@@ -675,3 +675,25 @@ RoleScreen, PasswordScreen, TotpScreen, GrantsScreen, GrantEditScreen, TrustScre
     min-width: 6;
     margin-left: 1;
 }
+
+/* Company branding */
+
+#br-colour-row {
+    height: auto;
+    margin-top: 1;
+}
+
+#br-colour-row Input {
+    width: 1fr;
+}
+
+#br-swatch {
+    width: 8;
+    height: 3;
+    margin-left: 1;
+    content-align: center middle;
+}
+
+#branding-box Checkbox {
+    margin-top: 1;
+}

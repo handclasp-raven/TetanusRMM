@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent::interactive::{desktop_channel, DesktopCommand, DesktopEnd, DesktopEvent};
+use protocol::brand::Branding;
 use protocol::clipboard::ClipboardData;
 use protocol::consent::{DeviceKind, PromptAnswer};
 use protocol::credential::CredentialEvent;
@@ -44,6 +45,7 @@ enum Seen {
     CredentialForget,
     /// Text from a vault, as the desktop was given it.
     TypeText(Vec<u16>),
+    Branding(Option<Branding>),
 }
 
 struct FakeDesktop {
@@ -153,6 +155,7 @@ fn run_desktop(mut end: DesktopEnd, fake: Arc<FakeDesktop>) {
                     let _ = reply.send(fake.password.swap(false, Ordering::SeqCst));
                     Seen::CredentialForget
                 }
+                DesktopCommand::Branding(branding) => Seen::Branding(branding),
                 DesktopCommand::TypeText { text, reply } => {
                     let _ = reply.send(fake.takes_text.load(Ordering::SeqCst));
                     Seen::TypeText(text.units().to_vec())
@@ -164,6 +167,7 @@ fn run_desktop(mut end: DesktopEnd, fake: Arc<FakeDesktop>) {
 }
 
 struct Rig {
+    hub: Arc<server::relay::Hub>,
     db: support::TestDb,
     certs: common::devcerts::DevCerts,
     addr: std::net::SocketAddr,
@@ -176,6 +180,7 @@ async fn rig_as(kind: DeviceKind) -> Rig {
     let db = start_db().await;
     let certs = common::devcerts::generate("unused").unwrap();
     let (quic, addr, _events) = support::start_quic(db.pool.clone(), &certs);
+    let hub = quic.hub();
     std::mem::forget(quic);
 
     let token = server::enroll::create_token(&db.pool, "root", Duration::from_secs(600))
@@ -218,6 +223,7 @@ async fn rig_as(kind: DeviceKind) -> Rig {
 
     let admin = create_user(&db.pool, "root", Role::Admin).await;
     let rig = Rig {
+        hub,
         db,
         certs,
         addr,
@@ -908,4 +914,64 @@ async fn text_from_a_vault_is_typed_and_audited_without_the_text() {
         .await
         .unwrap();
     assert!(all.iter().all(|(d,)| !d.to_string().contains("hunter2")));
+}
+
+#[tokio::test]
+async fn an_agent_is_told_the_branding_on_connecting_and_when_it_changes() {
+    let rig = rig().await;
+    let branding = |seen: &[Seen]| -> Vec<Option<Branding>> {
+        seen.iter()
+            .filter_map(|s| match s {
+                Seen::Branding(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // Nothing set: on connecting it is told so (TetanusRMM's own look).
+    rig.desktop
+        .wait_until("the branding at connect", |seen| branding(seen) == [None])
+        .await;
+
+    // An admin sets one: every connected agent hears at once.
+    let contoso = Branding {
+        name: "Contoso IT".into(),
+        accent: Some([0x0B, 0x5C, 0xAD]),
+        logo_png: None,
+    };
+    server::branding::save(&rig.db.pool, "root", &contoso)
+        .await
+        .unwrap();
+    rig.hub.broadcast(
+        &protocol::Message::Branding(Some(contoso.clone())),
+        protocol::MIN_BRANDING_VERSION,
+    );
+    rig.desktop
+        .wait_until("the new branding", |seen| {
+            branding(seen) == [None, Some(contoso.clone())]
+        })
+        .await;
+
+    // One the agent cannot show (the server should never send it) is none.
+    let too_light = Branding {
+        accent: Some([0xFF, 0xEE, 0x00]),
+        ..contoso.clone()
+    };
+    rig.hub.broadcast(
+        &protocol::Message::Branding(Some(too_light)),
+        protocol::MIN_BRANDING_VERSION,
+    );
+    rig.desktop
+        .wait_until("the unusable branding dropped", |seen| {
+            branding(seen).len() == 3 && branding(seen)[2].is_none()
+        })
+        .await;
+    // Agents too old to know the message are not sent it.
+    rig.hub
+        .broadcast(&protocol::Message::Branding(None), u32::MAX);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(branding(&rig.desktop.seen()).len(), 3);
+    assert_eq!(
+        server::branding::load(&rig.db.pool).await.unwrap(),
+        Some(contoso)
+    );
 }

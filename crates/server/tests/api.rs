@@ -240,3 +240,120 @@ async fn auditors_and_admins_read_and_verify_the_audit_log() {
         );
     }
 }
+
+/// A PNG header saying `width` x `height`.
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    out.extend_from_slice(&13u32.to_be_bytes());
+    out.extend_from_slice(b"IHDR");
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    out
+}
+
+#[tokio::test]
+async fn branding_is_read_by_anyone_and_set_by_admins_only() {
+    use protocol::brand::base64;
+    let db = start_db().await;
+    let api = start_api(db.pool.clone()).await;
+    let admin = create_user(&db.pool, "root", Role::Admin).await;
+    let engineer = create_user(&db.pool, "jane", Role::SupportEngineer).await;
+    let root = api.session("root", &admin.totp_secret).await;
+    let jane = api.session("jane", &engineer.totp_secret).await;
+    let url = api.url("/api/branding");
+
+    // Nothing set: null, without signing in.
+    let get = || async {
+        let resp = api.client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json::<Value>().await.unwrap()
+    };
+    assert_eq!(get().await, Value::Null);
+
+    let logo = base64::encode(&png(128, 96));
+    let contoso = json!({ "name": "  Contoso IT ", "accent": "#0b5cad", "logo_png": logo });
+    let put = |token: &str, body: Value| {
+        let request = api.client.put(&url).bearer_auth(token).json(&body);
+        async move { request.send().await.unwrap() }
+    };
+    // Not signed in, and not an admin: refused, and nothing changes.
+    let anonymous = api.client.put(&url).json(&contoso).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        put(&jane, contoso.clone()).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(get().await, Value::Null);
+
+    let saved = put(&root, contoso.clone()).await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let expected = json!({ "name": "Contoso IT", "accent": "#0B5CAD", "logo_png": logo });
+    assert_eq!(saved.json::<Value>().await.unwrap(), expected);
+    assert_eq!(get().await, expected);
+
+    // What cannot be shown is refused with the reason, and the last one stays.
+    for (body, why) in [
+        (json!({ "name": "" }), "name"),
+        (json!({ "name": "x".repeat(49) }), "name"),
+        (json!({ "name": "Contoso", "accent": "blue" }), "#RRGGBB"),
+        (
+            json!({ "name": "Contoso", "accent": "#FFEE00" }),
+            "too light",
+        ),
+        (json!({ "name": "Contoso", "logo_png": "***" }), "base64"),
+        (
+            json!({ "name": "Contoso", "logo_png": base64::encode(b"GIF89a") }),
+            "PNG",
+        ),
+        (
+            json!({ "name": "Contoso", "logo_png": base64::encode(&png(2048, 64)) }),
+            "2048x64",
+        ),
+    ] {
+        let resp = put(&root, body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        let error = resp.json::<Value>().await.unwrap()["error"].to_string();
+        assert!(error.contains(why), "{body}: {error}");
+    }
+    assert_eq!(get().await, expected);
+
+    // A name alone is a branding too; it replaces the whole of the last.
+    let name_only = put(&root, json!({ "name": "Contoso" })).await;
+    assert_eq!(
+        name_only.json::<Value>().await.unwrap(),
+        json!({ "name": "Contoso", "accent": null, "logo_png": null })
+    );
+
+    // Reset: admins only, and back to null.
+    let delete = |token: &str| {
+        let request = api.client.delete(&url).bearer_auth(token);
+        async move { request.send().await.unwrap().status() }
+    };
+    assert_eq!(delete(&jane).await, StatusCode::FORBIDDEN);
+    assert_eq!(delete(&root).await, StatusCode::OK);
+    assert_eq!(get().await, Value::Null);
+    assert_eq!(delete(&root).await, StatusCode::OK);
+
+    // Audited: two sets and one reset, by the admin, without the logo.
+    let rows: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT actor, detail FROM audit_log WHERE action = 'branding.update' ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (
+                "root".to_owned(),
+                json!({ "name": "Contoso IT", "accent": "#0B5CAD", "logo": true })
+            ),
+            (
+                "root".to_owned(),
+                json!({ "name": "Contoso", "accent": null, "logo": false })
+            ),
+            ("root".to_owned(), json!({ "reset": true })),
+        ]
+    );
+}

@@ -4,9 +4,10 @@
 //!
 //! It owns everything that must happen on the user's desktop:
 //! - the tray icon: connection state, and everyone connected right now
-//!   (tooltip and menu), with "End all remote sessions";
+//!   (tooltip and flyout), with "End all remote sessions";
 //! - the Ctrl+F12 hotkey, which ends every remote session;
-//! - the on-screen session indicator naming who is connected;
+//! - the on-screen session bar naming who is connected, with its own
+//!   "End session";
 //! - consent prompts (`require` mode) and "technician connected" toasts;
 //! - the prompt for a password to lend the technicians;
 //! - input injection, clipboard sync, and (in `stream`) screen capture.
@@ -24,17 +25,18 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use brand::mark::TrayState;
+use brand::raster;
 use protocol::clipboard::{ClipboardData, ClipboardGuard};
 use protocol::ipc::{AgentStatus, IpcMessage, PIPE_NAME};
 use protocol::{read_frame, write_frame};
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, warn};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::core::HSTRING;
+use tray_icon::{Icon, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -43,20 +45,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_F12,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage,
-    MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, QS_ALLINPUT, WM_HOTKEY,
+    DispatchMessageW, GetSystemMetrics, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage,
+    MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSMICON, WM_HOTKEY,
 };
 
 use super::clipboard::Listener;
+use super::flyout::{self, Flyout};
 use super::indicator::Indicator;
 use super::input::Injector;
 use super::stream::{self, Desktops, WorkerCommand};
+use super::ui::about;
+use super::ui::look::{self, Look};
 use super::{consent, credential, toast};
 use crate::core;
-use crate::interactive::indicator_text;
-
-/// How often the indicator is put back on top of other topmost windows.
-const INDICATOR_REFRESH: Duration = Duration::from_secs(3);
+use crate::interactive::indicator_who;
 
 /// Windows error code when all pipe instances are busy.
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -84,6 +86,8 @@ pub fn run() -> anyhow::Result<()> {
     {
         warn!("setting DPI awareness: {e}");
     }
+    // The branding last heard of, until the service says what it is now.
+    look::load_cached();
     toast::register();
     let session_id = current_session_id();
     info!(pid = std::process::id(), ?session_id, "helper starting");
@@ -191,6 +195,9 @@ pub struct DesktopCommands {
     ui: mpsc::Sender<UiEvent>,
     /// Answers, to the service.
     ctl: UnboundedSender<IpcMessage>,
+    /// Whether the branding is kept for the next start (the helper), or
+    /// only used (quick assist, which leaves nothing behind).
+    remember_branding: bool,
 }
 
 impl DesktopCommands {
@@ -207,7 +214,14 @@ impl DesktopCommands {
             worker: stream::spawn(out, Desktops::Own),
             ui,
             ctl,
+            remember_branding: true,
         }
+    }
+
+    /// Use the branding the server sends without keeping it on disk.
+    pub fn without_brand_cache(mut self) -> Self {
+        self.remember_branding = false;
+        self
     }
 
     /// Act on one message from the service. `false` once the UI thread or
@@ -215,7 +229,7 @@ impl DesktopCommands {
     pub fn handle(&mut self, message: IpcMessage) -> bool {
         let command = match message {
             IpcMessage::Status(status) => {
-                info!(tooltip = %status.tooltip(), "status from service");
+                info!(state = status.state(), "status from service");
                 return self.ui.send(UiEvent::Status(status)).is_ok();
             }
             IpcMessage::Technicians(list) => {
@@ -231,6 +245,16 @@ impl DesktopCommands {
             }
             IpcMessage::SetClipboard(data) => {
                 let _ = self.ui.send(UiEvent::SetClipboard(data));
+                return true;
+            }
+            IpcMessage::Branding(branding) => {
+                // Every window follows by itself (see `look::stamp`).
+                if self.remember_branding {
+                    look::set_branding(branding);
+                } else {
+                    look::use_branding(branding);
+                }
+                toast::register();
                 return true;
             }
             IpcMessage::Toast { technician } => {
@@ -314,7 +338,6 @@ pub struct DesktopUi {
     clipboard: Option<Listener>,
     guard: RefCell<ClipboardGuard>,
     indicator: RefCell<Option<Indicator>>,
-    indicator_refreshed: Cell<Instant>,
     /// To the service.
     ctl: UnboundedSender<IpcMessage>,
 }
@@ -359,7 +382,6 @@ impl DesktopUi {
             clipboard,
             guard: RefCell::new(guard),
             indicator: RefCell::new(indicator),
-            indicator_refreshed: Cell::new(Instant::now()),
             ctl,
         }
     }
@@ -376,7 +398,8 @@ impl DesktopUi {
     }
 
     /// Call every turn of the message loop: passes on a changed clipboard,
-    /// and keeps the indicator on top.
+    /// looks after the session bar, and ends the sessions if its button
+    /// was pressed.
     pub fn poll(&self) {
         if let Some(clipboard) = self.clipboard.as_ref().filter(|c| c.changed()) {
             if let Some(data) = clipboard.read() {
@@ -386,18 +409,19 @@ impl DesktopUi {
                 }
             }
         }
-        if self.indicator_refreshed.get().elapsed() >= INDICATOR_REFRESH {
-            self.indicator_refreshed.set(Instant::now());
-            if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
-                indicator.refresh();
-            }
+        let ended = self.indicator.borrow_mut().as_mut().is_some_and(|bar| {
+            bar.tick();
+            bar.take_end()
+        });
+        if ended {
+            self.kill_switch("session bar");
         }
     }
 
     /// Who is connected now: shows, updates or hides the indicator.
     pub fn set_technicians(&self, list: &[String]) {
         if let Some(indicator) = self.indicator.borrow_mut().as_mut() {
-            indicator.set(indicator_text(list));
+            indicator.set(indicator_who(list));
         }
     }
 
@@ -451,12 +475,12 @@ pub(super) async fn connect() -> std::io::Result<tokio::net::windows::named_pipe
 
 struct Tray {
     icon: TrayIcon,
-    status_item: MenuItem,
-    technicians_item: MenuItem,
-    end_sessions_item: MenuItem,
-    about_item: MenuItem,
+    /// What a click on the icon opens (see `super::flyout`).
+    flyout: Option<Flyout>,
     status: RefCell<AgentStatus>,
     technicians: RefCell<Vec<String>>,
+    /// The look the icon was last drawn with (see [`look::stamp`]).
+    stamp: Cell<(u64, bool, bool)>,
     /// The tooltip/icon still need applying.
     ///
     /// At logon the helper can start before Explorer has created the taskbar.
@@ -473,39 +497,31 @@ struct Tray {
 impl Tray {
     fn new(ctl: UnboundedSender<IpcMessage>) -> anyhow::Result<Self> {
         let initial = core::initial_status(None);
-        let status_item = MenuItem::new(initial.tooltip(), false, None);
-        let technicians_item = MenuItem::new(technicians_text(&[]), false, None);
-        let end_sessions_item = MenuItem::new("End all remote sessions (Ctrl+F12)", false, None);
-        let about_item = MenuItem::new("About RMM Agent", true, None);
-        // Deliberately disabled: users cannot stop the agent from the tray.
-        let quit_item = MenuItem::new("Quit (managed by your administrator)", false, None);
-        let menu = Menu::new();
-        menu.append(&status_item)?;
-        menu.append(&technicians_item)?;
-        menu.append(&end_sessions_item)?;
-        menu.append(&PredefinedMenuItem::separator())?;
-        menu.append(&about_item)?;
-        menu.append(&quit_item)?;
+        // No menu: a click opens the flyout.
         let icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip(initial.tooltip())
-            .with_icon(status_icon(&initial, false))
+            .with_tooltip(initial.tooltip(&Look::current().agent_name()))
+            .with_icon(tray_image(&initial, false))
             .build()?;
+        let flyout = match Flyout::new(initial.clone()) {
+            Ok(flyout) => Some(flyout),
+            Err(e) => {
+                warn!("the tray flyout is unavailable: {e}");
+                None
+            }
+        };
 
         Ok(Self {
             icon,
-            status_item,
-            technicians_item,
-            end_sessions_item,
-            about_item,
+            flyout,
             status: RefCell::new(initial),
             technicians: RefCell::new(Vec::new()),
+            stamp: Cell::new(look::stamp()),
             dirty: Cell::new(false),
             desktop: DesktopUi::new(ctl),
         })
     }
 
-    /// Win32 message loop plus polling of menu, clipboard and service
+    /// Win32 message loop plus polling of the tray, clipboard and service
     /// events. Returns when the service disconnects.
     fn run(&self, ui: &mpsc::Receiver<UiEvent>) {
         loop {
@@ -527,21 +543,48 @@ impl Tray {
                     DispatchMessageW(&msg);
                 }
             }
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                debug!(id = ?event.id, "menu event");
-                if event.id == *self.about_item.id() {
-                    show_about();
-                } else if event.id == *self.end_sessions_item.id() {
-                    self.desktop.kill_switch("tray menu");
+            // A click on the icon, either button, opens the flyout.
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                if let TrayIconEvent::Click {
+                    rect,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    let (left, top) = (rect.position.x as i32, rect.position.y as i32);
+                    if let Some(flyout) = &self.flyout {
+                        flyout.toggle(RECT {
+                            left,
+                            top,
+                            right: left + rect.size.width as i32,
+                            bottom: top + rect.size.height as i32,
+                        });
+                    }
                 }
             }
-            // Clicks on the icon itself are not used; drain them.
-            while TrayIconEvent::receiver().try_recv().is_ok() {}
+            if let Some(flyout) = &self.flyout {
+                flyout.tick();
+            }
+            for action in self.flyout.iter().flat_map(Flyout::take_actions) {
+                debug!(?action, "tray flyout");
+                match action {
+                    flyout::Action::About => about::show(),
+                    flyout::Action::EndSessions => self.desktop.kill_switch("tray"),
+                }
+            }
+            // Light or dark, or the branding, changed: the icon follows.
+            let stamp = look::stamp();
+            if self.stamp.replace(stamp) != stamp {
+                self.dirty.set(true);
+                if let Some(flyout) = &self.flyout {
+                    flyout.restyle();
+                }
+            }
 
             loop {
                 match ui.try_recv() {
                     Ok(UiEvent::Status(status)) => {
-                        info!(tooltip = %status.tooltip(), "status changed");
+                        info!(state = status.state(), "status changed");
                         *self.status.borrow_mut() = status;
                         self.dirty.set(true);
                     }
@@ -566,15 +609,14 @@ impl Tray {
         }
         let status = self.status.borrow();
         let technicians = self.technicians.borrow();
-        let tooltip = status.tooltip_with(&technicians);
-        self.status_item.set_text(status.tooltip());
-        self.technicians_item
-            .set_text(technicians_text(&technicians));
-        self.end_sessions_item.set_enabled(!technicians.is_empty());
+        let tooltip = status.tooltip_with(&Look::current().agent_name(), &technicians);
+        if let Some(flyout) = &self.flyout {
+            flyout.update(&status, &technicians);
+        }
         let applied = self.icon.set_tooltip(Some(&tooltip)).is_ok()
             && self
                 .icon
-                .set_icon(Some(status_icon(&status, !technicians.is_empty())))
+                .set_icon(Some(tray_image(&status, !technicians.is_empty())))
                 .is_ok();
         if applied {
             info!(%tooltip, "tray updated");
@@ -583,53 +625,32 @@ impl Tray {
     }
 }
 
-fn technicians_text(technicians: &[String]) -> String {
-    if technicians.is_empty() {
-        "No remote sessions".to_owned()
-    } else {
-        format!("Connected: {}", technicians.join(", "))
-    }
-}
-
-fn show_about() {
-    let text = format!(
-        "RMM Agent {}\n\nThis computer is managed remotely by your IT team.\n\
-         Press Ctrl+F12 at any time to end all remote sessions.",
-        core::version()
-    );
-    // SAFETY: plain modal message box with owned strings.
-    let result = unsafe {
-        MessageBoxW(
-            None,
-            &HSTRING::from(text),
-            &HSTRING::from("About RMM Agent"),
-            MB_OK | MB_ICONINFORMATION,
-        )
+/// The tray icon: the mark (or the company's logo) with a badge for the
+/// state, green when connected to the server, red while a technician is
+/// connected here; grey and without one when offline or not enrolled.
+fn tray_image(status: &AgentStatus, in_session: bool) -> Icon {
+    let state = match (&status.agent_id, status.connected) {
+        _ if in_session => TrayState::Live,
+        (Some(_), true) => TrayState::Connected,
+        _ => TrayState::Offline,
     };
-    debug!(?result, "about box closed");
-}
-
-/// A 32x32 filled circle: blue while a technician is connected, green when
-/// connected to the server, amber when enrolled but disconnected, grey when
-/// not enrolled.
-fn status_icon(status: &AgentStatus, in_session: bool) -> Icon {
-    let rgb = match (&status.agent_id, status.connected) {
-        _ if in_session => [0x1f, 0x6f, 0xeb],
-        (Some(_), true) => [0x2e, 0xa0, 0x43],
-        (Some(_), false) => [0xd9, 0x8e, 0x04],
-        (None, _) => [0x8a, 0x8a, 0x8a],
+    // SAFETY: a plain metric query.
+    let size = match unsafe { GetSystemMetrics(SM_CXSMICON) } {
+        size if size > 0 => size as u32,
+        _ => 16,
     };
-    const SIZE: u32 = 32;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let d = ((x as f32 - center).powi(2) + (y as f32 - center).powi(2)).sqrt();
-            // Anti-aliased edge.
-            let alpha = (15.5 - d).clamp(0.0, 1.0);
-            rgba.extend_from_slice(&rgb);
-            rgba.push((alpha * 255.0) as u8);
+    let look = Look::current();
+    let image = match &look.logo {
+        Some(logo) => {
+            let mut image = raster::fit(&logo.rgba, logo.width, logo.height, size);
+            raster::badge(&mut image, state);
+            image
         }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("valid icon dimensions")
+        None => raster::tray_icon(
+            size,
+            state,
+            raster::tray_tile(look::taskbar_dark(), look.accent),
+        ),
+    };
+    Icon::from_rgba(image.rgba, size, size).expect("valid icon dimensions")
 }

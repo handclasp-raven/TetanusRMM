@@ -4,6 +4,7 @@
 //! prefixed by its length as a big-endian `u32` (see [`framing`]).
 
 pub mod assist;
+pub mod brand;
 pub mod clipboard;
 pub mod consent;
 pub mod credential;
@@ -68,7 +69,14 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   and the agent reports `TextTyped` for the audit log, on the same
 ///   condition as the lent password (`EnableCredentialReports`). An older
 ///   agent skips the record, so nothing is typed.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// - 14: company branding (appended variant, see [`brand`]): the server
+///   sends `Branding` to agents at version 14+ after `Hello`, and again
+///   when an admin changes it. An older agent is never sent it and keeps
+///   TetanusRMM's own look.
+pub const PROTOCOL_VERSION: u32 = 14;
+
+/// Oldest agent protocol that shows a company's branding (see [`brand`]).
+pub const MIN_BRANDING_VERSION: u32 = 14;
 
 /// Oldest agent protocol that types text sent by a viewer (see [`vault`]).
 pub const MIN_TYPE_TEXT_VERSION: u32 = 13;
@@ -299,6 +307,12 @@ pub enum Message {
         /// The vault item's name.
         item: String,
     },
+
+    // --- Company branding (see `brand`) ------------------------------------
+    /// Server to agent (version 14+), after `Hello` and whenever an admin
+    /// changes it: the company's branding for what the user sees, or
+    /// `None` for TetanusRMM's own.
+    Branding(Option<brand::Branding>),
 }
 
 /// Most signed-in users an [`AgentStatus`] carries.
@@ -624,6 +638,21 @@ mod tests {
         let bytes = postcard::to_stdvec(&msg).unwrap();
         assert_eq!(bytes[0], 38);
         assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn branding_is_appended_after_text_typed_and_fits_in_a_frame() {
+        let msg = Message::Branding(Some(brand::Branding {
+            name: "Contoso IT".into(),
+            accent: Some([0x0B, 0x5C, 0xAD]),
+            logo_png: Some(vec![7; brand::MAX_LOGO_BYTES]),
+        }));
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        assert_eq!(bytes[0], 39);
+        assert!(bytes.len() < MAX_FRAME_LEN as usize);
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
+        let none = postcard::to_stdvec(&Message::Branding(None)).unwrap();
+        assert_eq!(none, [39, 0]);
     }
 
     #[test]

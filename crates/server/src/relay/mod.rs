@@ -544,6 +544,16 @@ impl Hub {
         }
     }
 
+    /// Send `message` to every connected agent that speaks at least
+    /// protocol `min_version`.
+    pub fn broadcast(&self, message: &Message, min_version: u32) {
+        for link in self.agents().values() {
+            if link.version >= min_version {
+                link.send(message.clone());
+            }
+        }
+    }
+
     pub fn get(&self, agent_id: &str) -> Option<Arc<AgentLink>> {
         self.agents().get(agent_id).cloned()
     }

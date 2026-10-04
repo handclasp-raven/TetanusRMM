@@ -57,6 +57,27 @@ enum Command {
         #[arg(long, default_value_t = 4_000_000)]
         bitrate: u32,
     },
+    /// Show one of the windows the user sees, with made-up data
+    /// (development aid; Windows only, run in an interactive session).
+    #[command(hide = true)]
+    UiTest {
+        /// consent, password, about, bar, pill or tray.
+        surface: String,
+        /// Who is supposedly connected. Repeat for more.
+        #[arg(long = "technician", default_value = "roker")]
+        technicians: Vec<String>,
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+        /// A company's name, to show its branding.
+        #[arg(long)]
+        company: Option<String>,
+        /// Its accent colour, #RRGGBB.
+        #[arg(long, requires = "company")]
+        accent: Option<String>,
+        /// Its logo, a PNG file.
+        #[arg(long, requires = "company")]
+        logo: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +195,31 @@ fn main() -> anyhow::Result<()> {
             fps,
             bitrate,
         } => capture_test(monitor, seconds, &out, fps, bitrate),
+        Command::UiTest {
+            surface,
+            technicians,
+            seconds,
+            company,
+            accent,
+            logo,
+        } => {
+            let branding = match company {
+                None => None,
+                Some(name) => Some(protocol::brand::Branding {
+                    name,
+                    accent: match accent {
+                        None => None,
+                        Some(text) => Some(
+                            brand::Rgb::parse(&text)
+                                .context("the accent must be #RRGGBB")?
+                                .to_array(),
+                        ),
+                    },
+                    logo_png: logo.map(std::fs::read).transpose()?,
+                }),
+            };
+            ui_test(&surface, &technicians, branding, seconds)
+        }
         command => {
             common::logging::init();
             tokio::runtime::Runtime::new()?.block_on(console(command))
@@ -186,7 +232,10 @@ async fn console(command: Command) -> anyhow::Result<()> {
         Command::Enroll(args) => enroll(args).await,
         Command::Run(args) => run(args).await,
         Command::Service(command) => service(command),
-        Command::Helper | Command::SystemHelper { .. } | Command::CaptureTest { .. } => {
+        Command::Helper
+        | Command::SystemHelper { .. }
+        | Command::CaptureTest { .. }
+        | Command::UiTest { .. } => {
             unreachable!()
         }
     }
@@ -314,6 +363,27 @@ fn capture_test(
 #[cfg(not(windows))]
 fn capture_test(_: u32, _: u64, _: &std::path::Path, _: u32, _: u32) -> anyhow::Result<()> {
     bail!("screen capture is only available on Windows")
+}
+
+#[cfg(windows)]
+fn ui_test(
+    surface: &str,
+    technicians: &[String],
+    branding: Option<protocol::brand::Branding>,
+    seconds: u64,
+) -> anyhow::Result<()> {
+    common::logging::init();
+    agent::win::ui::preview::run(surface, technicians, branding, seconds)
+}
+
+#[cfg(not(windows))]
+fn ui_test(
+    _: &str,
+    _: &[String],
+    _: Option<protocol::brand::Branding>,
+    _: u64,
+) -> anyhow::Result<()> {
+    bail!("the agent's windows are only on Windows")
 }
 
 #[cfg(not(windows))]

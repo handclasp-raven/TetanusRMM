@@ -14,6 +14,9 @@ use axum::response::{Html, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
+use brand::Theme;
+use protocol::brand::Branding;
+
 use super::{serve_update_file, ApiError, AppState};
 use crate::updates;
 
@@ -110,11 +113,13 @@ async fn page(State(state): State<AppState>) -> Result<Html<String>, ApiError> {
         .strip_prefix("https://")
         .unwrap_or(&state.public_url);
     let fingerprint = crate::quic::pem_fingerprint(&state.server_ca_pem).ok();
+    let branding = crate::branding::load_or_default(&state.pool).await;
     Ok(Html(render(
         server,
         wheel.as_deref(),
         &viewers,
         fingerprint.as_deref(),
+        branding.as_ref(),
     )))
 }
 
@@ -123,7 +128,17 @@ fn render(
     wheel: Option<&str>,
     viewers: &[(&str, &str, String)],
     fingerprint: Option<&str>,
+    branding: Option<&Branding>,
 ) -> String {
+    let page_with = |body: &str| {
+        house_page(
+            "Install the support tools",
+            "The support TUI and the remote desktop viewer, for Linux and Windows.",
+            "",
+            body,
+            branding,
+        )
+    };
     let server = escape(server);
     let Some(wheel) = wheel else {
         return page_with(
@@ -219,55 +234,133 @@ kept up to date from this server.</p>
     page_with(&body)
 }
 
-fn page_with(body: &str) -> String {
-    PAGE.replace("{style}", PAGE_STYLE).replace("{body}", body)
+/// A page in the house style: `title` and `lead` under the logo, then
+/// `body`. `extra_style` is CSS of the page's own. Shared with the quick
+/// assist page (`super::assist`).
+///
+/// The colours are the `brand` crate's light and dark themes (the browser
+/// picks, by `prefers-color-scheme`), with the company's accent, name and
+/// logo if the server has them. Nothing is fetched from elsewhere: the
+/// wordmark asks for Archivo and settles for the system's sans-serif.
+pub(super) fn house_page(
+    title: &str,
+    lead: &str,
+    extra_style: &str,
+    body: &str,
+    branding: Option<&Branding>,
+) -> String {
+    let accent = branding.and_then(Branding::accent_rgb);
+    let vars = |theme: &Theme, page_bg: brand::Rgb| {
+        [
+            ("bg", page_bg),
+            ("card", theme.body),
+            ("panel", theme.panel),
+            ("text", theme.text),
+            ("muted", theme.text_muted),
+            ("line", theme.line),
+            ("accent", theme.accent),
+            ("accent-hover", theme.accent_hover),
+            ("on-accent", theme.on_accent),
+            ("link", theme.accent_text),
+            ("tile", theme.tile),
+            ("warn", theme.live_text),
+        ]
+        .map(|(name, colour)| format!("--{name}: {};", colour.to_hex()))
+        .join(" ")
+    };
+    let (light, dark) = (Theme::light(accent), Theme::dark(accent));
+    let colours = format!(
+        ":root {{ {} }}\n@media (prefers-color-scheme: dark) {{\n  :root {{ {} }}\n}}",
+        vars(&light, brand::theme::palette::MIST),
+        vars(&dark, dark.footer),
+    );
+    // The mark follows the theme's accent; a company's logo stands in for it.
+    let mark = brand::svg::mark(40, light.accent).replace(
+        &format!("fill=\"{}\"", light.accent.to_hex()),
+        "style=\"fill:var(--accent)\"",
+    );
+    let (logo, wordmark, powered) = match branding {
+        None => (
+            mark,
+            "<b>Tetanus</b><span>RMM</span>".to_owned(),
+            String::new(),
+        ),
+        Some(b) => (
+            match &b.logo_png {
+                Some(png) => format!(
+                    "<img src=\"data:image/png;base64,{}\" alt=\"\" height=\"40\">",
+                    protocol::brand::base64::encode(png)
+                ),
+                None => mark,
+            },
+            format!("<b>{}</b>", escape(&b.name)),
+            format!("<footer>Powered by {}</footer>", brand::PRODUCT),
+        ),
+    };
+    PAGE.replace("{title}", &escape(title))
+        .replace("{lead}", &escape(lead))
+        .replace("{favicon}", &brand::svg::favicon(light.accent))
+        .replace("{colours}", &colours)
+        .replace("{style}", PAGE_STYLE)
+        .replace("{extra_style}", extra_style)
+        .replace("{logo}", &logo)
+        .replace("{wordmark}", &wordmark)
+        .replace("{powered}", &powered)
+        .replace("{body}", body)
 }
 
-/// Styles shared with the quick assist page (`super::assist`).
-pub(super) const PAGE_STYLE: &str = r#":root { --bg: #f6f7f9; --card: #fff; --text: #1c2330; --muted: #5d6878; --line: #dde1e7;
-  --accent: #1f5fd0; --accent-text: #fff; --code: #eef1f5; --warn: #c0392b; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #12161c; --card: #1a2029; --text: #e6e9ee; --muted: #9aa5b5; --line: #2c3442;
-    --accent: #6ea2ff; --accent-text: #0d1320; --code: #10151c; --warn: #ff7b6b; }
-}
-* { box-sizing: border-box; }
+const PAGE_STYLE: &str = r#"* { box-sizing: border-box; }
 body { margin: 0; padding: 32px 16px 64px; background: var(--bg); color: var(--text);
-  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  font: 16px/1.55 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif; }
 main { max-width: 720px; margin: 0 auto; }
+.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+.brand svg, .brand img { flex: none; border-radius: 9px; }
+.wordmark { font-family: Archivo, "Segoe UI", system-ui, sans-serif; font-size: 1.75rem;
+  letter-spacing: -0.5px; line-height: 1; }
+.wordmark b { font-weight: 800; }
+.wordmark span { font-weight: 500; color: var(--link); }
 h1 { font-size: 1.6rem; margin: 0 0 4px; }
 .lead { color: var(--muted); margin: 0 0 24px; }
 .steps { list-style: none; counter-reset: step; margin: 0; padding: 0; }
 .steps > li { counter-increment: step; background: var(--card); border: 1px solid var(--line);
-  border-radius: 10px; padding: 20px 24px; margin-bottom: 16px; }
+  border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
 h2 { font-size: 1.15rem; margin: 0 0 8px; }
 h2::before { content: counter(step) ". "; color: var(--muted); }
 h3 { font-size: 0.95rem; margin: 18px 0 6px; }
 p { margin: 8px 0; }
 .note { color: var(--muted); font-size: 0.92rem; }
-a { color: var(--accent); }
-.button { display: inline-block; background: var(--accent); color: var(--accent-text);
+a { color: var(--link); }
+.button { display: inline-block; background: var(--accent); color: var(--on-accent);
   text-decoration: none; font-weight: 600; padding: 10px 18px; border-radius: 8px; }
+.button:hover { background: var(--accent-hover); }
 code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.88rem; }
-code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
-pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+code { background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 10px 12px; margin: 8px 0; overflow-x: auto; white-space: pre; }
-pre.server { font-weight: 600; font-size: 1rem; }"#;
+pre.server { font-weight: 600; font-size: 1rem; }
+footer { color: var(--muted); font-size: 0.85rem; margin-top: 28px; text-align: center; }"#;
 
 const PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Install the RMM support tools</title>
+<meta name="color-scheme" content="light dark">
+<title>{title}</title>
+<link rel="icon" href="{favicon}">
 <style>
+{colours}
 {style}
+{extra_style}
 </style>
 </head>
 <body>
 <main>
-<h1>Install the RMM support tools</h1>
-<p class="lead">The support TUI and the remote desktop viewer, for Linux and Windows.</p>
+<header class="brand">{logo}<span class="wordmark">{wordmark}</span></header>
+<h1>{title}</h1>
+<p class="lead">{lead}</p>
 {body}
+{powered}
 </main>
 </body>
 </html>
@@ -284,6 +377,7 @@ mod tests {
             Some("tetanus_rmm-0.1.0-py3-none-any.whl"),
             &[("windows-x86_64", "Windows", "0.2.0".into())],
             Some("AB:CD:EF:01"),
+            None,
         );
         assert!(page.contains("href=\"/install/tetanus_rmm-0.1.0-py3-none-any.whl\""));
         assert!(page.contains("Download tetanus-rmm 0.1.0"));
@@ -295,10 +389,16 @@ mod tests {
 
     #[test]
     fn nothing_published_says_so() {
-        let page = render("rmm.example.com:8443", None, &[], None);
+        let page = render("rmm.example.com:8443", None, &[], None, None);
         assert!(page.contains("has not been published"));
         assert!(!page.contains("class=\"button\""));
-        let page = render("h:1", Some("tetanus_rmm-0.1.0-py3-none-any.whl"), &[], None);
+        let page = render(
+            "h:1",
+            Some("tetanus_rmm-0.1.0-py3-none-any.whl"),
+            &[],
+            None,
+            None,
+        );
         assert!(page.contains("No viewer has been published"));
     }
 
@@ -309,7 +409,41 @@ mod tests {
             Some("tetanus_rmm-0.1.0-py3-none-any.whl"),
             &[],
             None,
+            None,
         );
         assert!(page.contains("&lt;script&gt;") && !page.contains("<script>"));
+    }
+
+    #[test]
+    fn the_page_wears_tetanus_or_the_companys_brand_in_light_and_dark() {
+        let plain = render("h:1", None, &[], None, None);
+        assert!(plain.contains("<b>Tetanus</b><span>RMM</span>"));
+        assert!(plain.contains("--accent: #B5441C;") && plain.contains("--accent: #C9542A;"));
+        assert!(plain.contains("prefers-color-scheme: dark"));
+        assert!(plain.contains("style=\"fill:var(--accent)\""));
+        assert!(plain.contains("rel=\"icon\" href=\"data:image/svg+xml,"));
+        assert!(!plain.contains("Powered by"));
+        for hole in [
+            "{title}",
+            "{lead}",
+            "{logo}",
+            "{wordmark}",
+            "{powered}",
+            "{colours}",
+        ] {
+            assert!(!plain.contains(hole), "{hole}");
+        }
+
+        let contoso = Branding {
+            name: "Contoso <IT>".into(),
+            accent: Some([0x0B, 0x5C, 0xAD]),
+            logo_png: Some(b"\x89PNG-logo".to_vec()),
+        };
+        let branded = render("h:1", None, &[], None, Some(&contoso));
+        assert!(branded.contains("<b>Contoso &lt;IT&gt;</b>"));
+        assert!(branded.contains("--accent: #0B5CAD;"));
+        assert!(branded.contains("<img src=\"data:image/png;base64,iVBORy1sb2dv\""));
+        assert!(branded.contains("Powered by TetanusRMM"));
+        assert!(!branded.contains("<b>Tetanus</b>"));
     }
 }

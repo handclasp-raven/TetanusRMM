@@ -98,7 +98,9 @@ pub enum Phase {
     Session,
 }
 
-/// The window's status line.
+/// The status line of the console build. (The Windows window says the same
+/// in its own pages.)
+#[cfg_attr(windows, allow(dead_code))]
 pub fn status_text(phase: Phase, connected: bool, technicians: &[String]) -> String {
     match phase {
         Phase::Idle => String::new(),

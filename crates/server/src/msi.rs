@@ -30,6 +30,7 @@
 use std::io::{self, Cursor, Write};
 
 use msi::{Column, Insert, Language, Package, PackageType, Value};
+use protocol::brand::Branding;
 use uuid::Uuid;
 
 /// Fixed identities, so every download is "the same product".
@@ -38,8 +39,13 @@ const PRODUCT_CODE: &str = "{9A4C2F17-5B1D-4E63-8F0A-2C7D9E1B3A58}";
 const AGENT_COMPONENT: &str = "{3F8E1A62-7C4D-4B95-A1E0-5D2B6C9F8E13}";
 const CA_COMPONENT: &str = "{B27D4E90-1A3F-4C68-9E52-7F0C3D8A1B64}";
 
-const MANUFACTURER: &str = "RMM";
-const PRODUCT_NAME: &str = "RMM Agent";
+const MANUFACTURER: &str = brand::PRODUCT;
+const PRODUCT_NAME: &str = brand::AGENT_NAME;
+
+/// The icon Add/Remove Programs shows: its key in the Icon table.
+const ICON: &str = "AppIcon.ico";
+/// The sizes of the mark that icon carries (it is only ever shown small).
+const ICON_SIZES: [u32; 4] = [16, 24, 32, 48];
 
 /// File keys; also the file names inside the embedded cabinet.
 const AGENT_FILE: &str = "rmm_agent.exe";
@@ -76,6 +82,35 @@ pub struct MsiConfig<'a> {
     pub token: &'a str,
     /// For mass deployment with a deployment key (see the module docs).
     pub reusable: bool,
+    /// The company's branding, for the name and icon in Add/Remove
+    /// Programs. `None`: TetanusRMM's.
+    pub branding: Option<&'a Branding>,
+}
+
+/// What Add/Remove Programs calls the product. A company's name leads if
+/// there is one the package's code page can hold.
+fn product_name(branding: Option<&Branding>) -> String {
+    match branding {
+        Some(b) if b.name.is_ascii() => format!("{} Support Agent", b.name),
+        _ => PRODUCT_NAME.to_owned(),
+    }
+}
+
+/// The product's icon: the company's logo if it has one that fits in an
+/// icon, else the mark (on the company's colour, if it has one).
+fn product_icon(branding: Option<&Branding>) -> Vec<u8> {
+    let logo = branding.and_then(|b| b.logo_png.as_deref());
+    if let Some(ico) = logo.and_then(brand::ico::from_png) {
+        return ico;
+    }
+    let tile = branding
+        .and_then(Branding::accent_rgb)
+        .unwrap_or(brand::theme::palette::RUST);
+    let images: Vec<_> = ICON_SIZES
+        .into_iter()
+        .map(|size| brand::raster::app_icon(size, tile))
+        .collect();
+    brand::ico::encode(&images)
 }
 
 /// Whether `value` is a plain host name or IP address (it ends up on a
@@ -122,6 +157,8 @@ fn package_code(config: &MsiConfig) -> Uuid {
         config.server.as_bytes(),
         config.server_name.as_bytes(),
         config.token.as_bytes(),
+        product_name(config.branding).as_bytes(),
+        &product_icon(config.branding),
     ] {
         context.update(&(part.len() as u64).to_be_bytes());
         context.update(part);
@@ -174,6 +211,7 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
     summary.set_creation_time_to_now();
 
     let version = product_version(config.version);
+    let product_name = product_name(config.branding);
     let s = |v: &str| Value::from(v);
     let null = || Value::Null;
 
@@ -187,13 +225,14 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
         [
             ("ProductCode", PRODUCT_CODE),
             ("UpgradeCode", UPGRADE_CODE),
-            ("ProductName", PRODUCT_NAME),
+            ("ProductName", product_name.as_str()),
             ("ProductVersion", version.as_str()),
             ("ProductLanguage", "1033"),
             ("Manufacturer", MANUFACTURER),
             ("ALLUSERS", "1"),
             ("ARPNOMODIFY", "1"),
             ("ARPNOREPAIR", "1"),
+            ("ARPPRODUCTICON", ICON),
             ("RMM_SERVER", config.server),
             ("RMM_SERVER_NAME", config.server_name),
             ("RMM_TOKEN", config.token),
@@ -505,6 +544,20 @@ pub fn build(config: &MsiConfig) -> io::Result<Vec<u8>> {
         ],
     )?;
 
+    // The icon's bytes are the stream named after its row.
+    table(
+        &mut package,
+        "Icon",
+        vec![
+            Column::build("Name").primary_key().id_string(72),
+            Column::build("Data").binary(),
+        ],
+        vec![vec![s(ICON), Value::Binary]],
+    )?;
+    package
+        .write_stream(&format!("Icon.{ICON}"))?
+        .write_all(&product_icon(config.branding))?;
+
     package.write_stream(CABINET)?.write_all(&cabinet)?;
     package.flush()?;
     Ok(package.into_inner()?.into_inner())
@@ -551,6 +604,7 @@ mod tests {
             server_name: "rmm.example.com",
             token: "0123abcdef",
             reusable: false,
+            branding: None,
         }
     }
 
@@ -572,6 +626,78 @@ mod tests {
             }
         }
         panic!("no property {name}");
+    }
+
+    fn icon(package: &mut Package<Cursor<Vec<u8>>>) -> Vec<u8> {
+        let rows: Vec<String> = package
+            .select_rows(Select::table("Icon"))
+            .unwrap()
+            .map(|row| row[0].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(rows, [ICON]);
+        let mut bytes = Vec::new();
+        package
+            .read_stream(&format!("Icon.{ICON}"))
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn add_remove_programs_shows_the_mark_or_the_companys_brand() {
+        let exe = [0x4d, 0x5a, 1, 2, 3].repeat(100);
+        let plain = build(&config(&exe)).unwrap();
+        let mut package = Package::open(Cursor::new(plain)).unwrap();
+        assert_eq!(property(&mut package, "ProductName"), "TetanusRMM Agent");
+        assert_eq!(property(&mut package, "Manufacturer"), "TetanusRMM");
+        assert_eq!(property(&mut package, "ARPPRODUCTICON"), ICON);
+        let mark = icon(&mut package);
+        // An icon file with the four small sizes of the mark.
+        assert_eq!(mark[..6], [0, 0, 1, 0, 4, 0]);
+        assert_eq!([mark[6], mark[22], mark[38], mark[54]], [16, 24, 32, 48]);
+
+        // A company's name leads, and its logo is the icon as it is.
+        let mut logo = b"\x89PNG\r\n\x1a\n".to_vec();
+        logo.extend_from_slice(&13u32.to_be_bytes());
+        logo.extend_from_slice(b"IHDR");
+        logo.extend_from_slice(&64u32.to_be_bytes());
+        logo.extend_from_slice(&64u32.to_be_bytes());
+        logo.extend_from_slice(&[8, 6, 0, 0, 0, 1, 2, 3, 4]);
+        let mut contoso = Branding {
+            name: "Contoso IT".into(),
+            accent: Some([0x0B, 0x5C, 0xAD]),
+            logo_png: Some(logo.clone()),
+        };
+        let branded = |b: &Branding| {
+            let bytes = build(&MsiConfig {
+                branding: Some(b),
+                reusable: true,
+                ..config(&exe)
+            })
+            .unwrap();
+            Package::open(Cursor::new(bytes)).unwrap()
+        };
+        let mut package = branded(&contoso);
+        assert_eq!(
+            property(&mut package, "ProductName"),
+            "Contoso IT Support Agent"
+        );
+        let with_logo = icon(&mut package);
+        assert!(with_logo.ends_with(&logo) && with_logo.len() == 22 + logo.len());
+        let code = package.summary_info().uuid();
+
+        // No logo: the mark, on the company's colour. A name the package
+        // cannot hold leaves the product's own. Either changes the package
+        // code, since the package differs.
+        contoso.logo_png = None;
+        contoso.name = "Contos\u{14d} IT".into();
+        let mut package = branded(&contoso);
+        assert_eq!(property(&mut package, "ProductName"), "TetanusRMM Agent");
+        let tinted = icon(&mut package);
+        assert_eq!(tinted.len(), mark.len());
+        assert_ne!(tinted, mark);
+        assert_ne!(package.summary_info().uuid(), code);
     }
 
     #[test]

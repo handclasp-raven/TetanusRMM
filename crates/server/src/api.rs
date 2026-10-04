@@ -51,6 +51,9 @@
 //! | GET    | /api/viewer/{platform}/manifest | none |
 //! | GET    | /api/viewer/{platform}/binary   | none |
 //! | GET    | /api/tui/manifest           | none: the published TUI wheel (`install`) |
+//! | GET    | /api/branding               | none: the company branding, or null (`branding`) |
+//! | PUT    | /api/branding               | session (admin) |
+//! | DELETE | /api/branding               | session (admin): back to TetanusRMM's own |
 //! | POST   | /api/assist-sessions        | session (admin, support_engineer): a quick assist code |
 //! | GET    | /api/assist-sessions/{id}   | session (whoever made it; admin) |
 //! | GET    | /assist                     | none: the quick assist page (`assist`) |
@@ -88,6 +91,7 @@ use sqlx::PgPool;
 use tracing::error;
 
 mod assist;
+mod branding;
 mod deploy;
 mod install;
 mod rbac;
@@ -157,6 +161,7 @@ pub fn router(state: AppState) -> Router {
         .merge(rbac::routes())
         .merge(assist::routes())
         .merge(deploy::routes())
+        .merge(branding::routes())
         .merge(install::routes())
         // Per route, so the route template is known (unmatched requests
         // are not counted).
@@ -879,8 +884,10 @@ async fn download_msi(
     let ca_pem = state.server_ca_pem.clone();
     let token = query.token;
     let version = manifest.version.clone();
+    let branding = crate::branding::load_or_default(&state.pool).await;
     let msi = tokio::task::spawn_blocking(move || {
         crate::msi::build(&crate::msi::MsiConfig {
+            branding: branding.as_ref(),
             agent_exe: &binary,
             version: &version,
             ca_pem: &ca_pem,

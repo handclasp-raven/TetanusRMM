@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use protocol::brand::Branding;
 use protocol::consent::PromptAnswer;
 use protocol::credential::CredentialEvent;
 use protocol::ipc::{IpcMessage, Secret};
@@ -63,6 +64,9 @@ struct State {
     resync_requested: bool,
     /// Who is connected, for the tray.
     technicians: Vec<String>,
+    /// The company's branding, once the server has said (`Some(None)`:
+    /// TetanusRMM's own). A helper that attaches later is told.
+    branding: Option<Option<Branding>>,
     /// Consent prompts on screen, by request id.
     prompts: HashMap<u64, oneshot::Sender<PromptAnswer>>,
     /// The password the user lent the technicians, if any.
@@ -264,6 +268,10 @@ impl Bridge {
                 IpcMessage::Input(event)
             }
             DesktopCommand::SetClipboard(data) => IpcMessage::SetClipboard(data),
+            DesktopCommand::Branding(branding) => {
+                state.branding = Some(branding.clone());
+                IpcMessage::Branding(branding)
+            }
             DesktopCommand::SecureAttention => {
                 // Not a helper's job: only a service may (see `sas`). It
                 // touches the registry, so not on this thread.
@@ -346,6 +354,9 @@ impl Bridge {
     pub fn attach(&self, helper: mpsc::UnboundedSender<IpcMessage>) {
         let mut state = self.state();
         let _ = helper.send(IpcMessage::Technicians(state.technicians.clone()));
+        if let Some(branding) = &state.branding {
+            let _ = helper.send(IpcMessage::Branding(branding.clone()));
+        }
         state.helper = Some(helper);
         state.attached(HelperRole::User);
     }

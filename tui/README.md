@@ -20,6 +20,8 @@ directly. What it does:
   on the remote machine. See [Bitwarden](#bitwarden).
 - **Updates itself:** when the server publishes a newer TUI, you are offered
   it after signing in (or with `U`). See [Updating](#updating).
+- **Company branding** (admins only): your name, logo and accent colour on
+  what the people you support see. See [Company branding](#company-branding).
 - **Shell console:** interactive PowerShell on the agent, in a pane. Needs
   **no viewer**.
 - **Script runner:** runs a command or script on one or more agents, or on
@@ -231,6 +233,7 @@ server-side session then expires on its own.
 | `v` | Viewer buttons: the remote viewer's command buttons |
 | `b` | Bitwarden: unlock the vault for the viewers, or lock it again |
 | `U` | Check for updates: is there a newer TUI on the server? |
+| `B` | Company branding: your name, logo and colour on what users see (admins) |
 | `F5` | Refresh now (the table also refreshes every `poll_interval`) |
 | `l` | Sign out |
 | `q` | Quit |
@@ -512,6 +515,38 @@ What is kept, and where:
   agent, which kind, and the vault item's name. Never the value. An agent
   types nothing the server cannot audit, and an agent that predates this
   does not type vault text at all (the viewer says so): update it.
+
+### Company branding
+
+What the person at a supported computer sees is drawn in TetanusRMM's own
+look: the request to allow a session, the prompt to lend a password, the
+bar at the top of the screen while someone is connected (with its **End
+session** button), the tray icon and its flyout, and quick assist. All of
+it follows Windows' light or dark setting.
+
+An admin can put the company's own branding on it with `B` (Manage menu):
+
+- **Name**, up to 48 characters. Requests then come "From *name*", and the
+  agent is "*name* Support Agent" in the tray, its toasts and About.
+- **Accent colour**, as `#RRGGBB`, in place of TetanusRMM's rust on buttons,
+  icons and progress bars. It has to be dark enough for white text; the
+  server says so if it is not. Red for a live session, and for ending one,
+  is never replaced.
+- **Logo**, a PNG of 16 to 512 pixels a side and at most 128 KiB, in place
+  of the TetanusRMM mark: in window title bars, the session bar, the tray
+  and the flyout. Square works best. Leave its path empty to keep the one
+  already set, or tick **No logo** to go back to the mark (on your colour).
+
+**Save** applies it: connected agents show it at once and remember it for
+the next start, others when they next connect. Quick assist downloads and
+agent installers made afterwards carry it (the installer's entry in
+Windows' Apps list takes the name and logo), and the server's `/install`
+and `/assist` pages wear it. **Reset to TetanusRMM** removes it.
+
+Layout, type, icons and the safety wording are the same for everyone, and
+"Powered by TetanusRMM" stays in the tray flyout, About and the pages'
+foot. The programs' file names and their own icons are TetanusRMM's.
+Setting and resetting is in the audit log as `branding.update`.
 
 ### Updating
 

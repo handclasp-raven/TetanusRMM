@@ -100,6 +100,9 @@ pub enum Action {
     /// (see `protocol::vault`); detail has the kind and the vault item's
     /// name. Never the text, which the server does not see.
     VaultTyped,
+    /// An admin set or reset the company branding; detail has the name
+    /// and colour (never the logo itself).
+    BrandingUpdate,
 }
 
 impl Action {
@@ -153,6 +156,7 @@ impl Action {
             Action::Credential(CredentialEvent::Forgotten) => "credential.forgotten",
             Action::Credential(CredentialEvent::NotStored) => "credential.not_stored",
             Action::VaultTyped => "vault.typed",
+            Action::BrandingUpdate => "branding.update",
         }
     }
 }

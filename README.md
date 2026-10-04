@@ -63,6 +63,7 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 -  **Quick Commands:** In your remove viewer, you can add your own quick command buttons to save you having to hit Win+R.
 -  **Lent Password:** User off to lunch? From the viewer, ask them to type a password before they go. It stays on their PC, encrypted in memory, the agent types it for you (lock screen and UAC prompts too), and it is forgotten when the last session ends.
 -  **Bitwarden in the Viewer:** Search your vault from the viewer and have a username, password or TOTP code typed on the remote PC (lock screen and UAC prompts too). Uses the official `bw` CLI; unlock once in the TUI for every viewer. Your master password is never kept, what is typed is end-to-end encrypted, and the audit log records which item was used (`vault.typed`), never the value.
+-  **A Look of Its Own, or Yours:** What the person at the PC sees (the consent prompt, the session bar with its End session button, the tray, Quick Assist) is drawn in TetanusRMM's look, light or dark as Windows is set. Put your company's name, logo and accent colour on it instead from the TUI (`B`): agents pick it up at once, and new Quick Assist downloads and installers carry it.
 -  **Audit Logging** The server keeps an audit of who did what and where
 
 

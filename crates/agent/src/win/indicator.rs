@@ -1,166 +1,405 @@
-//! The on-screen session indicator: a small always-on-top banner at the top
-//! of the primary screen for as long as a technician is connected, naming
-//! them and reminding the user that Ctrl+F12 ends the session. The tray
-//! icon is easy to miss; this is not. (Text: `interactive::indicator_text`.)
+//! The on-screen session bar: at the top of the primary screen for as
+//! long as a technician is connected, naming them, with a button that
+//! ends the session. The tray icon is easy to miss; this is not. (Who it
+//! names: `interactive::indicator_who`.)
+//!
+//! It starts as a bar ("**roker** is controlling this PC | End session
+//! Ctrl+F12"). After ten seconds without the pointer over it, it shrinks
+//! to a pill (a red dot, the name, and a cross that ends the session), so
+//! that it is not in the way for the length of a session. A click on the
+//! pill brings the bar back.
 //!
 //! It shows for `notify` and `require` sessions, the same technicians the
 //! tray lists; `unattended` sessions are silent by policy.
 //!
-//! It must never get in the user's way, or become a way to interfere with
+//! It must not get in the user's way, or become a way to interfere with
 //! them:
-//! - click-through (`WS_EX_LAYERED | WS_EX_TRANSPARENT`, `HTTRANSPARENT`)
-//!   and never activated (`WS_EX_NOACTIVATE`, `MA_NOACTIVATE`), so neither
-//!   the user's clicks nor the technician's injected ones land on it;
-//! - excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`, Windows 10
-//!   2004+), so it does not cover what the technician is looking at. On
+//! - it takes clicks only on the bar or pill itself (a layered window with
+//!   per-pixel alpha: what is transparent does not exist for the mouse),
+//!   and is never activated (`WS_EX_NOACTIVATE`, `MA_NOACTIVATE`), so the
+//!   window the user is typing in keeps the keyboard;
+//! - all a click can do is end the remote sessions, which the technician's
+//!   own injected clicks may do too;
+//! - it is excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`, Windows
+//!   10 2004+), so it does not cover what the technician is looking at. On
 //!   older Windows it simply appears in the stream too.
 //!
 //! It lives on the helper's UI thread, whose message loop (the tray's)
 //! dispatches its messages. Other topmost windows can cover it, so the
-//! tray loop re-asserts it every few seconds ([`Indicator::refresh`]).
+//! loop re-asserts it every few seconds ([`Indicator::tick`]).
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
+use brand::theme::palette;
+use brand::{icons, Rgb, Theme};
 use tracing::{debug, info, warn};
 use windows::core::{w, Result};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, SetWindowRgn, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DRAW_TEXT_FORMAT, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS,
-    FW_SEMIBOLD, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, TRANSPARENT, VARIABLE_PITCH,
+    GetMonitorInfoW, MonitorFromPoint, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, MONITORINFO,
+    MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetLayeredWindowAttributes,
-    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA,
-    MA_NOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WDA_EXCLUDEFROMCAPTURE,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassW,
+    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST,
+    IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE,
+    ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
-/// Background, dot and text colours (0x00BBGGRR).
-const BACKGROUND: COLORREF = COLORREF(0x0024_2120);
-const DOT: COLORREF = COLORREF(0x0036_43EA);
-const TEXT: COLORREF = COLORREF(0x00FF_FFFF);
-/// Slightly see-through.
-const OPACITY: u8 = 235;
+use super::ui::canvas::{with_painter, Canvas, Painter, Rect, Surface, Text};
+use super::ui::look::{self, Look};
 
-/// Sizes at 96 DPI; scaled for the monitor's DPI.
-const FONT_PX: i32 = 15;
-const PAD_X: i32 = 14;
-const PAD_Y: i32 = 7;
-const TOP_MARGIN: i32 = 8;
-const CORNER: i32 = 12;
+/// `WM_MOUSELEAVE` (from winuser.h).
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
-const DOT_TEXT: &str = "\u{25CF}  ";
+/// How long the bar stays before it shrinks to the pill.
+const COLLAPSE_AFTER: Duration = Duration::from_secs(10);
+/// How often it is put back on top of other topmost windows.
+const RAISE_EVERY: Duration = Duration::from_secs(3);
+
+/// The bar's and the pill's heights, and the pill's distance from the top.
+const BAR_H: f32 = 45.0;
+const PILL_H: f32 = 27.0;
+const PILL_TOP: f32 = 6.0;
+
+/// Dark whatever Windows is set to: it sits over anything.
+const BACKGROUND: Rgb = Rgb::hex(0x1B2024);
+const DIVIDER: Rgb = Rgb::hex(0x3A4149);
+const CLOSE: Rgb = Rgb::hex(0x3A4149);
+const CLOSE_HOVER: Rgb = Rgb::hex(0x4D5660);
+const OPACITY: f32 = 0.97;
+
+/// What a click lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// "End session", or the pill's cross.
+    End,
+    /// The rest of the pill: a click brings the bar back.
+    Pill,
+}
+
+struct Bar {
+    hwnd: HWND,
+    /// Who is connected, and whether that is more than one.
+    who: Option<(String, bool)>,
+    expanded: bool,
+    /// When the bar was shown, or the pointer last over it.
+    active: Instant,
+    raised: Instant,
+    hover: Option<Part>,
+    pressed: Option<Part>,
+    tracking: bool,
+    /// The parts as last drawn, in device-independent pixels.
+    parts: Vec<(Part, Rect)>,
+    dpi: u32,
+    /// The user asked to end the sessions; taken by [`Indicator::take_end`].
+    end: bool,
+    stamp: (u64, bool, bool),
+}
 
 thread_local! {
-    /// What the window procedure paints (the window lives on this thread).
-    static PAINT: RefCell<Option<Paint>> = const { RefCell::new(None) };
+    static BAR: RefCell<Option<Bar>> = const { RefCell::new(None) };
 }
 
-struct Paint {
-    text: Vec<u16>,
-    font: HFONT,
-    pad_x: i32,
+/// The live dot: a bright centre in a darker ring.
+fn live_dot(c: &Canvas, cx: f32, cy: f32) {
+    c.circle(cx, cy, 6.5, palette::LIVE.mix(BACKGROUND, 0.45));
+    c.circle(cx, cy, 3.5, palette::TRAY_LIVE);
 }
 
-fn utf16(text: &str) -> Vec<u16> {
-    text.encode_utf16().collect()
+impl Bar {
+    /// Lay the bar out, drawing it if there is a canvas. Returns its size
+    /// and the parts that take clicks.
+    fn bar(&self, p: &Painter, c: Option<&Canvas>, look: &Look) -> (f32, f32, Vec<(Part, Rect)>) {
+        let (names, plural) = self.who.clone().unwrap_or_default();
+        let verb = if plural { " are" } else { " is" };
+        let rest = format!("{verb} controlling this PC");
+        let text = Text::new(13.0, Rgb::WHITE).middle();
+        let runs = [(names.as_str(), true), (rest.as_str(), false)];
+        let (text_w, _) = p.measure_runs(&runs, &text, 2000.0);
+        let label = Text::new(13.0, Rgb::WHITE).semibold().middle();
+        let (label_w, _) = p.measure("End session", &label, 400.0);
+        let key = Text::new(11.5, Rgb::WHITE).centered();
+        let cap_w = p.measure("Ctrl+F12", &key, 400.0).0 + 11.0;
+
+        let mark_x = 14.0 + 13.0 + 10.0;
+        let text_x = mark_x + 17.0 + 9.0;
+        let divider_x = text_x + text_w + 14.0;
+        let button = Rect::new(
+            divider_x + 1.0 + 12.0,
+            7.0,
+            11.0 + label_w + 8.0 + cap_w + 7.0,
+            31.0,
+        );
+        let width = button.right() + 7.0;
+        if let Some(c) = c {
+            // Flush with the top of the screen: only the lower corners round.
+            c.round_alpha(
+                Rect::new(0.0, -12.0, width, BAR_H + 12.0),
+                10.0,
+                BACKGROUND,
+                OPACITY,
+            );
+            live_dot(c, 14.0 + 6.5, BAR_H / 2.0);
+            let mark_y = (BAR_H - 17.0) / 2.0;
+            match &look.logo {
+                Some(logo) => c.logo(logo, mark_x, mark_y, 17.0),
+                None => c.mark(mark_x, mark_y, 17.0, Theme::dark(look.accent).accent),
+            }
+            c.runs(&runs, Rect::new(text_x, 0.0, text_w, BAR_H), &text);
+            c.rect(Rect::new(divider_x, 13.5, 1.0, 18.0), DIVIDER);
+            let hover = self.hover == Some(Part::End);
+            let fill = if hover && self.pressed == Some(Part::End) {
+                palette::LIVE.mix(Rgb::BLACK, 0.18)
+            } else if hover {
+                palette::LIVE.mix(Rgb::WHITE, 0.10)
+            } else {
+                palette::LIVE
+            };
+            c.round(button, 5.0, fill);
+            c.text(
+                "End session",
+                Rect::new(button.x + 11.0, button.y, label_w, button.h),
+                &label,
+            );
+            let cap = Rect::new(button.right() - 7.0 - cap_w, button.y + 6.5, cap_w, 18.0);
+            c.round(cap, 4.0, palette::LIVE.mix(Rgb::BLACK, 0.24));
+            c.text("Ctrl+F12", cap, &key);
+        }
+        (width, BAR_H, vec![(Part::End, button)])
+    }
+
+    /// The pill, likewise.
+    fn pill(&self, p: &Painter, c: Option<&Canvas>) -> (f32, f32, Vec<(Part, Rect)>) {
+        let (names, _) = self.who.clone().unwrap_or_default();
+        let text = Text::new(13.0, Rgb::WHITE).middle();
+        let (text_w, _) = p.measure(&names, &text, 2000.0);
+        let text_x = 12.0 + 7.0 + 8.0;
+        let close = Rect::new(text_x + text_w + 8.0, 4.0, 19.0, 19.0);
+        let width = close.right() + 4.0;
+        if let Some(c) = c {
+            c.round_alpha(
+                Rect::new(0.0, 0.0, width, PILL_H),
+                PILL_H / 2.0,
+                BACKGROUND,
+                OPACITY,
+            );
+            c.circle(12.0 + 3.5, PILL_H / 2.0, 3.5, palette::TRAY_LIVE);
+            c.text(&names, Rect::new(text_x, 0.0, text_w, PILL_H), &text);
+            let fill = if self.hover == Some(Part::End) {
+                CLOSE_HOVER
+            } else {
+                CLOSE
+            };
+            c.circle(close.x + 9.5, close.y + 9.5, 9.5, fill);
+            c.icon(
+                &icons::CLOSE,
+                close.x + 4.0,
+                close.y + 4.0,
+                11.0,
+                Rgb::WHITE,
+            );
+        }
+        (
+            width,
+            PILL_H,
+            vec![
+                (Part::End, close),
+                (Part::Pill, Rect::new(0.0, 0.0, close.x, PILL_H)),
+            ],
+        )
+    }
+
+    /// Draw the bar (or pill) and put it on screen, or hide it.
+    fn render(&mut self) {
+        if self.who.is_none() {
+            // SAFETY: our own window.
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            return;
+        }
+        // SAFETY: a plain query of our own window.
+        self.dpi = match unsafe { GetDpiForWindow(self.hwnd) } {
+            0 => 96,
+            dpi => dpi,
+        };
+        let look = Look::with(true);
+        let px = |dips: f32| (dips * self.dpi as f32 / 96.0).ceil() as i32;
+        let shown = with_painter(|p| -> Result<Vec<(Part, Rect)>> {
+            let layout = |c: Option<&Canvas>| {
+                if self.expanded {
+                    self.bar(p, c, &look)
+                } else {
+                    self.pill(p, c)
+                }
+            };
+            let (w, h, parts) = layout(None);
+            let surface = Surface::new(px(w), px(h))?;
+            p.draw(&surface, self.dpi, |c| {
+                layout(Some(c));
+            })?;
+            // SAFETY: a plain query.
+            let monitor = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: an out-parameter of the size it says.
+            unsafe {
+                let _ = GetMonitorInfoW(monitor, &mut info);
+            }
+            let work = info.rcWork;
+            let top = if self.expanded { 0.0 } else { PILL_TOP };
+            let at = POINT {
+                x: work.left + (work.right - work.left - surface.width) / 2,
+                y: work.top + px(top),
+            };
+            let size = SIZE {
+                cx: surface.width,
+                cy: surface.height,
+            };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            // SAFETY: the surface, with its premultiplied alpha, becomes
+            // the whole of our own layered window.
+            unsafe {
+                UpdateLayeredWindow(
+                    self.hwnd,
+                    None,
+                    Some(&at),
+                    Some(&size),
+                    Some(surface.hdc()),
+                    Some(&POINT::default()),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                )?;
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )?;
+            }
+            Ok(parts)
+        });
+        match shown {
+            Some(Ok(parts)) => self.parts = parts,
+            Some(Err(e)) => debug!("showing the session bar: {e}"),
+            None => {}
+        }
+    }
+
+    fn part_at(&self, lparam: LPARAM) -> Option<Part> {
+        let k = 96.0 / self.dpi.max(1) as f32;
+        let at = (
+            (lparam.0 & 0xFFFF) as i16 as f32 * k,
+            ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 * k,
+        );
+        self.parts
+            .iter()
+            .find(|(_, rect)| rect.contains(at))
+            .map(|(part, _)| *part)
+    }
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        // Clicks go to whatever is underneath.
-        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
-        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        WM_PAINT => {
-            paint(hwnd);
-            LRESULT(0)
+        // Never take the keyboard from what the user is doing.
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP => {
+            BAR.with(|bar| {
+                // Not while the bar is being drawn or moved.
+                let Ok(mut bar) = bar.try_borrow_mut() else {
+                    return;
+                };
+                let Some(bar) = bar.as_mut() else { return };
+                let before = (bar.hover, bar.pressed, bar.expanded);
+                match msg {
+                    WM_MOUSELEAVE => {
+                        bar.tracking = false;
+                        bar.hover = None;
+                        bar.pressed = None;
+                    }
+                    WM_MOUSEMOVE => {
+                        bar.hover = bar.part_at(lparam);
+                        bar.active = Instant::now();
+                        if !bar.tracking {
+                            bar.tracking = true;
+                            let mut track = TRACKMOUSEEVENT {
+                                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                                dwFlags: TME_LEAVE,
+                                hwndTrack: hwnd,
+                                dwHoverTime: 0,
+                            };
+                            // SAFETY: a valid structure for our own window.
+                            unsafe {
+                                let _ = TrackMouseEvent(&mut track);
+                            }
+                        }
+                    }
+                    WM_LBUTTONDOWN => bar.pressed = bar.part_at(lparam),
+                    _ => {
+                        let part = bar.part_at(lparam);
+                        if part.is_some() && part == bar.pressed.take() {
+                            match part {
+                                Some(Part::End) => bar.end = true,
+                                _ => {
+                                    bar.expanded = true;
+                                    bar.active = Instant::now();
+                                }
+                            }
+                        }
+                    }
+                }
+                if before != (bar.hover, bar.pressed, bar.expanded) {
+                    bar.render();
+                }
+            });
+            return LRESULT(0);
         }
-        // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => {}
     }
-}
-
-fn paint(hwnd: HWND) {
-    let mut ps = PAINTSTRUCT::default();
-    // SAFETY: WM_PAINT on our own window; GDI objects created here are
-    // deleted here, and the font outlives the call (owned by `Indicator`).
-    unsafe {
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let mut client = RECT::default();
-        let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
-        let brush = CreateSolidBrush(BACKGROUND);
-        FillRect(hdc, &client, brush);
-        let _ = DeleteObject(brush.into());
-        PAINT.with_borrow(|paint| {
-            if let Some(paint) = paint {
-                draw(hdc, client, paint);
-            }
-        });
-        let _ = EndPaint(hwnd, &ps);
-    }
-}
-
-/// The red dot, then the text, vertically centred.
-///
-/// # Safety
-/// `hdc` must be a valid device context for painting.
-unsafe fn draw(hdc: HDC, client: RECT, paint: &Paint) {
-    unsafe {
-        let old = SelectObject(hdc, paint.font.into());
-        SetBkMode(hdc, TRANSPARENT);
-        let format: DRAW_TEXT_FORMAT = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-        let mut dot = utf16(DOT_TEXT);
-        let mut dot_rect = RECT::default();
-        DrawTextW(hdc, &mut dot, &mut dot_rect, format | DT_CALCRECT);
-        let mut rect = RECT {
-            left: client.left + paint.pad_x,
-            ..client
-        };
-        SetTextColor(hdc, DOT);
-        DrawTextW(hdc, &mut dot, &mut rect, format);
-        rect.left += dot_rect.right - dot_rect.left;
-        SetTextColor(hdc, TEXT);
-        let mut text = paint.text.clone();
-        DrawTextW(hdc, &mut text, &mut rect, format);
-        SelectObject(hdc, old);
-    }
+    // SAFETY: default handling for everything else.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 pub struct Indicator {
     hwnd: HWND,
-    /// DPI the font was made for.
-    dpi: u32,
-    text: Option<String>,
 }
 
 impl Indicator {
+    /// Create the (hidden) bar on the calling thread, which must run a
+    /// message loop.
     pub fn new() -> Result<Self> {
-        // SAFETY: registering a class and creating a popup window with
-        // static strings and a valid window procedure, on this thread.
+        // SAFETY: registering a class and creating a window with static
+        // strings and a valid window procedure, on this thread.
         let hwnd = unsafe {
             let instance = GetModuleHandleW(None)?;
             let class = w!("RmmAgentSessionIndicator");
-            let wc = WNDCLASSW {
+            RegisterClassW(&WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
                 hInstance: instance.into(),
                 lpszClassName: class,
+                hCursor: LoadCursorW(None, IDC_ARROW)?,
                 ..Default::default()
-            };
-            // Fails harmlessly if already registered.
-            RegisterClassW(&wc);
+            });
             let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 class,
                 w!("Remote support session"),
                 WS_POPUP,
@@ -173,144 +412,104 @@ impl Indicator {
                 Some(instance.into()),
                 None,
             )?;
-            SetLayeredWindowAttributes(hwnd, COLORREF(0), OPACITY, LWA_ALPHA)?;
             if let Err(e) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
-                warn!("session indicator will be visible to technicians too: {e}");
+                warn!("the session bar will be visible to technicians too: {e}");
             }
             hwnd
         };
-        Ok(Self {
+        let now = Instant::now();
+        BAR.set(Some(Bar {
             hwnd,
-            dpi: 0,
-            text: None,
-        })
+            who: None,
+            expanded: true,
+            active: now,
+            raised: now,
+            hover: None,
+            pressed: None,
+            tracking: false,
+            parts: Vec::new(),
+            dpi: 96,
+            end: false,
+            stamp: look::stamp(),
+        }));
+        Ok(Self { hwnd })
     }
 
-    /// Show `text`, or hide the indicator for `None`.
-    pub fn set(&mut self, text: Option<String>) {
-        if text == self.text {
-            return;
-        }
-        match &text {
-            Some(t) => info!(text = %t, "session indicator shown"),
-            None => info!("session indicator hidden"),
-        }
-        self.text = text;
-        self.refresh();
-    }
-
-    /// Lay out and show (topmost again), or hide.
-    pub fn refresh(&mut self) {
-        let Some(text) = self.text.clone() else {
-            // SAFETY: hiding our own window.
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
+    /// Show the bar naming `who` (and whether that is several people),
+    /// or hide it for `None`. A new arrival brings the full bar back.
+    pub fn set(&mut self, who: Option<(String, bool)>) {
+        BAR.with_borrow_mut(|bar| {
+            let Some(bar) = bar.as_mut() else { return };
+            if who == bar.who {
+                return;
             }
-            return;
-        };
-        if let Err(e) = self.layout(&text) {
-            debug!("laying out the session indicator: {e}");
-        }
+            match &who {
+                Some((names, _)) => info!(%names, "session bar shown"),
+                None => info!("session bar hidden"),
+            }
+            bar.who = who;
+            bar.expanded = true;
+            bar.active = Instant::now();
+            bar.hover = None;
+            bar.pressed = None;
+            bar.end = false;
+            bar.render();
+        });
     }
 
-    fn scale(&self, px: i32) -> i32 {
-        px * self.dpi as i32 / 96
+    /// Call every turn of the message loop: shrinks the bar to the pill
+    /// when its time is up, follows a change of branding or scaling, and
+    /// keeps it above other topmost windows.
+    pub fn tick(&mut self) {
+        BAR.with_borrow_mut(|bar| {
+            let Some(bar) = bar.as_mut().filter(|bar| bar.who.is_some()) else {
+                return;
+            };
+            let now = Instant::now();
+            let mut redraw = false;
+            if bar.expanded && bar.hover.is_none() && now - bar.active >= COLLAPSE_AFTER {
+                bar.expanded = false;
+                redraw = true;
+            }
+            let stamp = look::stamp();
+            if stamp != bar.stamp {
+                bar.stamp = stamp;
+                redraw = true;
+            }
+            if now - bar.raised >= RAISE_EVERY {
+                bar.raised = now;
+                redraw = true;
+            }
+            if redraw {
+                bar.render();
+            }
+        });
     }
 
-    fn layout(&mut self, text: &str) -> Result<()> {
-        // SAFETY: GDI and window calls on our own window, from its thread.
-        // The previous font is deleted only after the new one is in place.
-        unsafe {
-            let dpi = match GetDpiForWindow(self.hwnd) {
-                0 => 96,
-                dpi => dpi,
-            };
-            let font = if dpi != self.dpi || PAINT.with_borrow(Option::is_none) {
-                self.dpi = dpi;
-                let font = CreateFontW(
-                    -self.scale(FONT_PX),
-                    0,
-                    0,
-                    0,
-                    FW_SEMIBOLD.0 as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_QUALITY,
-                    u32::from(VARIABLE_PITCH.0 | FF_SWISS.0),
-                    w!("Segoe UI"),
-                );
-                if let Some(old) = PAINT.with_borrow(|p| p.as_ref().map(|p| p.font)) {
-                    let _ = DeleteObject(old.into());
-                }
-                font
-            } else {
-                PAINT
-                    .with_borrow(|p| p.as_ref().map(|p| p.font))
-                    .unwrap_or_default()
-            };
+    /// Shrink to the pill now, not when the bar's time is up (for
+    /// `ui::preview`).
+    pub fn collapse(&mut self) {
+        BAR.with_borrow_mut(|bar| {
+            if let Some(bar) = bar.as_mut() {
+                bar.expanded = false;
+                bar.render();
+            }
+        });
+    }
 
-            // Measure the whole line.
-            let mut line = utf16(&format!("{DOT_TEXT}{text}"));
-            let hdc = GetDC(Some(self.hwnd));
-            let old = SelectObject(hdc, font.into());
-            let mut measured = RECT::default();
-            DrawTextW(
-                hdc,
-                &mut line,
-                &mut measured,
-                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            SelectObject(hdc, old);
-            ReleaseDC(Some(self.hwnd), hdc);
-
-            let width = measured.right - measured.left + 2 * self.scale(PAD_X);
-            let height = measured.bottom - measured.top + 2 * self.scale(PAD_Y);
-            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            let _ = GetMonitorInfoW(monitor, &mut info);
-            let work = info.rcWork;
-            let x = work.left + (work.right - work.left - width) / 2;
-            let y = work.top + self.scale(TOP_MARGIN);
-
-            PAINT.set(Some(Paint {
-                text: utf16(text),
-                font,
-                pad_x: self.scale(PAD_X),
-            }));
-            SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )?;
-            // Rounded corners. The system owns the region from here on.
-            let corner = self.scale(CORNER);
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner);
-            SetWindowRgn(self.hwnd, Some(region), true);
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, true);
-        }
-        Ok(())
+    /// Whether the user pressed "End session" (or the pill's cross) since
+    /// the last call.
+    pub fn take_end(&mut self) -> bool {
+        BAR.with_borrow_mut(|bar| bar.as_mut().is_some_and(|bar| std::mem::take(&mut bar.end)))
     }
 }
 
 impl Drop for Indicator {
     fn drop(&mut self) {
-        // SAFETY: destroying our own window on its thread, then its font.
+        BAR.set(None);
+        // SAFETY: our own window, on its thread.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
-            if let Some(paint) = PAINT.take() {
-                let _ = DeleteObject(paint.font.into());
-            }
         }
     }
 }
