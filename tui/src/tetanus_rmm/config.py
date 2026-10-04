@@ -113,6 +113,9 @@ class Config:
     #: Text size of the viewer's toolbar and panel, in pixels. ``None``: the
     #: viewer's own default.
     viewer_font_size: int | None = None
+    #: Bitwarden's command line client, for the viewer's Vault button: a
+    #: path, or a name looked up on PATH. ``None``: ``bw`` on PATH.
+    bw_path: str | None = None
 
     def __post_init__(self) -> None:
         check_server_url(self.server_url)

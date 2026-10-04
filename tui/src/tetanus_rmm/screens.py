@@ -3,6 +3,7 @@ panel) and audit screens."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from functools import partial
@@ -344,8 +345,8 @@ class MainScreen(Screen):
         Binding("s", "shell", "Shell"),
         Binding("r", "scripts", "Scripts", show=False),
         Binding("n", "new_agent", "New agent", show=False),
-        Binding("h", "quick_assist", "Quick assist", show=False),
         Binding("i", "deployment", "Deployment MSI", show=False),
+        Binding("h", "quick_assist", "Quick assist", show=False),
         Binding("k", "classify", "Classify", show=False),
         Binding("g", "groups", "Groups", show=False),
         Binding("u", "users", "Users", show=False),
@@ -357,6 +358,7 @@ class MainScreen(Screen):
         Binding("t", "app.change_theme", "Theme", show=False),
         Binding("e", "themes", "Edit themes", show=False),
         Binding("v", "viewer_commands", "Viewer buttons", show=False),
+        Binding("b", "bitwarden", "Bitwarden: unlock / lock", show=False),
         Binding("f5", "refresh", "Refresh", show=False),
         Binding("l", "logout", "Sign out", show=False),
         Binding("q", "app.quit", "Quit"),
@@ -376,7 +378,7 @@ class MainScreen(Screen):
         ],
         "View": ["search", "filter", "columns", "stats", "app.change_theme", "themes", "refresh"],
         "Manage": ["groups", "users", "audit", "viewer_commands"],
-        "Session": ["logout", "app.quit"],
+        "Session": ["bitwarden", "logout", "app.quit"],
     }
 
     #: Actions on the selected agent, and the capability each needs there.
@@ -419,12 +421,7 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield MenuBar(self.MENUS, id="menu-bar")
-        user = self.app.session.user
-        role = user.role.replace("_", " ") if user else ""
-        yield Static(
-            f"{user.username if user else ''} ({role}) @ {self.app.config.server_url}",
-            id="whoami",
-        )
+        yield Static(self._whoami(), id="whoami")
         yield Input(placeholder="Search by hostname, IP address or group  ( / )", id="search")
         with Horizontal(id="agent-body"):
             with Vertical(id="group-pane"):
@@ -450,6 +447,12 @@ class MainScreen(Screen):
         self.refresh_agents()
         self.load_groups()
         self.set_interval(self.app.config.poll_interval, self.refresh_agents)
+
+    def _whoami(self) -> str:
+        user = self.app.session.user
+        role = user.role.replace("_", " ") if user else ""
+        vault = " · vault unlocked" if self.app.bw_session else ""
+        return f"{user.username if user else ''} ({role}) @ {self.app.config.server_url}{vault}"
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         user = self.app.session.user
@@ -854,13 +857,13 @@ class MainScreen(Screen):
 
         self.app.push_screen(NewAgentScreen())
 
-    def action_quick_assist(self) -> None:
-        from .assist import QuickAssistScreen
-
     def action_deployment(self) -> None:
         from .deploy import DeploymentScreen
 
         self.app.push_screen(DeploymentScreen())
+
+    def action_quick_assist(self) -> None:
+        from .assist import QuickAssistScreen
 
         self.app.push_screen(QuickAssistScreen())
 
@@ -879,8 +882,49 @@ class MainScreen(Screen):
 
         self.app.push_screen(UsersScreen(list(self.agents.values())))
 
+    def action_bitwarden(self) -> None:
+        """Unlock the Bitwarden vault for the viewers, or lock it again."""
+        from . import bitwarden
+
+        app = self.app
+        if app.bw_session is not None:
+            self._lock_vault()
+            return
+
+        def unlocked(session: str | None) -> None:
+            if session is None:
+                return
+            app.bw_session = session
+            self.query_one("#whoami", Static).update(self._whoami())
+            app.notify(
+                "Vault unlocked: viewers started from now on can use it. "
+                "It is locked again when you quit or sign out."
+            )
+
+        unlock = partial(bitwarden.unlock, app.bw_path)
+        app.push_screen(bitwarden.UnlockScreen(unlock), unlocked)
+
+    @work(group="bitwarden")
+    async def _lock_vault(self) -> None:
+        from . import bitwarden
+
+        try:
+            await asyncio.to_thread(self.app.lock_vault)
+        except bitwarden.BitwardenError as e:
+            self.app.notify(f"Could not lock the vault: {e}", severity="error")
+        else:
+            self.app.notify("Vault locked, for the viewers already open too.")
+        self.query_one("#whoami", Static).update(self._whoami())
+
     @work(exclusive=True, group="logout")
     async def action_logout(self) -> None:
+        from . import bitwarden
+
+        try:
+            # The next person to sign in here does not get this vault.
+            await asyncio.to_thread(self.app.lock_vault)
+        except bitwarden.BitwardenError as e:
+            self.app.notify(f"Could not lock the vault: {e}", severity="error")
         await self.app.session.logout()
         self.app.show_login("Signed out.")
 

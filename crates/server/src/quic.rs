@@ -742,6 +742,23 @@ async fn serve_agent(
                             .await?;
                     }
                 }
+                Message::TextTyped {
+                    session_id,
+                    kind,
+                    item,
+                } => {
+                    info!(%agent_id, session_id, %kind, "text from a vault typed");
+                    if let Some(registry) = &hooks.registry {
+                        viewers::record_text_typed(
+                            &registry.pool,
+                            agent_id,
+                            session_id,
+                            kind,
+                            &item,
+                        )
+                        .await?;
+                    }
+                }
                 Message::AgentInfo { hostname } => {
                     let hostname = protocol::sanitize_hostname(&hostname);
                     info!(%agent_id, ?hostname, "agent info");

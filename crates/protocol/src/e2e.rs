@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::clipboard::ClipboardData;
 use crate::credential::CredentialEvent;
 use crate::input::InputEvent;
+use crate::ipc::Secret;
 use crate::media::{StreamSettings, StreamStatus};
+use crate::vault::{TextKind, TypeTextResult};
 
 /// Length of every symmetric key and X25519 public key in a session.
 pub const KEY_LEN: usize = 32;
@@ -95,6 +97,18 @@ pub enum Control {
     /// Agent -> viewer: what came of one of the three above. Only to the
     /// viewer that sent it, so never to one too old to know this record.
     CredentialStatus(CredentialEvent),
+    /// Viewer -> agent: type `text` where the remote keyboard focus is. It
+    /// comes from the technician's password manager (see
+    /// [`crate::vault`]); `kind` and `item` (the vault item's name) are
+    /// for the audit log. Older agents skip this record.
+    TypeText {
+        kind: TextKind,
+        item: String,
+        text: Secret,
+    },
+    /// Agent -> viewer: what came of a `TypeText`. Only to the viewer that
+    /// sent it.
+    TypeTextStatus(TypeTextResult),
 }
 
 /// A video key. Keys change when a viewer leaves, so a departed viewer
@@ -221,6 +235,28 @@ mod tests {
             assert_eq!(usize::from(bytes[0]), usize::from(base) + 1 + i);
             assert_eq!(postcard::from_bytes::<Control>(&bytes).unwrap(), record);
         }
+    }
+
+    #[test]
+    fn type_text_records_follow_the_credential_ones_and_hide_the_text() {
+        let text = Control::TypeText {
+            kind: TextKind::Password,
+            item: "Contoso admin".into(),
+            text: Secret::new(vec![104, 105]),
+        };
+        let records = [text.clone(), Control::TypeTextStatus(TypeTextResult::Typed)];
+        let base =
+            postcard::to_stdvec(&Control::CredentialStatus(CredentialEvent::Stored)).unwrap()[0];
+        for (i, record) in records.into_iter().enumerate() {
+            let bytes = postcard::to_stdvec(&record).unwrap();
+            assert_eq!(usize::from(bytes[0]), usize::from(base) + 1 + i);
+            assert_eq!(postcard::from_bytes::<Control>(&bytes).unwrap(), record);
+        }
+        let shown = format!("{text:?}");
+        assert!(
+            shown.contains("Contoso admin") && !shown.contains("104"),
+            "{shown}"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ import signal
 import socket
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -517,3 +518,23 @@ def test_bytes_short() -> None:
     assert formatting.bytes_short(512) == "512 B"
     assert formatting.bytes_short(1536) == "1.5 KiB"
     assert formatting.bytes_short(5 << 40) == "5.0 TiB"
+
+
+def test_the_vault_session_key_and_bw_path_go_in_the_environment() -> None:
+    config = Config(
+        server_url="https://rmm.example.com:8443",
+        ca_path=Path("/ca.pem"),
+        viewer_path="/opt/viewer",
+        bw_path="/opt/bw",
+    )
+    resolve = fake_resolve({"rmm.example.com": "203.0.113.5"})
+    cmd = build_command(config, SESSION, resolve, bw_session="bw-key")
+    assert cmd.env == {
+        "RMM_VIEWER_TOKEN": "secret-token",
+        "RMM_BW": "/opt/bw",
+        "RMM_BW_SESSION": "bw-key",
+    }
+    assert "bw-key" not in cmd.argv and "/opt/bw" not in cmd.argv
+    # Locked, and no path configured: nothing about the vault is passed.
+    plain = build_command(replace(config, bw_path=None), SESSION, resolve)
+    assert plain.env == {"RMM_VIEWER_TOKEN": "secret-token"}

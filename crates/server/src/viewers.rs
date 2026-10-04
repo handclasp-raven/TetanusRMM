@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use protocol::consent::{ConsentMode, Outcome};
 use protocol::credential::CredentialEvent;
 use protocol::e2e::Path;
+use protocol::vault::{sanitize_item, TextKind};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -268,6 +269,46 @@ pub async fn record_credential(
     audit::append_now(
         pool,
         NewEntry::new(actor, Action::Credential(event))
+            .target(agent_id)
+            .detail(detail),
+    )
+    .await
+    .map(drop)
+}
+
+/// Record that an agent typed text from a technician's password manager
+/// (see `protocol::vault`). Audited as `vault.typed`, with the kind and
+/// the vault item's name, by the technician of viewer session
+/// `session_id`; by the agent itself if that is not one of its sessions.
+pub async fn record_text_typed(
+    pool: &PgPool,
+    agent_id: &str,
+    session_id: u64,
+    kind: TextKind,
+    item: &str,
+) -> sqlx::Result<()> {
+    let session_id = i64::try_from(session_id).ok();
+    let technician: Option<String> = match session_id {
+        Some(id) => {
+            sqlx::query_scalar(
+                "SELECT u.username FROM viewer_sessions v JOIN users u ON u.id = v.user_id
+                 WHERE v.id = $1 AND v.agent_id = $2",
+            )
+            .bind(id)
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?
+        }
+        None => None,
+    };
+    let mut detail = json!({ "kind": kind, "item": sanitize_item(item) });
+    if let (Some(_), Some(id)) = (&technician, session_id) {
+        detail["viewer_session_id"] = json!(id);
+    }
+    let actor = technician.unwrap_or_else(|| format!("agent:{agent_id}"));
+    audit::append_now(
+        pool,
+        NewEntry::new(actor, Action::VaultTyped)
             .target(agent_id)
             .detail(detail),
     )

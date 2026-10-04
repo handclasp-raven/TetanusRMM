@@ -16,6 +16,12 @@ The text size picked in a viewer (its Text menu) is remembered: the viewer
 writes it to ``viewer.json`` in the TUI's data directory
 (``--remember-font-size``), and the next viewer starts at that size.
 Until one is picked, ``viewer_font_size`` from the config applies.
+
+The viewer's Vault button uses Bitwarden's ``bw`` client (see
+``bitwarden``). Once the vault is unlocked in the TUI, each viewer gets the
+session key (``RMM_BW_SESSION``, in the environment like the tokens) and
+need not ask for the master password; ``bw_path`` from the config goes in
+``RMM_BW``.
 """
 
 from __future__ import annotations
@@ -111,11 +117,14 @@ def build_command(
     api_token: str | None = None,
     commands: Iterable[QuickCommand] = (),
     font_file: Path | None = None,
+    bw_session: str | None = None,
 ) -> ViewerCommand:
     """The viewer's command line and extra environment for ``session``.
     With ``api_token``, the side panel can use the API as this session.
     With ``font_file``, the viewer starts at the text size remembered there
-    (else ``viewer_font_size``) and saves the one picked in it."""
+    (else ``viewer_font_size``) and saves the one picked in it. With
+    ``bw_session``, its Vault button opens the Bitwarden vault without
+    asking for the master password."""
     if config.ca_path is None:
         raise ViewerError("the viewer needs a CA certificate: set ca_path in the config")
     host, port = split_host_port(config.quic_addr or config.api_host, DEFAULT_QUIC_PORT)
@@ -140,6 +149,12 @@ def build_command(
     if font_file is not None:
         argv += ["--remember-font-size", str(font_file)]
     env = {"RMM_VIEWER_TOKEN": session.token}
+    # In the environment, not arguments: a viewer too old to know them
+    # ignores them, and the session key must not be on a command line.
+    if config.bw_path:
+        env["RMM_BW"] = config.bw_path
+    if bw_session:
+        env["RMM_BW_SESSION"] = bw_session
     if api_token:
         argv += ["--api-url", config.server_url]
         env["RMM_API_TOKEN"] = api_token

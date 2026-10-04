@@ -96,6 +96,10 @@ pub enum Action {
     /// an agent (asked for, stored, typed, forgotten...). Never the
     /// password, which stays on the agent.
     Credential(CredentialEvent),
+    /// An agent typed text a technician sent from their password manager
+    /// (see `protocol::vault`); detail has the kind and the vault item's
+    /// name. Never the text, which the server does not see.
+    VaultTyped,
 }
 
 impl Action {
@@ -108,12 +112,12 @@ impl Action {
             Action::Logout => "logout",
             Action::PolicyUpdate => "policy.update",
             Action::EnrollmentCreate => "enrollment.create",
+            Action::DeploymentKeyCreate => "deployment_key.create",
+            Action::DeploymentKeyRevoke => "deployment_key.revoke",
             Action::AgentEnroll => "agent.enroll",
             Action::ViewerSessionCreate => "viewer.session_create",
             Action::ViewerConnect => "viewer.connect",
             Action::ViewerDisconnect => "viewer.disconnect",
-            Action::DeploymentKeyCreate => "deployment_key.create",
-            Action::DeploymentKeyRevoke => "deployment_key.revoke",
             Action::PolicyDefault => "policy.default",
             Action::SessionStart => "session.start",
             Action::SessionUserTerminated => "session.user_terminated",
@@ -148,6 +152,7 @@ impl Action {
             Action::Credential(CredentialEvent::Typed) => "credential.typed",
             Action::Credential(CredentialEvent::Forgotten) => "credential.forgotten",
             Action::Credential(CredentialEvent::NotStored) => "credential.not_stored",
+            Action::VaultTyped => "vault.typed",
         }
     }
 }

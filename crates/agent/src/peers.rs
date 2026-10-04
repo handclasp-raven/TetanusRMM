@@ -354,14 +354,16 @@ impl Peers {
             Control::MediaKey(_)
             | Control::DirectAnswer(_)
             | Control::StreamStatus(_)
-            | Control::CredentialStatus(_) => {}
+            | Control::CredentialStatus(_)
+            | Control::TypeTextStatus(_) => {}
             record @ (Control::Input(_)
             | Control::Clipboard(_)
             | Control::StreamSettings(_)
             | Control::SecureAttention
             | Control::CredentialRequest
             | Control::CredentialType
-            | Control::CredentialForget) => {
+            | Control::CredentialForget
+            | Control::TypeText { .. }) => {
                 let _ = self.inbound.send(Inbound::Record { session_id, record });
             }
         }

@@ -45,6 +45,7 @@ use protocol::consent::{decide, Decision, DeviceKind, Outcome, SessionRequest};
 use protocol::credential::CredentialEvent;
 use protocol::e2e::{AgentProof, Control};
 use protocol::media::{FrameRate, StreamReport, StreamStatus, VideoPayload};
+use protocol::vault::{sanitize_item, TypeTextResult, MAX_TEXT_UNITS};
 use protocol::{close_code, read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -837,6 +838,46 @@ impl AgentSession {
                                 });
                             }
                         }
+                    }
+                    Inbound::Record {
+                        session_id,
+                        record: Control::TypeText { kind, item, text },
+                    } => {
+                        let active = lock(&sessions).is_active(session_id);
+                        let (true, Some(desktop)) = (active, &self.desktop) else {
+                            debug!(session_id, "text to type dropped: not an active session");
+                            continue;
+                        };
+                        let status = |result| Control::TypeTextStatus(result);
+                        // Like the lent password: nothing unaudited.
+                        if !credential_reports.load(std::sync::atomic::Ordering::Relaxed)
+                            || text.units().len() > MAX_TEXT_UNITS
+                        {
+                            info!(session_id, %kind, "text not typed: unaudited or too long");
+                            peers.send(session_id, &status(TypeTextResult::Unavailable));
+                            continue;
+                        }
+                        let item = sanitize_item(&item);
+                        let (reply, typed) = tokio::sync::oneshot::channel();
+                        let _ = desktop
+                            .commands
+                            .send(DesktopCommand::TypeText { text, reply });
+                        let (peers, outbox) = (peers.clone(), outbox_tx.clone());
+                        while credential_tasks.try_join_next().is_some() {}
+                        credential_tasks.spawn(async move {
+                            let typed = typed.await.unwrap_or(false);
+                            info!(session_id, %kind, %item, typed, "text from a vault");
+                            if typed {
+                                let _ = outbox.send(Message::TextTyped {
+                                    session_id,
+                                    kind,
+                                    item,
+                                });
+                                peers.send(session_id, &status(TypeTextResult::Typed));
+                            } else {
+                                peers.send(session_id, &status(TypeTextResult::Blocked));
+                            }
+                        });
                     }
                     Inbound::Record {
                         session_id,

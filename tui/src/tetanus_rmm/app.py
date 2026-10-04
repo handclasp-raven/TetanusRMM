@@ -14,7 +14,7 @@ from textual import work
 from textual.app import App
 from textual.theme import Theme
 
-from . import provision
+from . import bitwarden, provision
 from .api import ApiClient, ApiError
 from .auth import SessionManager
 from .commands import QuickCommand
@@ -61,6 +61,9 @@ class RmmApp(App):
         self.trust = trust or TrustStore(self.log_dir / "servers")
         self.fetch_ca = ca_fetcher
         self.viewers: list[subprocess.Popen[bytes]] = []
+        #: Opens the Bitwarden vault for viewers, once unlocked here (see
+        #: ``bitwarden``). In memory only.
+        self.bw_session: str | None = None
         for theme in (*THEMES, *self.state.custom_themes.values()):
             self.register_theme(theme)
 
@@ -192,8 +195,23 @@ class RmmApp(App):
             api_token=self.session.api.token,
             commands=commands,
             font_file=self.state.path.with_name(FONT_FILE),
+            bw_session=self.bw_session,
         )
         return self.launch_viewer(command)
+
+    @property
+    def bw_path(self) -> str:
+        return self.config.bw_path or "bw"
+
+    def lock_vault(self) -> bool:
+        """Lock the Bitwarden vault if it was unlocked here, which also
+        ends the access of the viewers given its session key. Whether there
+        was anything to lock. Raises :class:`bitwarden.BitwardenError`."""
+        session, self.bw_session = self.bw_session, None
+        if session is None:
+            return False
+        bitwarden.lock(self.bw_path)
+        return True
 
     def close_viewers(self) -> None:
         """Close every viewer this TUI started. Safe to call more than once."""
@@ -203,4 +221,8 @@ class RmmApp(App):
     async def on_unmount(self) -> None:
         # Viewer windows must not outlive the TUI that opened them.
         await asyncio.to_thread(self.close_viewers)
+        try:
+            await asyncio.to_thread(self.lock_vault)
+        except bitwarden.BitwardenError:
+            pass  # nothing more to be done about it on the way out
         await self.session.api.aclose()

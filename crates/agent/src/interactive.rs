@@ -23,6 +23,7 @@ use protocol::clipboard::ClipboardData;
 use protocol::consent::{ConsentMode, Outcome, PromptAnswer};
 use protocol::credential::CredentialEvent;
 use protocol::input::{scancode, InputEvent};
+use protocol::ipc::Secret;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::input::HeldInput;
@@ -223,6 +224,13 @@ pub enum DesktopCommand {
     /// Forget the lent password and withdraw any prompt for one. `reply`
     /// gets whether there was one to forget.
     CredentialForget {
+        reply: oneshot::Sender<bool>,
+    },
+    /// Type text a technician sent from their password manager (see
+    /// [`protocol::vault`]) where the keyboard focus is. `reply` gets
+    /// whether something was there to take it.
+    TypeText {
+        text: Secret,
         reply: oneshot::Sender<bool>,
     },
 }

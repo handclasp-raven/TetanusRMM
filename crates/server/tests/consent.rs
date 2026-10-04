@@ -14,6 +14,8 @@ use protocol::clipboard::ClipboardData;
 use protocol::consent::{DeviceKind, PromptAnswer};
 use protocol::credential::CredentialEvent;
 use protocol::input::{scancode, InputEvent, MouseButton};
+use protocol::ipc::Secret;
+use protocol::vault::{TextKind, TypeTextResult, MAX_TEXT_UNITS};
 use serde_json::Value;
 use server::registry::{self, ConsentMode, DevicePolicy, OnNoUser};
 use server::users::{CreatedUser, Role};
@@ -40,6 +42,8 @@ enum Seen {
     CredentialPrompt(String),
     CredentialType,
     CredentialForget,
+    /// Text from a vault, as the desktop was given it.
+    TypeText(Vec<u16>),
 }
 
 struct FakeDesktop {
@@ -52,6 +56,8 @@ struct FakeDesktop {
     /// Whether the desktop holds a lent password (the password itself
     /// never reaches the agent core, so a flag stands in for it).
     password: AtomicBool,
+    /// Whether something on the desktop takes typed text.
+    takes_text: AtomicBool,
     events: mpsc::UnboundedSender<DesktopEvent>,
 }
 
@@ -147,6 +153,10 @@ fn run_desktop(mut end: DesktopEnd, fake: Arc<FakeDesktop>) {
                     let _ = reply.send(fake.password.swap(false, Ordering::SeqCst));
                     Seen::CredentialForget
                 }
+                DesktopCommand::TypeText { text, reply } => {
+                    let _ = reply.send(fake.takes_text.load(Ordering::SeqCst));
+                    Seen::TypeText(text.units().to_vec())
+                }
             };
             fake.seen.lock().unwrap().push(seen);
         }
@@ -194,6 +204,7 @@ async fn rig_as(kind: DeviceKind) -> Rig {
         answer: Mutex::new(PromptAnswer::Accepted),
         lend: Mutex::new(CredentialEvent::Stored),
         password: AtomicBool::new(false),
+        takes_text: AtomicBool::new(true),
         events: end.events.clone(),
     });
     run_desktop(end, desktop.clone());
@@ -350,6 +361,20 @@ async fn next_credential(events: &mut mpsc::Receiver<ViewerEvent>) -> Credential
     })
     .await
     .expect("credential status within deadline")
+}
+
+async fn next_typed(events: &mut mpsc::Receiver<ViewerEvent>) -> TypeTextResult {
+    timeout(DEADLINE, async {
+        loop {
+            match events.recv().await.expect("viewer events") {
+                ViewerEvent::TypeText(result) => return result,
+                ViewerEvent::Closed(reason) => panic!("closed: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("type-text status within deadline")
 }
 
 async fn closed_reason(events: &mut mpsc::Receiver<ViewerEvent>) -> String {
@@ -818,4 +843,69 @@ async fn a_lent_password_is_shared_by_technicians_and_forgotten_with_the_last_se
     .await
     .unwrap_or(());
     assert_eq!(credential_audit(&rig).await, expected);
+}
+
+#[tokio::test]
+async fn text_from_a_vault_is_typed_and_audited_without_the_text() {
+    let rig = rig().await;
+    let (root, mut events) = rig.connect().await;
+    let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+
+    root.type_text(
+        TextKind::Password,
+        "Contoso\n domain admin".into(),
+        Secret::new(units("hunter2-s3cret")),
+    );
+    assert_eq!(next_typed(&mut events).await, TypeTextResult::Typed);
+    assert!(rig
+        .desktop
+        .seen()
+        .contains(&Seen::TypeText(units("hunter2-s3cret"))));
+
+    // Nothing took it: said so, and not audited as typed.
+    rig.desktop.takes_text.store(false, Ordering::SeqCst);
+    root.type_text(
+        TextKind::Totp,
+        "Contoso VPN".into(),
+        Secret::new(units("123456")),
+    );
+    assert_eq!(next_typed(&mut events).await, TypeTextResult::Blocked);
+
+    // Too long: refused before it reaches the desktop.
+    rig.desktop.takes_text.store(true, Ordering::SeqCst);
+    let long = vec![u16::from(b'x'); MAX_TEXT_UNITS + 1];
+    root.type_text(TextKind::Username, "Long".into(), Secret::new(long.clone()));
+    assert_eq!(next_typed(&mut events).await, TypeTextResult::Unavailable);
+    assert!(!rig.desktop.seen().contains(&Seen::TypeText(long)));
+
+    let rows = || async {
+        sqlx::query_as::<_, (String, Option<String>, Value)>(
+            "SELECT actor, target, detail FROM audit_log WHERE action = 'vault.typed' ORDER BY id",
+        )
+        .fetch_all(&rig.db.pool)
+        .await
+        .unwrap()
+    };
+    timeout(DEADLINE, async {
+        while rows().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("vault.typed audited");
+    let rows = rows().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (actor, target, detail) = &rows[0];
+    assert_eq!(actor, "root");
+    assert_eq!(target.as_deref(), Some(rig.agent_id.as_str()));
+    assert_eq!(detail["kind"], "password");
+    assert_eq!(detail["item"], "Contoso domain admin");
+    assert!(detail["viewer_session_id"].is_i64());
+
+    // The text is nowhere in the audit log.
+    let all: Vec<(Value,)> = sqlx::query_as("SELECT detail FROM audit_log")
+        .fetch_all(&rig.db.pool)
+        .await
+        .unwrap();
+    assert!(all.iter().all(|(d,)| !d.to_string().contains("hunter2")));
 }

@@ -31,3 +31,4 @@ tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 transport.workspace = true
 winit.workspace = true
+zeroize.workspace = true

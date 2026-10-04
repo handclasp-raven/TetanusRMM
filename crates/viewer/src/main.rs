@@ -3,8 +3,8 @@
 //! mouse and keyboard input and clipboard changes to it.
 //!
 //! Around the picture: a toolbar (display mode, monitor, refresh,
-//! Ctrl+Alt+Del, the password the remote user lends for the session, full
-//! screen, the side panel, disconnect) and a side panel with the agent's
+//! Ctrl+Alt+Del, the password the remote user lends for the session, the
+//! technician's Bitwarden vault, full screen, the side panel, disconnect) and a side panel with the agent's
 //! status, command buttons and file transfer (see `viewer::ui`). The panel
 //! uses the server's HTTPS API as the signed-in technician; the TUI passes
 //! the API address and its session token (`RMM_API_TOKEN`, never on the
@@ -16,8 +16,18 @@
 //! controls' text smaller or larger, F5 asks for a fresh keyframe, Del
 //! presses Ctrl+Alt+Del on the remote machine (for its logon and lock
 //! screens; the technician's own Ctrl+Alt+Del never reaches the viewer),
-//! Q quits. While a menu or dialog is open, keys go to it (Esc closes it;
+//! B opens the vault, Q quits. While a menu or dialog is open, keys go to it (Esc closes it;
 //! in the monitor menu 1-9 pick).
+//!
+//! The vault dialog searches the technician's Bitwarden vault through the
+//! `bw` client (see `viewer::vault`) and has the agent type a username,
+//! password or one-time code where the remote keyboard focus is. In it,
+//! Enter searches, the arrow keys pick an item, and Ctrl+U, Ctrl+P and
+//! Ctrl+T type its username, password and code. The master password is
+//! asked for when the vault is locked and never kept; the TUI can unlock
+//! once for every viewer it starts (the session key comes in
+//! `RMM_BW_SESSION`, never on the command line). What is typed is sealed
+//! for the agent, so the server sees only that it happened.
 //!
 //! The FPS menu sets how many frames a second this technician wants (the
 //! agent streams at the fastest any technician watching wants); "Auto"
@@ -38,7 +48,9 @@ use anyhow::{bail, Context};
 use clap::Parser;
 use protocol::credential::CredentialEvent;
 use protocol::input::{normalise, InputEvent, MouseButton, WHEEL_NOTCH};
+use protocol::ipc::Secret;
 use protocol::media::{FrameRate, MonitorInfo, StreamStatus};
+use protocol::vault::{TextKind, TypeTextResult};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
 use viewer::api::{remote_file_name, AgentDetails, ApiClient};
@@ -47,12 +59,14 @@ use viewer::decode::{Picture, VideoDecoder};
 use viewer::keymap;
 use viewer::render::{self, DisplayMode, Rect, View};
 use viewer::ui::{self, Action, Chrome, Hit, Metrics, Notice, Overlay, QuickCommand};
+use viewer::vault::{self, Bw, SessionKey, VaultError};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
+use zeroize::{Zeroize, Zeroizing};
 
 /// How often the side panel's status is refreshed.
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
@@ -67,6 +81,14 @@ const PAN_ZONE_CHARS: f64 = 3.0;
 const PAN_SPEED: f64 = 1500.0;
 /// Pan steps while the pointer is in an edge zone.
 const PAN_TICK: Duration = Duration::from_millis(16);
+/// How long the agent gets to say what came of text sent to be typed. One
+/// too old to know the record says nothing.
+const TYPE_TEXT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Room for a master password typed into the prompt, so that the text
+/// never moves (leaving a copy behind) as it grows.
+const PASSWORD_CAPACITY: usize = 256;
+/// The environment variable a Bitwarden session key arrives in.
+const BW_SESSION_ENV: &str = "RMM_BW_SESSION";
 
 #[derive(Parser)]
 #[command(about = "RMM remote desktop viewer", version)]
@@ -120,6 +142,11 @@ struct Cli {
     /// speed), max, or a number such as 60. Also in the toolbar's FPS menu.
     #[arg(long, env = "RMM_VIEWER_FPS", default_value = "auto")]
     fps: FrameRate,
+    /// Bitwarden's command line client, for the Vault button. It must be
+    /// signed in (`bw login`). A session key in RMM_BW_SESSION (from the
+    /// TUI) opens the vault without asking for the master password.
+    #[arg(long, env = "RMM_BW", default_value = "bw", value_name = "PATH")]
+    bw: PathBuf,
     /// Start with the side panel hidden.
     #[arg(long)]
     no_panel: bool,
@@ -142,6 +169,13 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Out of the environment at once: nothing this process starts, other
+    // than `bw` itself, gets to inherit it.
+    let bw_session: Option<SessionKey> = std::env::var(BW_SESSION_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(Zeroizing::new);
+    std::env::remove_var(BW_SESSION_ENV);
     common::logging::init();
     let cli = Cli::parse();
     let ca_pem = std::fs::read_to_string(&cli.ca)
@@ -190,6 +224,8 @@ fn main() -> anyhow::Result<()> {
         show_panel: !cli.no_panel,
         font_px: cli.font_size,
         font_file: cli.remember_font_size,
+        bw: Bw::new(cli.bw),
+        bw_session,
     };
     windowed(options, cli.monitor, panel)
 }
@@ -289,6 +325,8 @@ struct PanelSetup {
     show_panel: bool,
     font_px: u32,
     font_file: Option<PathBuf>,
+    bw: Bw,
+    bw_session: Option<SessionKey>,
 }
 
 enum UserEvent {
@@ -301,6 +339,9 @@ enum UserEvent {
     StreamMonitor(u32),
     StreamStatus(StreamStatus),
     Credential(CredentialEvent),
+    /// What the agent did with text sent to be typed.
+    TypeText(TypeTextResult),
+    Vault(VaultEvent),
     Path(protocol::e2e::Path),
     Closed(String),
     /// The agent's status for the side panel, or why it could not be had.
@@ -337,6 +378,122 @@ enum Job {
     },
 }
 
+/// Work for the vault worker (see [`vault_worker`]).
+enum VaultJob {
+    /// The dialog was opened: can the vault be used?
+    Open,
+    /// Unlock with this master password, wiped when the job is done.
+    Unlock(Zeroizing<String>),
+    Search(String),
+    /// Fetch `kind` of item `id` and have the agent type it.
+    Type {
+        handle: ViewerHandle,
+        id: String,
+        name: String,
+        kind: TextKind,
+        /// The search already has it; it is no secret.
+        username: Option<String>,
+    },
+    Sync,
+    Lock,
+}
+
+/// What the vault worker has to say.
+enum VaultEvent {
+    /// The vault is locked: ask for the master password (`wrong`: again).
+    NeedPassword {
+        wrong: bool,
+    },
+    Unlocked,
+    Results {
+        query: String,
+        items: Vec<vault::Item>,
+    },
+    /// The text is on its way to the agent.
+    Sent {
+        kind: TextKind,
+        name: String,
+    },
+    Synced,
+    Locked,
+    Failed(String),
+}
+
+/// Runs `bw` for the vault dialog, one call at a time, off the UI thread
+/// (each takes a second or so). The session key lives here and nowhere
+/// else in the viewer; a value to type goes straight from `bw` to the
+/// agent without passing through the window.
+fn vault_worker(
+    bw: Bw,
+    mut session: Option<SessionKey>,
+    jobs: std::sync::mpsc::Receiver<VaultJob>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    for job in jobs {
+        let result = run_vault_job(&bw, &mut session, job);
+        let event = match result {
+            Ok(event) => event,
+            Err(VaultError::Locked) => {
+                session = None;
+                VaultEvent::NeedPassword { wrong: false }
+            }
+            Err(VaultError::WrongPassword) => VaultEvent::NeedPassword { wrong: true },
+            Err(e) => VaultEvent::Failed(e.to_string()),
+        };
+        if proxy.send_event(UserEvent::Vault(event)).is_err() {
+            return;
+        }
+    }
+}
+
+fn run_vault_job(
+    bw: &Bw,
+    session: &mut Option<SessionKey>,
+    job: VaultJob,
+) -> Result<VaultEvent, VaultError> {
+    if let VaultJob::Unlock(password) = &job {
+        *session = Some(bw.unlock(password)?);
+        return Ok(VaultEvent::Unlocked);
+    }
+    if let VaultJob::Lock = job {
+        bw.lock()?;
+        *session = None;
+        return Ok(VaultEvent::Locked);
+    }
+    if let VaultJob::Open = job {
+        return match bw.status(session.as_ref())? {
+            vault::Status::Unlocked if session.is_some() => Ok(VaultEvent::Unlocked),
+            vault::Status::Unauthenticated => Err(VaultError::NotLoggedIn),
+            _ => Err(VaultError::Locked),
+        };
+    }
+    let key = session.as_ref().ok_or(VaultError::Locked)?;
+    match job {
+        VaultJob::Search(query) => {
+            let items = bw.search(key, &query)?;
+            Ok(VaultEvent::Results { query, items })
+        }
+        VaultJob::Type {
+            handle,
+            id,
+            name,
+            kind,
+            username,
+        } => {
+            let text = match (kind, username) {
+                (TextKind::Username, Some(username)) => {
+                    Secret::new(username.encode_utf16().collect())
+                }
+                _ => bw.fetch(key, &id, kind)?,
+            };
+            handle.type_text(kind, name.clone(), text);
+            Ok(VaultEvent::Sent { kind, name })
+        }
+        VaultJob::Sync => bw.sync(key).map(|()| VaultEvent::Synced),
+        VaultJob::Open | VaultJob::Unlock(_) | VaultJob::Lock => unreachable!("handled above"),
+    }
+}
+
 /// The newest decoded picture. The decoder overwrites it; the window takes
 /// it. A slow window skips pictures instead of queueing them.
 type Slot = Arc<Mutex<Option<Picture>>>;
@@ -349,6 +506,12 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>, setup: PanelSetup) -> 
     let api = setup.api;
     let has_api = api.is_some();
     let frame_rate = setup.frame_rate;
+    let (vault_tx, vault_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let proxy = proxy.clone();
+        let (bw, session) = (setup.bw, setup.bw_session);
+        move || vault_worker(bw, session, vault_rx, proxy)
+    });
     std::thread::spawn({
         let slot = slot.clone();
         move || network(options, monitor, frame_rate, proxy, slot, api, jobs_rx)
@@ -395,6 +558,11 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>, setup: PanelSetup) -> 
         busy: None,
         jobs: has_api.then_some(jobs_tx),
         last_remote_dir: None,
+        vault: ui::Vault::default(),
+        vault_items: Vec::new(),
+        vault_ready: false,
+        vault_jobs: vault_tx,
+        typing: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -504,6 +672,7 @@ fn network(
                 ViewerEvent::StreamMonitor(m) => UserEvent::StreamMonitor(m),
                 ViewerEvent::StreamStatus(status) => UserEvent::StreamStatus(status),
                 ViewerEvent::Credential(event) => UserEvent::Credential(event),
+                ViewerEvent::TypeText(result) => UserEvent::TypeText(result),
                 ViewerEvent::Path(path) => UserEvent::Path(path),
                 ViewerEvent::Closed(reason) => UserEvent::Closed(reason),
             };
@@ -720,6 +889,18 @@ struct App {
     jobs: Option<UnboundedSender<Job>>,
     /// Folder of the last path used on the agent, to start the next from.
     last_remote_dir: Option<String>,
+
+    // The vault (see `viewer::vault`).
+    /// The dialog, kept while it is closed so it reopens as it was.
+    vault: ui::Vault,
+    /// What the last search found, row for row with the dialog's list.
+    vault_items: Vec<vault::Item>,
+    /// Whether the worker holds a session key that opened the vault.
+    vault_ready: bool,
+    vault_jobs: std::sync::mpsc::Sender<VaultJob>,
+    /// Text sent to the agent to type: what it was, and when to give up
+    /// waiting to hear what came of it.
+    typing: Option<(String, Instant)>,
 }
 
 impl App {
@@ -769,6 +950,7 @@ impl App {
             },
             scroll: self.scroll,
             overlay: self.overlay.as_ref(),
+            vault: &self.vault,
             notices: &self.notices,
             cursor: self.cursor,
         }
@@ -912,6 +1094,93 @@ impl App {
         }
     }
 
+    fn vault_job(&mut self, job: VaultJob, busy: &str) {
+        self.vault.busy = Some(busy.into());
+        self.vault.note = None;
+        let _ = self.vault_jobs.send(job);
+    }
+
+    /// Ask for the master password. It is typed into a masked prompt and
+    /// wiped as soon as it has been used, or the prompt is cancelled.
+    fn ask_master_password(&mut self, wrong: bool) {
+        let again = if wrong { "Wrong master password. " } else { "" };
+        self.open(Overlay::Prompt(ui::Prompt {
+            title: format!(
+                "{again}Bitwarden master password, to unlock your vault (it is not kept):"
+            ),
+            text: String::with_capacity(PASSWORD_CAPACITY),
+            purpose: ui::PromptPurpose::VaultUnlock,
+            masked: true,
+        }));
+    }
+
+    /// What the vault worker said.
+    fn vault_event(&mut self, event: VaultEvent) {
+        self.vault.busy = None;
+        let showing = matches!(self.overlay, Some(Overlay::Vault));
+        match event {
+            VaultEvent::NeedPassword { wrong } => {
+                self.vault_ready = false;
+                self.vault.set_rows(Vec::new());
+                self.vault_items.clear();
+                if showing {
+                    self.ask_master_password(wrong);
+                } else {
+                    self.notify("The vault is locked: open Vault to unlock it.", true);
+                }
+            }
+            VaultEvent::Unlocked => {
+                self.vault_ready = true;
+                self.vault.note = None;
+                if !self.vault.query.is_empty() && self.vault.rows.is_empty() {
+                    self.vault_job(VaultJob::Search(self.vault.query.clone()), "Searching...");
+                }
+            }
+            VaultEvent::Results { query, items } => {
+                self.vault.note = items
+                    .is_empty()
+                    .then(|| (format!("Nothing found for \"{query}\"."), false));
+                self.vault.set_rows(
+                    items
+                        .iter()
+                        .map(|item| ui::VaultRow {
+                            name: item.name.clone(),
+                            detail: item
+                                .username
+                                .clone()
+                                .or_else(|| item.uri.clone())
+                                .unwrap_or_default(),
+                            username: item.has(TextKind::Username),
+                            password: item.has(TextKind::Password),
+                            totp: item.has(TextKind::Totp),
+                        })
+                        .collect(),
+                );
+                self.vault_items = items;
+            }
+            VaultEvent::Sent { kind, name } => {
+                let what = format!("the {} of {name}", kind_label(kind));
+                self.typing = Some((what, Instant::now() + TYPE_TEXT_TIMEOUT));
+            }
+            VaultEvent::Synced => self.vault.note = Some(("Synced.".into(), false)),
+            VaultEvent::Locked => {
+                self.vault_ready = false;
+                self.vault.clear();
+                self.vault_items.clear();
+                if showing {
+                    self.overlay = None;
+                }
+                self.notify("Vault locked.", false);
+            }
+            VaultEvent::Failed(error) => {
+                if !showing {
+                    self.notify(error.clone(), true);
+                }
+                self.vault.note = Some((error, true));
+            }
+        }
+    }
+
     fn notify(&mut self, text: impl Into<String>, error: bool) {
         let time = if error {
             ERROR_NOTICE_TIME
@@ -948,6 +1217,12 @@ impl App {
     /// Open a menu or dialog: from now on input goes to it.
     fn open(&mut self, overlay: Overlay) {
         self.release_all();
+        // A master password half typed into the prompt this replaces.
+        if let Some(Overlay::Prompt(prompt)) = &mut self.overlay {
+            if prompt.masked {
+                prompt.text.zeroize();
+            }
+        }
         self.overlay = Some(overlay);
     }
 
@@ -985,6 +1260,45 @@ impl App {
             }
             (Overlay::Prompt(_), Key::Named(NamedKey::Enter)) => {
                 self.act(event_loop, Action::PromptOk)
+            }
+            (Overlay::Vault, Key::Named(NamedKey::Enter)) => {
+                self.act(event_loop, Action::VaultSearch)
+            }
+            (Overlay::Vault, Key::Named(NamedKey::ArrowDown)) => self.vault.move_by(1),
+            (Overlay::Vault, Key::Named(NamedKey::ArrowUp)) => self.vault.move_by(-1),
+            (Overlay::Vault, Key::Named(NamedKey::PageDown)) => {
+                self.vault.move_by(ui::VAULT_ROWS as isize)
+            }
+            (Overlay::Vault, Key::Named(NamedKey::PageUp)) => {
+                self.vault.move_by(-(ui::VAULT_ROWS as isize))
+            }
+            (Overlay::Vault, Key::Named(NamedKey::Backspace)) => {
+                self.vault.query.pop();
+            }
+            (Overlay::Vault, Key::Character(c)) if self.modifiers.control_key() => {
+                let kind = match c.to_ascii_lowercase().as_str() {
+                    "u" => TextKind::Username,
+                    "p" => TextKind::Password,
+                    "t" => TextKind::Totp,
+                    "v" => {
+                        let pasted = arboard::Clipboard::new().and_then(|mut c| c.get_text());
+                        if let Ok(pasted) = pasted {
+                            self.vault
+                                .query
+                                .extend(pasted.chars().filter(|c| !c.is_control()));
+                        }
+                        return;
+                    }
+                    _ => return,
+                };
+                self.act(event_loop, Action::VaultType(kind));
+            }
+            (Overlay::Vault, _) if !self.modifiers.control_key() => {
+                if let Some(text) = text {
+                    self.vault
+                        .query
+                        .extend(text.chars().filter(|c| !c.is_control()));
+                }
             }
             (Overlay::Confirm(_), Key::Named(NamedKey::Enter)) => {
                 self.act(event_loop, Action::ConfirmOk)
@@ -1033,6 +1347,7 @@ impl App {
         match code {
             KeyCode::KeyM | KeyCode::Tab => self.act(event_loop, Action::MonitorMenu),
             KeyCode::KeyP => self.act(event_loop, Action::TogglePanel),
+            KeyCode::KeyB => self.act(event_loop, Action::Vault),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.act(
                 event_loop,
                 Action::SetTextSize(self.font_px.saturating_sub(1)),
@@ -1163,6 +1478,47 @@ impl App {
                     }
                 }
             }
+            Action::Vault => {
+                if matches!(self.overlay, Some(Overlay::Vault)) {
+                    self.overlay = None;
+                } else {
+                    self.open(Overlay::Vault);
+                    if !self.vault_ready && self.vault.busy.is_none() {
+                        self.vault_job(VaultJob::Open, "Checking Bitwarden...");
+                    }
+                }
+            }
+            Action::VaultSearch => {
+                if self.vault.busy.is_none() {
+                    let query = self.vault.query.trim().to_owned();
+                    self.vault_job(VaultJob::Search(query), "Searching...");
+                }
+            }
+            Action::VaultSelect(index) => self.vault.select(index),
+            Action::VaultType(kind) => {
+                let item = self
+                    .vault_items
+                    .get(self.vault.selected)
+                    .filter(|item| item.has(kind) && self.vault.busy.is_none());
+                let (Some(item), Some(handle)) = (item, &self.handle) else {
+                    return;
+                };
+                info!(%kind, item = %item.name, "typing from the vault");
+                let job = VaultJob::Type {
+                    handle: handle.clone(),
+                    id: item.id.clone(),
+                    name: item.name.clone(),
+                    kind,
+                    username: item.username.clone(),
+                };
+                let _ = self.vault_jobs.send(job);
+                // Out of the way: the next field on the remote machine can
+                // be clicked. It reopens as it is.
+                self.overlay = None;
+            }
+            Action::VaultSync => self.vault_job(VaultJob::Sync, "Syncing..."),
+            Action::VaultLock => self.vault_job(VaultJob::Lock, "Locking..."),
+            Action::VaultClose => self.overlay = None,
             Action::ToggleFullscreen => {
                 self.fullscreen = !self.fullscreen;
                 if let Some(w) = &self.window {
@@ -1190,12 +1546,25 @@ impl App {
                     title: "Download which file from the agent? Its full path:".into(),
                     text: self.remote_dir(),
                     purpose: ui::PromptPurpose::Download,
+                    masked: false,
                 }));
             }
             Action::PromptOk => {
-                let Some(Overlay::Prompt(prompt)) = self.overlay.take() else {
+                let Some(Overlay::Prompt(mut prompt)) = self.overlay.take() else {
                     return;
                 };
+                if prompt.purpose == ui::PromptPurpose::VaultUnlock {
+                    // Moved, not copied: the prompt's text is the only one.
+                    let password = Zeroizing::new(std::mem::take(&mut prompt.text));
+                    self.overlay = Some(Overlay::Vault);
+                    if password.is_empty() {
+                        self.vault.note = Some(("No master password given.".into(), true));
+                    } else {
+                        self.vault_job(VaultJob::Unlock(password), "Unlocking...");
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 let remote = prompt.text.trim().to_owned();
                 if remote.is_empty() || remote_file_name(&remote).is_empty() {
                     self.notify("Give the full path of a file on the agent.", true);
@@ -1216,9 +1585,16 @@ impl App {
                         self.busy = Some("Choose where to save it...".into());
                         self.submit(Job::Download { remote });
                     }
+                    ui::PromptPurpose::VaultUnlock => unreachable!("handled above"),
                 }
             }
-            Action::PromptCancel => self.overlay = None,
+            Action::PromptCancel => {
+                if let Some(Overlay::Prompt(mut prompt)) = self.overlay.take() {
+                    if prompt.masked {
+                        prompt.text.zeroize();
+                    }
+                }
+            }
             Action::ConfirmOk => {
                 if let Some(Overlay::Confirm(confirm)) = self.overlay.take() {
                     let ui::ConfirmPurpose::Overwrite { local, remote } = confirm.purpose;
@@ -1344,9 +1720,21 @@ impl ApplicationHandler<UserEvent> for App {
             None if self.pan_velocity() != (0.0, 0.0) => self.pan_tick = Some(now),
             None => {}
         }
+        // An agent that never says what came of text sent to be typed does
+        // not know how.
+        if self.typing.as_ref().is_some_and(|(_, until)| now >= *until) {
+            let (what, _) = self.typing.take().expect("checked");
+            self.notify(
+                format!("No word on {what}: the agent is too old to type text. Update it."),
+                true,
+            );
+            self.request_redraw();
+        }
         // ...and wake up for the next step, and to take down notices.
         let next_pan = self.pan_tick.map(|t| t + PAN_TICK);
-        match self.notices.iter().map(|n| n.until).chain(next_pan).min() {
+        let typing = self.typing.as_ref().map(|(_, until)| *until);
+        let wake = self.notices.iter().map(|n| n.until).chain(next_pan);
+        match wake.chain(typing).min() {
             Some(until) => event_loop.set_control_flow(ControlFlow::WaitUntil(until)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
@@ -1458,6 +1846,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if matches!(self.overlay, Some(Overlay::Vault)) {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                    };
+                    self.vault.move_by(if up { -1 } else { 1 });
+                    self.request_redraw();
+                    return;
+                }
                 let over_panel = self
                     .cursor
                     .is_some_and(|c| self.layout().panel.is_some_and(|p| p.contains(c)));
@@ -1524,6 +1921,25 @@ impl ApplicationHandler<UserEvent> for App {
                 let (text, error) = credential_notice(event);
                 self.notify(text, error);
             }
+            UserEvent::TypeText(result) => {
+                info!(?result, "text sent to be typed");
+                let what = self.typing.take().map_or("the text".to_owned(), |t| t.0);
+                match result {
+                    TypeTextResult::Typed => self.notify(format!("Typed {what}."), false),
+                    TypeTextResult::Blocked => self.notify(
+                        format!("Could not type {what}: nothing on the remote machine took it."),
+                        true,
+                    ),
+                    TypeTextResult::Unavailable => self.notify(
+                        format!(
+                            "The agent would not type {what}: the server cannot audit it, \
+                             or it is too long."
+                        ),
+                        true,
+                    ),
+                }
+            }
+            UserEvent::Vault(event) => self.vault_event(event),
             // A failed attempt leaves the session where it was: relayed.
             UserEvent::Path(protocol::e2e::Path::DirectFailed) => {}
             UserEvent::Path(path) => self.path = path,
@@ -1546,6 +1962,7 @@ impl ApplicationHandler<UserEvent> for App {
                     title: format!("Upload {name} to which path on the agent?"),
                     text,
                     purpose: ui::PromptPurpose::Upload { local },
+                    masked: false,
                 }));
             }
             UserEvent::UploadExists { local, remote } => {
@@ -1587,6 +2004,15 @@ fn credential_notice(event: CredentialEvent) -> (&'static str, bool) {
         CredentialEvent::Typed => ("Password typed.", false),
         CredentialEvent::Forgotten => ("Password forgotten.", false),
         CredentialEvent::NotStored => ("No password is stored: ask the user first.", true),
+    }
+}
+
+/// A kind of text, as notices put it.
+fn kind_label(kind: TextKind) -> &'static str {
+    match kind {
+        TextKind::Username => "username",
+        TextKind::Password => "password",
+        TextKind::Totp => "one-time code",
     }
 }
 

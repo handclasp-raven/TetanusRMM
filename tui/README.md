@@ -15,6 +15,9 @@ directly. What it does:
   window it opened. The viewer's side panel shows the agent's status and
   has command buttons (`cmd`, `ncpa.cpl`, `mstsc`, ...) that you choose in
   the TUI (`v`), plus file upload and download.
+- **Bitwarden:** unlock your vault once (`b`) and every viewer started
+  afterwards can search it and type usernames, passwords and one-time codes
+  on the remote machine. See [Bitwarden](#bitwarden).
 - **Shell console:** interactive PowerShell on the agent, in a pane. Needs
   **no viewer**.
 - **Script runner:** runs a command or script on one or more agents, or on
@@ -25,12 +28,12 @@ directly. What it does:
 - **New agent:** a single-use download link for installing an agent. On
   Windows that's an MSI which installs and enrolls it unattended, optionally
   straight into agent groups. The MSI can be saved from the TUI.
-- **Quick assist:** help someone whose computer has no agent, for one
-  session: a six-digit code they type into a program they download from
-  the server. The viewer opens when they have.
 - **Deployment MSI:** one MSI for many PCs, to push with Group Policy or
   Intune. It installs silently and enrolls each PC with a reusable key
   that you can revoke.
+- **Quick assist:** help someone whose computer has no agent, for one
+  session: a six-digit code they type into a program they download from
+  the server. The viewer opens when they have.
 - **Groups:** view groups and their members. Admins can also create, rename,
   delete and fill them. The group list beside the agent table filters it,
   and the search box above it filters by hostname, IP address or group
@@ -141,6 +144,7 @@ quic_addr = "rmm.example.com:4433"            # optional, see below
 poll_interval = 5                             # seconds between agent refreshes
 scripts_path = "~/rmm-scripts.json"           # optional; default is in the data dir
 viewer_font_size = 9                          # optional; the viewer's text size
+bw_path = "/usr/local/bin/bw"                 # optional: Bitwarden's CLI
 ```
 
 | Setting | Flag | Default | |
@@ -152,6 +156,8 @@ viewer_font_size = 9                          # optional; the viewer's text size
 | `poll_interval` | | `5` | At least 1. |
 | `scripts_path` | | data dir `/scripts.json` | The saved-script library. |
 | `viewer_font_size` | | *(viewer default, 10)* | Text size of the viewer's toolbar and side panel, in pixels (6–32), until you pick one in a viewer (**Text** menu, or `Ctrl+Alt+Shift+-`/`=`). From then on viewers start at the size you last picked, remembered in `viewer.json` in the data directory; delete that file to go back to this setting. |
+
+| `bw_path` | | `bw` on `PATH` | Bitwarden's command line client, for [the vault](#bitwarden). On Windows, name the `.exe` (or npm's `bw.cmd`) by its full path. |
 
 Relative paths in the file are relative to the file. Unknown keys are an
 error, so typos get caught.
@@ -206,19 +212,20 @@ server-side session then expires on its own.
 | `s` | Shell console on the selected agent |
 | `r` | Script runner (the selected agent is pre-selected) |
 | `n` | New agent: download link / MSI (admins and support engineers) |
+| `i` | Deployment MSI: a reusable MSI for Group Policy or Intune (admins and support engineers) |
 | `h` | Quick assist: a one-time session by six-digit code (admins and support engineers) |
 | `/` | Search by hostname, IP address or group name (`Enter`: back to the table, `Esc`: clear) |
 | `f` | Jump to the group list |
 | `k` | Classify the selected agent as server, desktop or other (admins) |
 | `g` | Groups |
 | `u` | Users: accounts, roles, access and passwords (admins; hidden otherwise) |
-| `i` | Deployment MSI: a reusable MSI for Group Policy or Intune (admins and support engineers) |
 | `a` | Audit log (admins and auditors) |
 | `c` | Choose columns |
 | `p` | Show or hide the stats panel (kept between runs) |
 | `t` | Choose the colour theme (kept between runs; `tetanus` is the default) |
 | `e` | Theme editor: make, change and delete themes of your own |
 | `v` | Viewer buttons: the remote viewer's command buttons |
+| `b` | Bitwarden: unlock the vault for the viewers, or lock it again |
 | `F5` | Refresh now (the table also refreshes every `poll_interval`) |
 | `l` | Sign out |
 | `q` | Quit |
@@ -313,13 +320,6 @@ You then get:
 **Copy** puts a value on the clipboard (via your terminal, OSC 52). A link is
 single use: once an agent enrolls with it, it's dead.
 
-**Groups** (`g`): the groups, their descriptions and counts, and the
-highlighted group's members with online dots. Admins get:
-- `n` new
-- `e` rename / change description
-- `m` members: tick agents with `Space`
-- `Del` delete: its agents stay but lose access granted through it
-
 **Deployment MSI** (`i`): one MSI for as many PCs as you push it to. It
 carries a deployment key instead of a single-use link, so every PC that
 installs it enrolls as its own agent.
@@ -358,6 +358,13 @@ Good to know:
 - The server's name is looked up when the MSI runs, so the PC needs the
   network (and DNS) at that point.
 - It needs agent 0.1.6 or later published on the server.
+
+**Groups** (`g`): the groups, their descriptions and counts, and the
+highlighted group's members with online dots. Admins get:
+- `n` new
+- `e` rename / change description
+- `m` members: tick agents with `Space`
+- `Del` delete: its agents stay but lose access granted through it
 
 **Users** (`u`, admins only): every user with their role and what they can
 reach.
@@ -450,6 +457,46 @@ the standard set (Command prompt, Network connections, Remote desktop, Task
 manager, Services, Event viewer), and **Save** keeps the list in
 `state.json`. Viewers started afterwards show it; with an empty list the
 panel has no buttons.
+
+### Bitwarden
+
+The viewer's **Vault** button (`Ctrl+Alt+Shift+B`) searches your Bitwarden
+vault and has the agent type a username, password or one-time code where
+the remote keyboard focus is: at the lock screen and UAC prompts too.
+
+It uses Bitwarden's own command line client. Install
+[`bw`](https://bitwarden.com/help/cli/) and sign in once, in a terminal:
+
+```sh
+bw login          # self-hosted: `bw config server https://...` first
+```
+
+Then press `b` in the TUI and type your master password. Every viewer
+started from then on opens the vault without asking. A viewer started
+before that (or after the vault was locked) asks for the master password
+itself, for that window only.
+
+In the vault dialog: type part of an item's name and press Enter, pick an
+item with the arrow keys or the mouse, then **Username**, **Password** or
+**TOTP code** (`Ctrl+U`, `Ctrl+P`, `Ctrl+T`). The dialog closes so you can
+click the next field on the remote machine; it reopens where it was.
+
+What is kept, and where:
+
+- **Your master password: nowhere.** It is passed to one `bw unlock`, in
+  that process's environment (never on a command line), and dropped.
+- **The session key** `bw unlock` returns: in the TUI's memory, and in the
+  environment of the viewers it starts. It is never written to disk. `b`
+  again locks the vault, as do signing out and quitting the TUI, and that
+  ends the viewers' access too. (`bw lock` is not per program: it also
+  locks the vault for a `bw` session in another terminal.)
+- **Search results:** names, usernames and addresses only. A password or
+  code is fetched from `bw` when you have it typed, sent to the agent
+  end-to-end encrypted, and wiped.
+- **The audit log** records that it happened (`vault.typed`): who, on which
+  agent, which kind, and the vault item's name. Never the value. An agent
+  types nothing the server cannot audit, and an agent that predates this
+  does not type vault text at all (the viewer says so): update it.
 
 ## Tests
 

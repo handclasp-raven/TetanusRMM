@@ -18,6 +18,7 @@ pub mod shell;
 pub mod stun;
 pub mod transfer;
 pub mod update;
+pub mod vault;
 
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +63,15 @@ pub use framing::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 ///   `EnableCredentialReports` to agents at version 12+, which then report
 ///   each `CredentialEvent` for the audit log; an agent that was not asked
 ///   refuses to keep a password, so nothing is kept unaudited.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// - 13: text from the technician's password manager (appended variant and
+///   sealed records, see [`vault`]): viewers may send `Control::TypeText`,
+///   and the agent reports `TextTyped` for the audit log, on the same
+///   condition as the lent password (`EnableCredentialReports`). An older
+///   agent skips the record, so nothing is typed.
+pub const PROTOCOL_VERSION: u32 = 13;
+
+/// Oldest agent protocol that types text sent by a viewer (see [`vault`]).
+pub const MIN_TYPE_TEXT_VERSION: u32 = 13;
 
 /// Oldest agent protocol that keeps a lent password (see [`credential`]).
 pub const MIN_CREDENTIAL_VERSION: u32 = 12;
@@ -278,6 +287,17 @@ pub enum Message {
     CredentialEvent {
         session_id: Option<u64>,
         event: credential::CredentialEvent,
+    },
+
+    // --- Text from a password manager (see `vault`) ------------------------
+    /// Agent to server (version 13+, once `EnableCredentialReports` came):
+    /// the agent typed text a technician sent from their vault, for the
+    /// audit log. Never the text.
+    TextTyped {
+        session_id: u64,
+        kind: vault::TextKind,
+        /// The vault item's name.
+        item: String,
     },
 }
 
@@ -592,6 +612,18 @@ mod tests {
             assert_eq!(usize::from(bytes[0]), 36 + i);
             assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn text_typed_is_appended_after_the_credential_messages() {
+        let msg = Message::TextTyped {
+            session_id: 4,
+            kind: vault::TextKind::Password,
+            item: "Contoso admin".into(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        assert_eq!(bytes[0], 38);
+        assert_eq!(postcard::from_bytes::<Message>(&bytes).unwrap(), msg);
     }
 
     #[test]

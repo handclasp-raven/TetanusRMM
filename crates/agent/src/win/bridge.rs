@@ -95,6 +95,22 @@ impl State {
         }
     }
 
+    /// Have `text` typed where the keyboard focus is, like any other
+    /// input: by the system helper when there is one, so it reaches the
+    /// lock screen and UAC. `false` if no helper is there to type it.
+    fn type_text(&self, text: Secret) -> bool {
+        let message = IpcMessage::TypeText(text);
+        let message = match &self.system {
+            Some(system) => system.send(message).err().map(|e| e.0),
+            None => Some(message),
+        };
+        match (message, &self.helper) {
+            (None, _) => true,
+            (Some(message), Some(helper)) => helper.send(message).is_ok(),
+            (Some(_), None) => false,
+        }
+    }
+
     /// The helper capturing the screen, if any can.
     fn capturing(&self) -> Option<&mpsc::UnboundedSender<IpcMessage>> {
         self.capturer.and_then(|role| self.helper(role))
@@ -295,19 +311,14 @@ impl Bridge {
                             return;
                         }
                     };
-                // Typed like any other input: by the system helper when
-                // there is one, so it reaches the lock screen and UAC.
-                let message = IpcMessage::TypeText(text);
-                let message = match &state.system {
-                    Some(system) => system.send(message).err().map(|e| e.0),
-                    None => Some(message),
-                };
-                let sent = match (message, &state.helper) {
-                    (None, _) => true,
-                    (Some(message), Some(helper)) => helper.send(message).is_ok(),
-                    (Some(_), None) => false,
-                };
+                let sent = state.type_text(text);
                 info!(sent, "lent password typed");
+                let _ = reply.send(sent);
+                return;
+            }
+            DesktopCommand::TypeText { text, reply } => {
+                let sent = state.type_text(text);
+                info!(sent, "text from a vault typed");
                 let _ = reply.send(sent);
                 return;
             }

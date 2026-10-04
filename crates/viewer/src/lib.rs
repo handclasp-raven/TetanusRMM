@@ -18,6 +18,8 @@
 //! - [`api`]: the server's HTTPS API behind the side panel.
 //! - [`keymap`]: physical keys to the scancodes the agent injects.
 //! - [`clipboard`]: two-way clipboard sync with the remote machine.
+//! - [`vault`]: the technician's Bitwarden vault, through the `bw` client,
+//!   for usernames, passwords and one-time codes to type remotely.
 
 pub mod api;
 pub mod client;
@@ -26,3 +28,4 @@ pub mod decode;
 pub mod keymap;
 pub mod render;
 pub mod ui;
+pub mod vault;

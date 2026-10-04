@@ -29,7 +29,9 @@ use protocol::clipboard::{ClipboardData, MAX_CLIPBOARD_BYTES};
 use protocol::credential::CredentialEvent;
 use protocol::e2e::{Control, DirectAnswer, DirectOffer, Envelope, Path};
 use protocol::input::InputEvent;
+use protocol::ipc::Secret;
 use protocol::media::{FrameRate, MediaFrame, MonitorInfo, StreamSettings, StreamStatus};
+use protocol::vault::{TextKind, TypeTextResult};
 use protocol::{read_frame, write_frame, FrameError, Message, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -98,6 +100,8 @@ pub enum ViewerEvent {
     /// What came of asking for, typing or forgetting the password the
     /// remote user lends the technicians.
     Credential(CredentialEvent),
+    /// What came of [`ViewerHandle::type_text`].
+    TypeText(TypeTextResult),
     /// Video now flows this way (`Relayed` or `Direct`), or a direct
     /// attempt failed (`DirectFailed`: the session stays on the relay).
     Path(Path),
@@ -214,6 +218,16 @@ impl ViewerHandle {
     /// Have the agent forget the lent password now.
     pub fn forget_credential(&self) {
         self.shared.send_sealed(&Control::CredentialForget);
+    }
+
+    /// Have the agent type `text` where the remote keyboard focus is: a
+    /// username, password or one-time code from the technician's password
+    /// manager (see [`protocol::vault`]). `item` names the vault item, for
+    /// the audit log. The answer is a [`ViewerEvent::TypeText`]; an agent
+    /// too old to know the record sends none.
+    pub fn type_text(&self, kind: TextKind, item: String, text: Secret) {
+        self.shared
+            .send_sealed(&Control::TypeText { kind, item, text });
     }
 
     /// Put `data` on the remote clipboard.
@@ -675,6 +689,11 @@ async fn run(running: Running, early: Vec<Message>) {
                     }
                     Control::CredentialStatus(event) => {
                         if events.send(ViewerEvent::Credential(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Control::TypeTextStatus(result) => {
+                        if events.send(ViewerEvent::TypeText(result)).await.is_err() {
                             return;
                         }
                     }

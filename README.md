@@ -62,12 +62,13 @@ See [Installing the Server](https://github.com/handclasp-raven/TetanusRMM/wiki/I
 -  **Scripts:** Add scripts, choose target devices or a group and hit run. Easy.
 -  **Quick Commands:** In your remove viewer, you can add your own quick command buttons to save you having to hit Win+R.
 -  **Lent Password:** User off to lunch? From the viewer, ask them to type a password before they go. It stays on their PC, encrypted in memory, the agent types it for you (lock screen and UAC prompts too), and it is forgotten when the last session ends.
+-  **Bitwarden in the Viewer:** Search your vault from the viewer and have a username, password or TOTP code typed on the remote PC (lock screen and UAC prompts too). Uses the official `bw` CLI; unlock once in the TUI for every viewer. Your master password is never kept, what is typed is end-to-end encrypted, and the audit log records which item was used (`vault.typed`), never the value.
 -  **Audit Logging** The server keeps an audit of who did what and where
 
 
 ## 🤔 Still To Come
 - [ ] **Handle Login Screens and UAC:** currently you can interact with elevated windows, however the user still needs to handle the login screen and UAC prompts.
-- [ ] **Password Manager Integration:** Integrate a password manager into the Remote Session Viewer to save you having to copy/paste everything
+- [x] **Password Manager Integration:** Bitwarden, in the Remote Session Viewer, to save you having to copy/paste everything
 - [ ] **Cred Cache:** Prompt users for a credential so you can log into things without them, all without them actually giving you the credential!
 - [ ] **Better Monitoring:** Sysmon and a sane config by default + log shipping.
 - [ ] **Tunnelling and Remote Apps:** Create temporary tunnels and access devices within the customer's network like admin pages, printers, etc from your local browser.
