@@ -57,7 +57,7 @@ file, certificate or viewer has to be set up by hand: see
 (Python 3.11 or newer):
 
 ```sh
-uv tool install tetanus_rmm-0.1.7-py3-none-any.whl     # or: pipx install tetanus_rmm-…whl
+uv tool install tetanus_rmm-0.1.8-py3-none-any.whl     # or: pipx install tetanus_rmm-…whl
 tetanus-rmm
 ```
 
