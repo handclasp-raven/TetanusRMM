@@ -2,10 +2,13 @@
 //! short-lived viewer-session token, shows the agent's screen, and sends
 //! mouse and keyboard input and clipboard changes to it.
 //!
-//! Around the picture: a toolbar (display mode, monitor, refresh,
-//! Ctrl+Alt+Del, the password the remote user lends for the session, the
-//! technician's Bitwarden vault, full screen, the side panel, disconnect) and a side panel with the agent's
-//! status, command buttons and file transfer (see `viewer::ui`). The panel
+//! Around the picture: a toolbar (display mode, frame rate, monitor, text
+//! size, and the side panel's toggle) and a side panel with the session's
+//! buttons (disconnect, full screen, refresh, Ctrl+Alt+Del), the
+//! technician's Bitwarden vault, the password the remote user lends for
+//! the session, the agent's status, command buttons and file transfer (see
+//! `viewer::ui`). The display mode and text size picked are remembered for
+//! the next viewer (`--remember`). The panel
 //! uses the server's HTTPS API as the signed-in technician; the TUI passes
 //! the API address and its session token (`RMM_API_TOKEN`, never on the
 //! command line) when it starts the viewer.
@@ -16,14 +19,17 @@
 //! controls' text smaller or larger, F5 asks for a fresh keyframe, Del
 //! presses Ctrl+Alt+Del on the remote machine (for its logon and lock
 //! screens; the technician's own Ctrl+Alt+Del never reaches the viewer),
-//! B opens the vault, Q quits. While a menu or dialog is open, keys go to it (Esc closes it;
+//! B puts the keyboard in the vault's search field, Q quits. While a menu or dialog is open, keys go to it (Esc closes it;
 //! in the monitor menu 1-9 pick).
 //!
-//! The vault dialog searches the technician's Bitwarden vault through the
-//! `bw` client (see `viewer::vault`) and has the agent type a username,
-//! password or one-time code where the remote keyboard focus is. In it,
-//! Enter searches, the arrow keys pick an item, and Ctrl+U, Ctrl+P and
-//! Ctrl+T type its username, password and code. The master password is
+//! The panel's vault section searches the technician's Bitwarden vault
+//! through the `bw` client (see `viewer::vault`) and has the agent type a
+//! username, password or one-time code where the remote keyboard focus is.
+//! Keys go to its search field once it is clicked (or with the B
+//! shortcut): Enter searches, the arrow keys pick an item, Ctrl+U, Ctrl+P
+//! and Ctrl+T type its username, password and code, and Esc or a click on
+//! the picture gives the keyboard back to the remote machine. Locked, the
+//! section has an unlock button instead. The master password is
 //! asked for when the vault is locked and never kept; the TUI can unlock
 //! once for every viewer it starts (the session key comes in
 //! `RMM_BW_SESSION`, never on the command line). What is typed is sealed
@@ -136,8 +142,9 @@ struct Cli {
     /// How the picture fills its area: scale (fit, keeping its shape),
     /// stretch, fill (keeping its shape, cropping the edges), or original
     /// (one remote pixel per screen pixel, panned at the edges).
-    #[arg(long, default_value = "scale")]
-    display: DisplayMode,
+    /// Without it: the mode picked last (see --remember), else scale.
+    #[arg(long)]
+    display: Option<DisplayMode>,
     /// Frames a second to ask for: auto (the agent picks by network
     /// speed), max, or a number such as 60. Also in the toolbar's FPS menu.
     #[arg(long, env = "RMM_VIEWER_FPS", default_value = "auto")]
@@ -155,11 +162,12 @@ struct Cli {
     #[arg(long, env = "RMM_VIEWER_FONT_SIZE", default_value_t = ui::DEFAULT_FONT_PX,
           value_parser = clap::value_parser!(u32).range(i64::from(ui::MIN_FONT_PX)..=i64::from(ui::MAX_FONT_PX)))]
     font_size: u32,
-    /// Save the text size here whenever it is changed in the viewer, as
-    /// `{"font_size": N}`, so whoever starts the next viewer (the TUI) can
-    /// start it at that size.
-    #[arg(long, value_name = "FILE")]
-    remember_font_size: Option<PathBuf>,
+    /// Save the text size and display mode here whenever they are changed
+    /// in the viewer, as `{"font_size": N, "display": "fill"}`. The next
+    /// viewer starts in that display mode, and whoever starts it (the TUI)
+    /// can start it at that text size.
+    #[arg(long, alias = "remember-font-size", value_name = "FILE")]
+    remember: Option<PathBuf>,
     /// Headless: decode frames, write the last one to this PPM file, exit.
     #[arg(long)]
     snapshot: Option<PathBuf>,
@@ -219,11 +227,14 @@ fn main() -> anyhow::Result<()> {
     let panel = PanelSetup {
         api,
         commands,
-        display: cli.display,
+        display: cli
+            .display
+            .or_else(|| cli.remember.as_deref().and_then(ui::load_display))
+            .unwrap_or_default(),
         frame_rate: cli.fps,
         show_panel: !cli.no_panel,
         font_px: cli.font_size,
-        font_file: cli.remember_font_size,
+        settings_file: cli.remember,
         bw: Bw::new(cli.bw),
         bw_session,
     };
@@ -324,7 +335,7 @@ struct PanelSetup {
     frame_rate: FrameRate,
     show_panel: bool,
     font_px: u32,
-    font_file: Option<PathBuf>,
+    settings_file: Option<PathBuf>,
     bw: Bw,
     bw_session: Option<SessionKey>,
 }
@@ -507,6 +518,12 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>, setup: PanelSetup) -> 
     let has_api = api.is_some();
     let frame_rate = setup.frame_rate;
     let (vault_tx, vault_rx) = std::sync::mpsc::channel();
+    // A key from the TUI: see at once whether it still opens the vault.
+    let mut vault = ui::Vault::default();
+    if setup.bw_session.is_some() {
+        vault.busy = Some("Checking Bitwarden...".into());
+        let _ = vault_tx.send(VaultJob::Open);
+    }
     std::thread::spawn({
         let proxy = proxy.clone();
         let (bw, session) = (setup.bw, setup.bw_session);
@@ -522,7 +539,7 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>, setup: PanelSetup) -> 
         size: (0, 0),
         metrics: Metrics::new(setup.font_px, 1.0),
         font_px: setup.font_px,
-        font_file: setup.font_file,
+        settings_file: setup.settings_file,
         scale_factor: 1.0,
         handle: None,
         agent_id: None,
@@ -558,9 +575,9 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>, setup: PanelSetup) -> 
         busy: None,
         jobs: has_api.then_some(jobs_tx),
         last_remote_dir: None,
-        vault: ui::Vault::default(),
+        vault,
         vault_items: Vec::new(),
-        vault_ready: false,
+        vault_asked: false,
         vault_jobs: vault_tx,
         typing: None,
     };
@@ -855,8 +872,9 @@ struct App {
     /// Text size as chosen, and the window's scale factor: together they
     /// make `metrics`.
     font_px: u32,
-    /// Where to remember a text size picked here (`--remember-font-size`).
-    font_file: Option<PathBuf>,
+    /// Where to remember the text size and display mode picked here
+    /// (`--remember`).
+    settings_file: Option<PathBuf>,
     scale_factor: f64,
     display: DisplayMode,
     /// Original size: the picture pixel at the area's top-left corner
@@ -891,12 +909,15 @@ struct App {
     last_remote_dir: Option<String>,
 
     // The vault (see `viewer::vault`).
-    /// The dialog, kept while it is closed so it reopens as it was.
+    /// The panel's vault section: whether it is unlocked (the worker holds
+    /// a session key that opened the vault), the search and its results.
     vault: ui::Vault,
-    /// What the last search found, row for row with the dialog's list.
+    /// What the last search found, row for row with the panel's list.
     vault_items: Vec<vault::Item>,
-    /// Whether the worker holds a session key that opened the vault.
-    vault_ready: bool,
+    /// The technician pressed Unlock: ask for the master password if the
+    /// vault turns out to be locked (a key from the TUI that no longer
+    /// works just leaves it locked).
+    vault_asked: bool,
     vault_jobs: std::sync::mpsc::Sender<VaultJob>,
     /// Text sent to the agent to type: what it was, and when to give up
     /// waiting to hear what came of it.
@@ -936,7 +957,6 @@ impl App {
                 streamed_fps: self.streamed_fps,
                 monitors: &self.monitors,
                 active_monitor: self.active,
-                fullscreen: self.fullscreen,
                 panel: self.show_panel,
                 font_px: self.font_px,
                 info,
@@ -947,6 +967,7 @@ impl App {
                 error: self.details_error.as_deref(),
                 commands: &self.commands,
                 busy: self.busy.as_deref(),
+                fullscreen: self.fullscreen,
             },
             scroll: self.scroll,
             overlay: self.overlay.as_ref(),
@@ -1117,23 +1138,29 @@ impl App {
     /// What the vault worker said.
     fn vault_event(&mut self, event: VaultEvent) {
         self.vault.busy = None;
-        let showing = matches!(self.overlay, Some(Overlay::Vault));
+        let asked = std::mem::take(&mut self.vault_asked);
+        // The panel shows the vault's notes; hidden, a notice does.
+        let hidden = self.layout().panel.is_none();
         match event {
             VaultEvent::NeedPassword { wrong } => {
-                self.vault_ready = false;
-                self.vault.set_rows(Vec::new());
+                let was_unlocked = self.vault.unlocked;
+                self.vault.lock();
                 self.vault_items.clear();
-                if showing {
+                if asked {
+                    self.vault_asked = true;
                     self.ask_master_password(wrong);
-                } else {
-                    self.notify("The vault is locked: open Vault to unlock it.", true);
+                } else if was_unlocked {
+                    self.vault.note = Some(("The vault was locked.".into(), true));
+                    self.notify("The vault is locked: unlock it in the panel.", true);
                 }
             }
             VaultEvent::Unlocked => {
-                self.vault_ready = true;
+                self.vault.unlocked = true;
                 self.vault.note = None;
-                if !self.vault.query.is_empty() && self.vault.rows.is_empty() {
-                    self.vault_job(VaultJob::Search(self.vault.query.clone()), "Searching...");
+                if asked {
+                    // Just unlocked by hand: ready to search.
+                    self.release_all();
+                    self.vault.focused = true;
                 }
             }
             VaultEvent::Results { query, items } => {
@@ -1164,20 +1191,59 @@ impl App {
             }
             VaultEvent::Synced => self.vault.note = Some(("Synced.".into(), false)),
             VaultEvent::Locked => {
-                self.vault_ready = false;
-                self.vault.clear();
+                self.vault.lock();
                 self.vault_items.clear();
-                if showing {
-                    self.overlay = None;
-                }
                 self.notify("Vault locked.", false);
             }
             VaultEvent::Failed(error) => {
-                if !showing {
+                if hidden {
                     self.notify(error.clone(), true);
                 }
                 self.vault.note = Some((error, true));
             }
+        }
+    }
+
+    /// A key while the vault's search field has the keyboard. Nothing
+    /// reaches the remote.
+    fn vault_key(&mut self, event_loop: &ActiveEventLoop, logical: &Key, text: Option<&str>) {
+        let control = self.modifiers.control_key();
+        match logical.as_ref() {
+            Key::Named(NamedKey::Escape) => self.vault.focused = false,
+            Key::Named(NamedKey::Enter) => self.act(event_loop, Action::VaultSearch),
+            Key::Named(NamedKey::ArrowDown) => self.vault.move_by(1),
+            Key::Named(NamedKey::ArrowUp) => self.vault.move_by(-1),
+            Key::Named(NamedKey::PageDown) => self.vault.move_by(ui::VAULT_ROWS as isize),
+            Key::Named(NamedKey::PageUp) => self.vault.move_by(-(ui::VAULT_ROWS as isize)),
+            Key::Named(NamedKey::Backspace) => {
+                self.vault.query.pop();
+            }
+            Key::Character(c) if control => {
+                let kind = match c.to_ascii_lowercase().as_str() {
+                    "u" => TextKind::Username,
+                    "p" => TextKind::Password,
+                    "t" => TextKind::Totp,
+                    "v" => {
+                        let pasted = arboard::Clipboard::new().and_then(|mut c| c.get_text());
+                        if let Ok(pasted) = pasted {
+                            self.vault
+                                .query
+                                .extend(pasted.chars().filter(|c| !c.is_control()));
+                        }
+                        return;
+                    }
+                    _ => return,
+                };
+                self.act(event_loop, Action::VaultType(kind));
+            }
+            _ if !control => {
+                if let Some(text) = text {
+                    self.vault
+                        .query
+                        .extend(text.chars().filter(|c| !c.is_control()));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1261,45 +1327,6 @@ impl App {
             (Overlay::Prompt(_), Key::Named(NamedKey::Enter)) => {
                 self.act(event_loop, Action::PromptOk)
             }
-            (Overlay::Vault, Key::Named(NamedKey::Enter)) => {
-                self.act(event_loop, Action::VaultSearch)
-            }
-            (Overlay::Vault, Key::Named(NamedKey::ArrowDown)) => self.vault.move_by(1),
-            (Overlay::Vault, Key::Named(NamedKey::ArrowUp)) => self.vault.move_by(-1),
-            (Overlay::Vault, Key::Named(NamedKey::PageDown)) => {
-                self.vault.move_by(ui::VAULT_ROWS as isize)
-            }
-            (Overlay::Vault, Key::Named(NamedKey::PageUp)) => {
-                self.vault.move_by(-(ui::VAULT_ROWS as isize))
-            }
-            (Overlay::Vault, Key::Named(NamedKey::Backspace)) => {
-                self.vault.query.pop();
-            }
-            (Overlay::Vault, Key::Character(c)) if self.modifiers.control_key() => {
-                let kind = match c.to_ascii_lowercase().as_str() {
-                    "u" => TextKind::Username,
-                    "p" => TextKind::Password,
-                    "t" => TextKind::Totp,
-                    "v" => {
-                        let pasted = arboard::Clipboard::new().and_then(|mut c| c.get_text());
-                        if let Ok(pasted) = pasted {
-                            self.vault
-                                .query
-                                .extend(pasted.chars().filter(|c| !c.is_control()));
-                        }
-                        return;
-                    }
-                    _ => return,
-                };
-                self.act(event_loop, Action::VaultType(kind));
-            }
-            (Overlay::Vault, _) if !self.modifiers.control_key() => {
-                if let Some(text) = text {
-                    self.vault
-                        .query
-                        .extend(text.chars().filter(|c| !c.is_control()));
-                }
-            }
             (Overlay::Confirm(_), Key::Named(NamedKey::Enter)) => {
                 self.act(event_loop, Action::ConfirmOk)
             }
@@ -1347,7 +1374,7 @@ impl App {
         match code {
             KeyCode::KeyM | KeyCode::Tab => self.act(event_loop, Action::MonitorMenu),
             KeyCode::KeyP => self.act(event_loop, Action::TogglePanel),
-            KeyCode::KeyB => self.act(event_loop, Action::Vault),
+            KeyCode::KeyB => self.act(event_loop, Action::VaultFocus),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.act(
                 event_loop,
                 Action::SetTextSize(self.font_px.saturating_sub(1)),
@@ -1410,8 +1437,7 @@ impl App {
             Action::DisplayMenu
             | Action::FrameRateMenu
             | Action::MonitorMenu
-            | Action::TextMenu
-            | Action::PasswordMenu => {
+            | Action::TextMenu => {
                 let already = matches!(&self.overlay, Some(Overlay::Menu(m)) if m.anchor == self.anchor(&action));
                 if already {
                     self.overlay = None;
@@ -1424,7 +1450,6 @@ impl App {
                         ui::frame_rate_menu(anchor, self.frame_rate, self.streamed_fps)
                     }
                     Action::TextMenu => ui::text_menu(anchor, self.font_px),
-                    Action::PasswordMenu => ui::password_menu(anchor),
                     _ => ui::monitor_menu(anchor, &self.monitors, self.active),
                 };
                 self.open(Overlay::Menu(menu));
@@ -1432,11 +1457,12 @@ impl App {
             Action::SetTextSize(px) => {
                 self.set_font(px);
                 self.overlay = None;
-                self.remember_font();
+                self.remember("font_size", self.font_px.into());
             }
             Action::SetDisplay(mode) => {
                 self.display = mode;
                 self.overlay = None;
+                self.remember("display", mode.label().to_lowercase().into());
                 self.last_move = None;
             }
             Action::SetFrameRate(frame_rate) => {
@@ -1478,14 +1504,20 @@ impl App {
                     }
                 }
             }
-            Action::Vault => {
-                if matches!(self.overlay, Some(Overlay::Vault)) {
-                    self.overlay = None;
+            Action::VaultUnlock => {
+                if !self.vault.unlocked && self.vault.busy.is_none() {
+                    self.vault_asked = true;
+                    self.vault_job(VaultJob::Open, "Checking Bitwarden...");
+                }
+            }
+            Action::VaultFocus => {
+                // The B shortcut works with the panel hidden: show it.
+                self.show_panel = true;
+                if self.vault.unlocked {
+                    self.release_all();
+                    self.vault.focused = true;
                 } else {
-                    self.open(Overlay::Vault);
-                    if !self.vault_ready && self.vault.busy.is_none() {
-                        self.vault_job(VaultJob::Open, "Checking Bitwarden...");
-                    }
+                    self.act(event_loop, Action::VaultUnlock);
                 }
             }
             Action::VaultSearch => {
@@ -1512,13 +1544,12 @@ impl App {
                     username: item.username.clone(),
                 };
                 let _ = self.vault_jobs.send(job);
-                // Out of the way: the next field on the remote machine can
-                // be clicked. It reopens as it is.
-                self.overlay = None;
+                // The keyboard goes back to the remote machine, for the
+                // next field there.
+                self.vault.focused = false;
             }
             Action::VaultSync => self.vault_job(VaultJob::Sync, "Syncing..."),
             Action::VaultLock => self.vault_job(VaultJob::Lock, "Locking..."),
-            Action::VaultClose => self.overlay = None,
             Action::ToggleFullscreen => {
                 self.fullscreen = !self.fullscreen;
                 if let Some(w) = &self.window {
@@ -1527,6 +1558,7 @@ impl App {
                 }
             }
             Action::TogglePanel => {
+                self.vault.focused = false;
                 self.show_panel = !self.show_panel;
                 self.scroll = 0;
             }
@@ -1556,8 +1588,8 @@ impl App {
                 if prompt.purpose == ui::PromptPurpose::VaultUnlock {
                     // Moved, not copied: the prompt's text is the only one.
                     let password = Zeroizing::new(std::mem::take(&mut prompt.text));
-                    self.overlay = Some(Overlay::Vault);
                     if password.is_empty() {
+                        self.vault_asked = false;
                         self.vault.note = Some(("No master password given.".into(), true));
                     } else {
                         self.vault_job(VaultJob::Unlock(password), "Unlocking...");
@@ -1592,6 +1624,7 @@ impl App {
                 if let Some(Overlay::Prompt(mut prompt)) = self.overlay.take() {
                     if prompt.masked {
                         prompt.text.zeroize();
+                        self.vault_asked = false;
                     }
                 }
             }
@@ -1656,14 +1689,15 @@ impl App {
         self.request_redraw();
     }
 
-    /// Save the chosen text size for the next viewer, if asked to.
-    fn remember_font(&self) {
-        let Some(path) = &self.font_file else {
+    /// Save a choice (`font_size`, `display`) for the next viewer, if
+    /// asked to.
+    fn remember(&self, key: &str, value: serde_json::Value) {
+        let Some(path) = &self.settings_file else {
             return;
         };
-        match ui::save_font_size(path, self.font_px) {
-            Ok(()) => info!(size = self.font_px, path = %path.display(), "text size remembered"),
-            Err(e) => warn!(path = %path.display(), "cannot remember the text size: {e}"),
+        match ui::save_setting(path, key, value.clone()) {
+            Ok(()) => info!(key, %value, path = %path.display(), "choice remembered"),
+            Err(e) => warn!(path = %path.display(), "cannot remember {key}: {e}"),
         }
     }
 
@@ -1786,6 +1820,15 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                if self.vault.focused {
+                    if !down {
+                        self.forward_key(event.physical_key, false);
+                    } else if !self.shortcut(event_loop, event.physical_key) {
+                        self.vault_key(event_loop, &event.logical_key, event.text.as_deref());
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 // Key-ups always go through (if their key-down did), so
                 // nothing sticks on the remote.
                 if !(down && self.shortcut(event_loop, event.physical_key)) {
@@ -1832,6 +1875,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let hit = self.chrome(&info).hit(pos);
                 match hit {
                     Hit::Desktop => {
+                        if std::mem::take(&mut self.vault.focused) {
+                            self.request_redraw();
+                        }
                         self.held_buttons.push(button);
                         self.send(InputEvent::MouseButton { button, down: true });
                     }
@@ -1846,7 +1892,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if matches!(self.overlay, Some(Overlay::Vault)) {
+                let over_rows = self.overlay.is_none()
+                    && self.cursor.is_some_and(|c| {
+                        let info = String::new();
+                        self.chrome(&info).over_vault_rows(c)
+                    });
+                if over_rows {
                     let up = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y > 0.0,
                         MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
@@ -1992,7 +2043,7 @@ fn credential_notice(event: CredentialEvent) -> (&'static str, bool) {
         CredentialEvent::Requested => ("Asking the user for a password...", false),
         CredentialEvent::Stored => (
             "The user typed a password. It stays on their computer until the last \
-             session ends: use Password > Type the password.",
+             session ends: use Type under LENT PASSWORD.",
             false,
         ),
         CredentialEvent::Declined => ("The user did not give a password.", true),

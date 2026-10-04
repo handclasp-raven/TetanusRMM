@@ -1,9 +1,9 @@
 //! The viewer's controls around the remote picture: a toolbar along the
-//! top (display mode, monitor, refresh, full screen, the panel, disconnect)
-//! and a panel on the right (the agent's status, command buttons, file
-//! transfer), plus drop-down menus, a one-line text prompt, a confirmation
-//! box, the vault dialog (search the technician's password manager and
-//! have a username, password or one-time code typed remotely) and notices.
+//! top (display mode, frame rate, monitor, text size, and the panel's
+//! toggle) and a panel on the right (the session's buttons, the
+//! technician's password vault, the lent password, the agent's status,
+//! command buttons, file transfer), plus drop-down menus, a one-line text
+//! prompt, a confirmation box and notices.
 //!
 //! Everything here is layout and drawing. A [`Chrome`] describes what is on
 //! screen; the same geometry serves drawing ([`Chrome::draw`]) and clicks
@@ -54,10 +54,8 @@ pub const TEXT_SIZES: [u32; 8] = [8, 9, 10, 11, 12, 14, 16, 20];
 const NOTICE_CHARS: usize = 60;
 /// Widest the prompt's field gets, in characters.
 const PROMPT_CHARS: u32 = 48;
-/// Widest the vault dialog gets, in characters, and the items it shows at
-/// once.
-const VAULT_CHARS: u32 = 64;
-pub const VAULT_ROWS: usize = 8;
+/// Items of the vault the panel shows at once.
+pub const VAULT_ROWS: usize = 4;
 
 /// Sizes in physical pixels, from the text size and the window's scale
 /// factor. Padding and spacing follow the text size.
@@ -173,16 +171,17 @@ pub enum Action {
     Keyframe,
     /// Ctrl+Alt+Del on the remote machine.
     SecureAttention,
-    PasswordMenu,
     /// Ask the remote user to lend a password (see `protocol::credential`).
     PasswordRequest,
     /// Have the agent type the lent password on the remote machine.
     PasswordType,
     /// Have the agent forget it.
     PasswordForget,
-    /// Open the vault dialog (see [`Vault`]).
-    Vault,
-    /// Search the vault for what is in the dialog's field.
+    /// Ask for the master password, to unlock the vault (see [`Vault`]).
+    VaultUnlock,
+    /// Give the vault's search field the keyboard.
+    VaultFocus,
+    /// Search the vault for what is in its field.
     VaultSearch,
     /// Pick the item at this index of the results.
     VaultSelect(usize),
@@ -191,7 +190,6 @@ pub enum Action {
     /// Fetch the latest vault from the Bitwarden server.
     VaultSync,
     VaultLock,
-    VaultClose,
     ToggleFullscreen,
     TogglePanel,
     Disconnect,
@@ -309,7 +307,7 @@ pub struct Prompt {
     pub masked: bool,
 }
 
-/// An item of the vault as the dialog lists it. No secrets.
+/// An item of the vault as the panel lists it. No secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRow {
     pub name: String,
@@ -331,11 +329,14 @@ impl VaultRow {
     }
 }
 
-/// The vault dialog: a search field, the items found, and what to type.
-/// It outlives the dialog being closed, so opening it again shows the last
-/// search.
+/// The vault section of the panel: locked, an unlock button; unlocked, a
+/// search field, the items found, and what to type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Vault {
+    /// Whether the vault can be searched (a session key opened it).
+    pub unlocked: bool,
+    /// Whether keys go to the search field rather than the remote machine.
+    pub focused: bool,
     pub query: String,
     pub rows: Vec<VaultRow>,
     pub selected: usize,
@@ -375,8 +376,8 @@ impl Vault {
         self.selected = 0;
     }
 
-    /// Forget the results (the vault was locked).
-    pub fn clear(&mut self) {
+    /// The vault was locked: forget the search and its results.
+    pub fn lock(&mut self) {
         *self = Self::default();
     }
 }
@@ -402,8 +403,6 @@ pub enum Overlay {
     Menu(Menu),
     Prompt(Prompt),
     Confirm(Confirm),
-    /// The vault dialog; its state is [`Chrome::vault`].
-    Vault,
 }
 
 /// A message in the corner of the picture, until `until`.
@@ -425,7 +424,6 @@ pub struct Toolbar<'a> {
     pub streamed_fps: Option<u32>,
     pub monitors: &'a [MonitorInfo],
     pub active_monitor: Option<u32>,
-    pub fullscreen: bool,
     pub panel: bool,
     /// Text size, as chosen (before the scale factor).
     pub font_px: u32,
@@ -444,6 +442,7 @@ pub struct Panel<'a> {
     pub commands: &'a [QuickCommand],
     /// A file transfer in progress, described.
     pub busy: Option<&'a str>,
+    pub fullscreen: bool,
 }
 
 /// Something drawn in the panel.
@@ -461,13 +460,42 @@ pub enum Item {
         fraction: f64,
     },
     Button(Button),
+    /// The vault's search field. A click gives it the keyboard.
+    Field {
+        rect: Rect,
+        text: String,
+        focused: bool,
+    },
+    /// An item the vault search found: its name, and its username or
+    /// address beneath. A click picks it.
+    Row {
+        rect: Rect,
+        /// Its place in the results.
+        index: usize,
+        name: String,
+        detail: String,
+        selected: bool,
+    },
 }
 
 impl Item {
+    /// Where it is, if it is a box (text has only a top-left corner).
+    fn rect_mut(&mut self) -> Option<&mut Rect> {
+        match self {
+            Item::Text { .. } => None,
+            Item::Bar { rect, .. } | Item::Field { rect, .. } | Item::Row { rect, .. } => {
+                Some(rect)
+            }
+            Item::Button(b) => Some(&mut b.rect),
+        }
+    }
+
     fn bottom(&self, m: &Metrics) -> u32 {
         match self {
             Item::Text { y, .. } => y + m.glyph_h(),
-            Item::Bar { rect, .. } => rect.bottom(),
+            Item::Bar { rect, .. } | Item::Field { rect, .. } | Item::Row { rect, .. } => {
+                rect.bottom()
+            }
             Item::Button(b) => b.rect.bottom(),
         }
     }
@@ -475,8 +503,18 @@ impl Item {
     fn top(&self) -> u32 {
         match self {
             Item::Text { y, .. } => *y,
-            Item::Bar { rect, .. } => rect.y,
+            Item::Bar { rect, .. } | Item::Field { rect, .. } | Item::Row { rect, .. } => rect.y,
             Item::Button(b) => b.rect.y,
+        }
+    }
+
+    /// What a click on it does, if anything, and where.
+    fn target(&self) -> Option<(Rect, Action)> {
+        match self {
+            Item::Button(b) if b.enabled => Some((b.rect, b.action.clone())),
+            Item::Field { rect, .. } => Some((*rect, Action::VaultFocus)),
+            Item::Row { rect, index, .. } => Some((*rect, Action::VaultSelect(*index))),
+            _ => None,
         }
     }
 }
@@ -503,8 +541,7 @@ pub struct Chrome<'a> {
     /// How far the panel is scrolled, in pixels.
     pub scroll: u32,
     pub overlay: Option<&'a Overlay>,
-    /// The vault dialog's state (shown while the overlay is
-    /// [`Overlay::Vault`]).
+    /// The vault section of the panel.
     pub vault: &'a Vault,
     pub notices: &'a [Notice],
     /// Where the mouse is (for hover highlights).
@@ -634,38 +671,31 @@ pub fn frame_rate_menu(anchor: Rect, current: FrameRate, streamed: Option<u32>) 
     }
 }
 
-/// The Password menu: the password the remote user lends the technicians.
-/// It is kept on their machine, so the viewer cannot tell whether there is
-/// one (another technician may have asked): every choice is always there,
-/// and the agent says what came of it.
-pub fn password_menu(anchor: Rect) -> Menu {
-    Menu {
-        anchor,
-        items: [
-            ("Ask the user for a password", Action::PasswordRequest),
-            ("Type the password", Action::PasswordType),
-            ("Forget the password", Action::PasswordForget),
-        ]
-        .into_iter()
-        .map(|(label, action)| MenuItem {
-            label: label.into(),
-            action,
-            checked: false,
-        })
-        .collect(),
-    }
+/// Remember `value` under `key` in the JSON object in `path`, keeping its
+/// other keys: `{"font_size": 9, "display": "fill"}`. Whoever starts the
+/// next viewer (the TUI) reads the text size from it, and the viewer the
+/// display mode. Written beside it and renamed, so a reader never sees
+/// half a file.
+pub fn save_setting(
+    path: &std::path::Path,
+    key: &str,
+    value: serde_json::Value,
+) -> std::io::Result<()> {
+    let mut settings = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
+    };
+    settings.insert(key.to_owned(), value);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::Value::Object(settings).to_string() + "\n")?;
+    std::fs::rename(&tmp, path)
 }
 
-/// Remember `px` as the text size in `path`, as `{"font_size": N}` (the
-/// TUI reads it to start the next viewer at that size). Written beside it
-/// and renamed, so a reader never sees half a file.
-pub fn save_font_size(path: &std::path::Path, px: u32) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::json!({ "font_size": px }).to_string() + "\n",
-    )?;
-    std::fs::rename(&tmp, path)
+/// The display mode remembered in `path` (see [`save_setting`]), if any.
+pub fn load_display(path: &std::path::Path) -> Option<DisplayMode> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&text).ok()?;
+    settings.get("display")?.as_str()?.parse().ok()
 }
 
 /// The Text menu: sizes to pick from, the current one marked.
@@ -768,37 +798,19 @@ impl Chrome<'_> {
             true,
             &mut buttons,
         );
-        add_left("Refresh", Action::Keyframe, false, &mut buttons);
-        add_left("Ctrl+Alt+Del", Action::SecureAttention, false, &mut buttons);
-        add_left("Password", Action::PasswordMenu, true, &mut buttons);
-        add_left("Vault", Action::Vault, false, &mut buttons);
-        let fullscreen = if t.fullscreen {
-            "Exit full screen"
-        } else {
-            "Full screen"
-        };
-        add_left(fullscreen, Action::ToggleFullscreen, false, &mut buttons);
-
-        // From the right edge.
-        let mut right = self.layout.toolbar.right().saturating_sub(m.gap);
-        let mut right_buttons = Vec::new();
-        for (label, action, active) in [
-            ("Disconnect", Action::Disconnect, false),
-            ("Panel", Action::TogglePanel, t.panel),
-        ] {
-            let mut b = self.toolbar_button(0, label, action, false);
-            b.rect.x = right.saturating_sub(b.rect.w);
-            b.active = active;
-            right = b.rect.x.saturating_sub(m.gap);
-            right_buttons.push(b);
-        }
+        // The panel's toggle, at the right edge.
+        let mut panel = self.toolbar_button(0, "Panel", Action::TogglePanel, false);
+        let edge = self.layout.toolbar.right().saturating_sub(m.gap);
+        panel.rect.x = edge.saturating_sub(panel.rect.w);
+        panel.active = t.panel;
+        let right = panel.rect.x.saturating_sub(m.gap);
         // A narrow window: leave out buttons from the end of the left group
-        // (full screen, refresh and text size have shortcuts) rather than
-        // overlap the right group. The first two always stay.
+        // (text size has shortcuts, monitors too) rather than overlap the
+        // right group. The first two always stay.
         while buttons.len() > 2 && buttons.last().is_some_and(|b| b.rect.right() > right) {
             buttons.pop();
         }
-        buttons.extend(right_buttons);
+        buttons.push(panel);
         buttons
     }
 
@@ -848,6 +860,150 @@ impl Chrome<'_> {
             }));
             *y += m.button_h() + m.gap;
         };
+
+        // Buttons side by side, sharing the panel's width equally.
+        let row = |items: &mut Vec<Item>, y: &mut u32, buttons: &[(&str, Action, bool, bool)]| {
+            let n = buttons.len() as u32;
+            let full = panel.w - 2 * m.gap;
+            let w = full.saturating_sub((n - 1) * m.gap) / n;
+            let room = (w.saturating_sub(2 * m.pad) / m.char_w()) as usize;
+            for (i, (label, action, enabled, active)) in buttons.iter().enumerate() {
+                let rect = Rect::new(
+                    panel.x + m.gap + i as u32 * (w + m.gap),
+                    *y,
+                    w,
+                    m.button_h(),
+                );
+                items.push(Item::Button(Button {
+                    enabled: *enabled,
+                    active: *active,
+                    ..Button::new(rect, truncate(label, room), action.clone())
+                }));
+            }
+            *y += m.button_h() + m.gap;
+        };
+
+        heading(&mut items, &mut y, "SESSION");
+        row(
+            &mut items,
+            &mut y,
+            &[
+                ("Disconnect", Action::Disconnect, true, false),
+                ("Full screen", Action::ToggleFullscreen, true, p.fullscreen),
+            ],
+        );
+        row(
+            &mut items,
+            &mut y,
+            &[
+                ("Refresh", Action::Keyframe, true, false),
+                ("Ctrl+Alt+Del", Action::SecureAttention, true, false),
+            ],
+        );
+
+        heading(&mut items, &mut y, "VAULT");
+        let v = self.vault;
+        let idle = v.busy.is_none();
+        if v.unlocked {
+            items.push(Item::Field {
+                rect: Rect::new(panel.x + m.gap, y, panel.w - 2 * m.gap, m.button_h()),
+                text: v.query.clone(),
+                focused: v.focused,
+            });
+            y += m.button_h() + m.gap;
+            let row_h = 2 * m.line_h() + m.gap;
+            for index in (v.top..v.rows.len()).take(VAULT_ROWS) {
+                let found = &v.rows[index];
+                items.push(Item::Row {
+                    rect: Rect::new(panel.x + m.gap, y, panel.w - 2 * m.gap, row_h),
+                    index,
+                    name: truncate(&found.name, chars),
+                    detail: truncate(&found.detail, chars),
+                    selected: index == v.selected,
+                });
+                y += row_h;
+            }
+            if !v.rows.is_empty() {
+                y += m.gap;
+            }
+            let has = |kind| idle && v.current().is_some_and(|found| found.has(kind));
+            row(
+                &mut items,
+                &mut y,
+                &[
+                    (
+                        "Username",
+                        Action::VaultType(TextKind::Username),
+                        has(TextKind::Username),
+                        false,
+                    ),
+                    (
+                        "Password",
+                        Action::VaultType(TextKind::Password),
+                        has(TextKind::Password),
+                        false,
+                    ),
+                    (
+                        "TOTP",
+                        Action::VaultType(TextKind::Totp),
+                        has(TextKind::Totp),
+                        false,
+                    ),
+                ],
+            );
+            row(
+                &mut items,
+                &mut y,
+                &[
+                    ("Sync", Action::VaultSync, idle, false),
+                    ("Lock", Action::VaultLock, idle, false),
+                ],
+            );
+        } else {
+            button(
+                &mut items,
+                &mut y,
+                "Unlock vault",
+                Action::VaultUnlock,
+                idle,
+            );
+        }
+        let more = v.rows.len().saturating_sub(VAULT_ROWS);
+        match (&v.busy, &v.note) {
+            (Some(busy), _) => text(&mut items, &mut y, 0, colors::MUTED, busy),
+            (None, Some((note, true))) => text(&mut items, &mut y, 0, colors::WARN, note),
+            (None, Some((note, false))) => text(&mut items, &mut y, 0, colors::MUTED, note),
+            (None, None) if more > 0 => text(
+                &mut items,
+                &mut y,
+                0,
+                colors::MUTED,
+                &format!("{} found: scroll for more.", v.rows.len()),
+            ),
+            (None, None) if v.unlocked && v.rows.is_empty() => text(
+                &mut items,
+                &mut y,
+                0,
+                colors::MUTED,
+                "Click the field, type a name and press Enter.",
+            ),
+            (None, None) => {}
+        }
+
+        // The password the remote user lends (see `protocol::credential`).
+        // It is kept on their machine, so the viewer cannot tell whether
+        // there is one: every choice is always there, and the agent says
+        // what came of it.
+        heading(&mut items, &mut y, "LENT PASSWORD");
+        row(
+            &mut items,
+            &mut y,
+            &[
+                ("Ask user", Action::PasswordRequest, true, false),
+                ("Type", Action::PasswordType, true, false),
+                ("Forget", Action::PasswordForget, true, false),
+            ],
+        );
 
         heading(&mut items, &mut y, "STATUS");
         match (p.api, p.details) {
@@ -998,10 +1154,10 @@ impl Chrome<'_> {
 
         let height = y - top + m.gap;
         for item in &mut items {
-            match item {
-                Item::Text { y, .. } => *y = y.wrapping_sub(self.scroll),
-                Item::Bar { rect, .. } => rect.y = rect.y.wrapping_sub(self.scroll),
-                Item::Button(b) => b.rect.y = b.rect.y.wrapping_sub(self.scroll),
+            if let Item::Text { y, .. } = item {
+                *y = y.wrapping_sub(self.scroll);
+            } else if let Some(rect) = item.rect_mut() {
+                rect.y = rect.y.wrapping_sub(self.scroll);
             }
         }
         (items, height)
@@ -1081,90 +1237,9 @@ impl Chrome<'_> {
         }
     }
 
-    /// The vault dialog: its box, the search field, the list and the row
-    /// of each item shown (with its index in the results), where the status
-    /// line goes, and the buttons.
-    fn vault_geometry(&self) -> VaultGeometry {
-        let m = *self.m();
-        let v = self.vault;
-        let area = self.layout.desktop;
-        let chars = VAULT_CHARS
-            .min(area.w.saturating_sub(2 * (m.gap + m.pad)) / m.char_w())
-            .max(8);
-        let w = chars * m.char_w() + 2 * m.pad;
-        let list_h = VAULT_ROWS as u32 * m.button_h();
-        let h = 2 * m.pad + 2 * m.line_h() + 2 * m.button_h() + list_h + 4 * m.gap;
-        let x = area.x + area.w.saturating_sub(w) / 2;
-        let y = area.y + area.h.saturating_sub(h) / 4;
-        let (inner_x, inner_w) = (x + m.pad, w - 2 * m.pad);
-        let title_y = y + m.pad;
-        let field = Rect::new(inner_x, title_y + m.line_h() + m.gap, inner_w, m.button_h());
-        let list = Rect::new(inner_x, field.bottom() + m.gap, inner_w, list_h);
-        let rows = (v.top..v.rows.len())
-            .take(VAULT_ROWS)
-            .enumerate()
-            .map(|(i, index)| {
-                let row = Rect::new(
-                    list.x,
-                    list.y + i as u32 * m.button_h(),
-                    list.w,
-                    m.button_h(),
-                );
-                (index, row)
-            })
-            .collect();
-        let status_y = list.bottom() + m.gap;
-        let buttons_y = status_y + m.line_h() + m.gap;
-        let idle = v.busy.is_none();
-        let mut buttons = Vec::new();
-        // What to type, from the left...
-        let mut left = inner_x;
-        for (label, kind) in [
-            ("Username", TextKind::Username),
-            ("Password", TextKind::Password),
-            ("TOTP code", TextKind::Totp),
-        ] {
-            let bw = render::text_width(label, m.font) + 2 * m.pad;
-            buttons.push(Button {
-                enabled: idle && v.current().is_some_and(|row| row.has(kind)),
-                ..Button::new(
-                    Rect::new(left, buttons_y, bw, m.button_h()),
-                    label,
-                    Action::VaultType(kind),
-                )
-            });
-            left += bw + m.gap;
-        }
-        // ...and the rest from the right.
-        let mut right = inner_x + inner_w;
-        for (label, action, enabled) in [
-            ("Close", Action::VaultClose, true),
-            ("Lock", Action::VaultLock, idle),
-            ("Sync", Action::VaultSync, idle),
-        ] {
-            let bw = render::text_width(label, m.font) + 2 * m.pad;
-            let rect = Rect::new(right.saturating_sub(bw), buttons_y, bw, m.button_h());
-            right = rect.x.saturating_sub(m.gap);
-            buttons.push(Button {
-                enabled,
-                ..Button::new(rect, label, action)
-            });
-        }
-        VaultGeometry {
-            rect: Rect::new(x, y, w, h),
-            chars,
-            title_y,
-            field,
-            list,
-            rows,
-            status_y,
-            buttons,
-        }
-    }
-
     fn overlay_geometry(&self, overlay: &Overlay) -> Option<DialogGeometry> {
         match overlay {
-            Overlay::Menu(_) | Overlay::Vault => None,
+            Overlay::Menu(_) => None,
             Overlay::Prompt(p) => Some(self.dialog(
                 &p.title,
                 [("OK", Action::PromptOk), ("Cancel", Action::PromptCancel)],
@@ -1195,19 +1270,6 @@ impl Chrome<'_> {
                         None => Hit::Dismiss,
                     }
                 }
-                Overlay::Vault => {
-                    let g = self.vault_geometry();
-                    let row = g
-                        .rows
-                        .iter()
-                        .find(|(_, r)| r.contains(pos))
-                        .map(|(index, _)| Action::VaultSelect(*index));
-                    g.buttons
-                        .iter()
-                        .find_map(enabled)
-                        .or(row)
-                        .map_or(Hit::Nothing, Hit::Action)
-                }
                 _ => {
                     let geometry = self.overlay_geometry(overlay).expect("a dialog");
                     geometry
@@ -1230,11 +1292,9 @@ impl Chrome<'_> {
             return items
                 .iter()
                 .filter(|i| self.visible(i))
-                .find_map(|i| match i {
-                    Item::Button(b) => enabled(b),
-                    _ => None,
-                })
-                .map_or(Hit::Nothing, Hit::Action);
+                .filter_map(Item::target)
+                .find(|(rect, _)| rect.contains(pos))
+                .map_or(Hit::Nothing, |(_, action)| Hit::Action(action));
         }
         if self.layout.desktop.contains(pos) {
             return Hit::Desktop;
@@ -1249,16 +1309,6 @@ impl Chrome<'_> {
             let (_, rows) = self.menu_rects(menu);
             return rows.into_iter().find(|r| r.contains(pos));
         }
-        if let Some(Overlay::Vault) = self.overlay {
-            let g = self.vault_geometry();
-            return g
-                .buttons
-                .iter()
-                .filter(|b| b.enabled)
-                .map(|b| b.rect)
-                .chain(g.rows.iter().map(|(_, r)| *r))
-                .find(|r| r.contains(pos));
-        }
         if let Some(overlay) = self.overlay {
             let geometry = self.overlay_geometry(overlay)?;
             return geometry
@@ -1270,13 +1320,25 @@ impl Chrome<'_> {
         let (items, _) = self.panel_items();
         self.toolbar_buttons()
             .into_iter()
-            .chain(items.into_iter().filter_map(|i| match i {
-                Item::Button(b) if self.visible(&Item::Button(b.clone())) => Some(b),
-                _ => None,
-            }))
             .filter(|b| b.enabled)
             .map(|b| b.rect)
+            .chain(
+                items
+                    .iter()
+                    .filter(|i| self.visible(i))
+                    .filter_map(|i| i.target().map(|(rect, _)| rect)),
+            )
             .find(|r| r.contains(pos))
+    }
+
+    /// Whether `pos` is over the vault's list of items (the wheel scrolls
+    /// it rather than the panel).
+    pub fn over_vault_rows(&self, pos: (f64, f64)) -> bool {
+        let (items, _) = self.panel_items();
+        items
+            .iter()
+            .filter(|i| self.visible(i))
+            .any(|i| matches!(i, Item::Row { rect, .. } if rect.contains(pos)))
     }
 
     // --- drawing ------------------------------------------------------------
@@ -1313,11 +1375,17 @@ impl Chrome<'_> {
         }
     }
 
-    /// A text field holding `text`, with the caret after it.
-    fn draw_field(&self, canvas: &mut Canvas, field: Rect, text: &str) {
+    /// A text field holding `text`; with the keyboard (`focused`), outlined
+    /// and with the caret after the text.
+    fn draw_field(&self, canvas: &mut Canvas, field: Rect, text: &str, focused: bool) {
         let m = self.m();
         render::fill_rect(canvas, field, colors::FIELD);
-        render::outline(canvas, field, m.border(), colors::ACTIVE);
+        let edge = if focused {
+            colors::ACTIVE
+        } else {
+            colors::BORDER
+        };
+        render::outline(canvas, field, m.border(), edge);
         // Show the end of a long entry: that is where typing goes.
         let room = (field.w.saturating_sub(2 * m.pad) / m.char_w()).saturating_sub(1) as usize;
         let count = text.chars().count();
@@ -1325,73 +1393,13 @@ impl Chrome<'_> {
         let tx = field.x + m.pad;
         let ty = m.text_y(field);
         render::draw_text(canvas, (tx, ty), m.font, colors::TEXT, &shown);
-        let caret_x = tx + render::text_width(&shown, m.font);
-        render::fill_rect(
-            canvas,
-            Rect::new(caret_x, ty, m.border(), m.glyph_h()),
-            colors::TEXT,
-        );
-    }
-
-    fn draw_vault(&self, canvas: &mut Canvas) {
-        let m = *self.m();
-        let v = self.vault;
-        let g = self.vault_geometry();
-        render::fill_rect(canvas, g.rect, colors::TOOLBAR);
-        render::outline(canvas, g.rect, m.border(), colors::ACTIVE);
-        let chars = g.chars as usize;
-        render::draw_text(
-            canvas,
-            (g.field.x, g.title_y),
-            m.font,
-            colors::HEADING,
-            &truncate("Bitwarden: search, pick, then choose what to type", chars),
-        );
-        self.draw_field(canvas, g.field, &v.query);
-
-        render::fill_rect(canvas, g.list, colors::FIELD);
-        // The name takes a little over half the row; the detail the rest.
-        let name_chars = chars * 5 / 9;
-        let detail_chars = chars.saturating_sub(name_chars + 2);
-        for (index, row) in &g.rows {
-            let item = &v.rows[*index];
-            if *index == v.selected {
-                render::fill_rect(canvas, *row, colors::ACTIVE);
-            } else if self.cursor.is_some_and(|c| row.contains(c)) {
-                render::fill_rect(canvas, *row, colors::HOVER);
-            }
-            let y = m.text_y(*row);
-            let name = truncate(&item.name, name_chars);
-            render::draw_text(canvas, (row.x + m.pad, y), m.font, colors::TEXT, &name);
-            let detail_x = row.x + m.pad + (name_chars as u32 + 1) * m.char_w();
-            let detail = truncate(&item.detail, detail_chars);
-            render::draw_text(canvas, (detail_x, y), m.font, colors::MUTED, &detail);
-        }
-        render::outline(canvas, g.list, m.border(), colors::BORDER);
-
-        let more = v.rows.len().saturating_sub(VAULT_ROWS);
-        let (status, color) = match (&v.busy, &v.note) {
-            (Some(busy), _) => (busy.clone(), colors::MUTED),
-            (None, Some((note, true))) => (note.clone(), colors::WARN),
-            (None, Some((note, false))) => (note.clone(), colors::MUTED),
-            (None, None) if more > 0 => (
-                format!("{} items: the arrow keys show the rest.", v.rows.len()),
-                colors::MUTED,
-            ),
-            (None, None) => (
-                "Enter searches. Ctrl+U, Ctrl+P, Ctrl+T type.".into(),
-                colors::MUTED,
-            ),
-        };
-        render::draw_text(
-            canvas,
-            (g.field.x, g.status_y),
-            m.font,
-            color,
-            &truncate(&status, chars),
-        );
-        for b in &g.buttons {
-            self.draw_button(canvas, b);
+        if focused {
+            let caret_x = tx + render::text_width(&shown, m.font);
+            render::fill_rect(
+                canvas,
+                Rect::new(caret_x, ty, m.border(), m.glyph_h()),
+                colors::TEXT,
+            );
         }
     }
 
@@ -1501,6 +1509,29 @@ impl Chrome<'_> {
                         render::fill_rect(canvas, Rect { w: fill, ..*rect }, color);
                     }
                     Item::Button(b) => self.draw_button(canvas, b),
+                    Item::Field {
+                        rect,
+                        text,
+                        focused,
+                    } => self.draw_field(canvas, *rect, text, *focused),
+                    Item::Row {
+                        rect,
+                        name,
+                        detail,
+                        selected,
+                        ..
+                    } => {
+                        if *selected {
+                            render::fill_rect(canvas, *rect, colors::ACTIVE);
+                        } else if self.cursor.is_some_and(|c| rect.contains(c)) {
+                            render::fill_rect(canvas, *rect, colors::HOVER);
+                        }
+                        let tx = rect.x + m.pad;
+                        let ty = rect.y + m.gap;
+                        render::draw_text(canvas, (tx, ty), m.font, colors::TEXT, name);
+                        let ty = ty + m.line_h();
+                        render::draw_text(canvas, (tx, ty), m.font, colors::MUTED, detail);
+                    }
                 }
             }
             // A scroll bar when it does not all fit.
@@ -1556,32 +1587,18 @@ impl Chrome<'_> {
                 if let (Some(field), Overlay::Prompt(prompt)) = (g.field, overlay) {
                     if prompt.masked {
                         let stars = "*".repeat(prompt.text.chars().count());
-                        self.draw_field(canvas, field, &stars);
+                        self.draw_field(canvas, field, &stars, true);
                     } else {
-                        self.draw_field(canvas, field, &prompt.text);
+                        self.draw_field(canvas, field, &prompt.text, true);
                     }
                 }
                 for b in &g.buttons {
                     self.draw_button(canvas, b);
                 }
             }
-            Some(Overlay::Vault) => self.draw_vault(canvas),
             None => {}
         }
     }
-}
-
-struct VaultGeometry {
-    rect: Rect,
-    /// Characters across the inside of the box.
-    chars: u32,
-    title_y: u32,
-    field: Rect,
-    list: Rect,
-    /// Each item shown: its index in the results, and its row.
-    rows: Vec<(usize, Rect)>,
-    status_y: u32,
-    buttons: Vec<Button>,
 }
 
 struct DialogGeometry {
@@ -1662,7 +1679,6 @@ mod tests {
                     streamed_fps: Some(60),
                     monitors: &self.monitors,
                     active_monitor: Some(1),
-                    fullscreen: false,
                     panel: true,
                     font_px: 16,
                     info: "30 fps",
@@ -1673,6 +1689,7 @@ mod tests {
                     error: None,
                     commands: &self.commands,
                     busy: None,
+                    fullscreen: false,
                 },
                 scroll: 0,
                 overlay: self.overlay.as_ref(),
@@ -1693,6 +1710,8 @@ mod tests {
             .filter_map(|i| match i {
                 Item::Text { text, .. } => Some(text.trim().to_owned()),
                 Item::Button(b) => Some(format!("[{}]", b.label)),
+                Item::Field { text, .. } => Some(format!("<{text}>")),
+                Item::Row { name, detail, .. } => Some(format!("{name} | {detail}")),
                 Item::Bar { .. } => None,
             })
             .collect()
@@ -1740,16 +1759,33 @@ mod tests {
     }
 
     #[test]
-    fn the_chosen_text_size_is_saved_for_the_tui() {
+    fn the_text_size_and_display_mode_are_remembered_together() {
         let dir = std::env::temp_dir().join(format!("rmm-font-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("viewer.json");
-        save_font_size(&path, 9).unwrap();
-        save_font_size(&path, 11).unwrap();
+        assert_eq!(load_display(&path), None);
+        save_setting(&path, "font_size", 9.into()).unwrap();
+        assert_eq!(load_display(&path), None);
+        save_setting(&path, "display", "fill".into()).unwrap();
+        save_setting(&path, "font_size", 11.into()).unwrap();
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved, serde_json::json!({ "font_size": 11 }));
+        assert_eq!(
+            saved,
+            serde_json::json!({ "font_size": 11, "display": "fill" })
+        );
+        assert_eq!(load_display(&path), Some(DisplayMode::Fill));
         assert!(!path.with_extension("tmp").exists());
+        // Every mode survives the round trip, as the viewer saves it.
+        for mode in DisplayMode::ALL {
+            save_setting(&path, "display", mode.label().to_lowercase().into()).unwrap();
+            assert_eq!(load_display(&path), Some(mode));
+        }
+        // Nonsense in the file is no mode, and is replaced by the next save.
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(load_display(&path), None);
+        save_setting(&path, "display", "scale".into()).unwrap();
+        assert_eq!(load_display(&path), Some(DisplayMode::Scale));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1777,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_offers_display_monitor_and_session_controls() {
+    fn the_toolbar_holds_the_four_menus_and_the_panel_toggle() {
         let f = Fixture::new();
         let chrome = f.chrome(2000, 900);
         let buttons = chrome.toolbar_buttons();
@@ -1789,55 +1825,22 @@ mod tests {
                 "FPS: Auto (60)",
                 "Monitor 2 of 2",
                 "Text: 16",
-                "Refresh",
-                "Ctrl+Alt+Del",
-                "Password",
-                "Vault",
-                "Full screen",
-                "Disconnect",
                 "Panel"
             ]
         );
-        assert!(buttons[..4].iter().all(|b| b.dropdown) && buttons[10].active);
-        assert!(buttons[6].dropdown);
-        // Disconnect sits at the right edge.
-        assert_eq!(buttons[9].rect.right(), 2000 - M.gap);
-        assert_eq!(
-            chrome.hit(centre(buttons[7].rect)),
-            Hit::Action(Action::Vault)
-        );
-        assert_eq!(
-            chrome.hit(centre(buttons[0].rect)),
-            Hit::Action(Action::DisplayMenu)
-        );
-        assert_eq!(
-            chrome.hit(centre(buttons[1].rect)),
-            Hit::Action(Action::FrameRateMenu)
-        );
-        assert_eq!(
-            chrome.hit(centre(buttons[5].rect)),
-            Hit::Action(Action::SecureAttention)
-        );
-        assert_eq!(
-            chrome.hit(centre(buttons[6].rect)),
-            Hit::Action(Action::PasswordMenu)
-        );
-        assert_eq!(
-            password_menu(buttons[6].rect)
-                .items
-                .into_iter()
-                .map(|i| i.action)
-                .collect::<Vec<_>>(),
-            [
-                Action::PasswordRequest,
-                Action::PasswordType,
-                Action::PasswordForget
-            ]
-        );
-        assert_eq!(
-            chrome.hit(centre(buttons[9].rect)),
-            Hit::Action(Action::Disconnect)
-        );
+        assert!(buttons[..4].iter().all(|b| b.dropdown) && buttons[4].active);
+        // The toggle sits at the right edge.
+        assert_eq!(buttons[4].rect.right(), 2000 - M.gap);
+        let actions = [
+            Action::DisplayMenu,
+            Action::FrameRateMenu,
+            Action::MonitorMenu,
+            Action::TextMenu,
+            Action::TogglePanel,
+        ];
+        for (button, action) in buttons.iter().zip(actions) {
+            assert_eq!(chrome.hit(centre(button.rect)), Hit::Action(action));
+        }
         assert_eq!(chrome.hit((800.0, 500.0)), Hit::Desktop);
     }
 
@@ -1855,12 +1858,12 @@ mod tests {
         let narrow = labels(700);
         assert!(narrow.len() < wide.len(), "{narrow:?}");
         assert_eq!(narrow[..2], wide[..2], "display and FPS stay");
-        assert!(narrow.ends_with(&["Disconnect".to_owned(), "Panel".to_owned()]));
+        assert!(narrow.ends_with(&["Panel".to_owned()]));
         for width in [300, 500, 700, 900, 1200] {
             let buttons = f.chrome(width, 600).toolbar_buttons();
             let (left, right): (Vec<_>, Vec<_>) = buttons
                 .iter()
-                .partition(|b| !matches!(b.action, Action::Disconnect | Action::TogglePanel));
+                .partition(|b| b.action != Action::TogglePanel);
             let left_end = left.iter().map(|b| b.rect.right()).max().unwrap();
             let right_start = right.iter().map(|b| b.rect.x).min().unwrap();
             assert!(
@@ -1876,7 +1879,18 @@ mod tests {
         let chrome = f.chrome(1600, 2000);
         let (items, _) = chrome.panel_items();
         let texts = texts(&items);
-        let expected: [&str; 25] = [
+        let expected: [&str; 36] = [
+            "SESSION",
+            "[Disconnect]",
+            "[Full screen]",
+            "[Refresh]",
+            "[Ctrl+Alt+Del]",
+            "VAULT",
+            "[Unlock vault]",
+            "LENT PASSWORD",
+            "[Ask user]",
+            "[Type]",
+            "[Forget]",
             "STATUS",
             "Hostname",
             "WS-01",
@@ -1944,14 +1958,13 @@ mod tests {
         assert_eq!(chrome.hit(centre(upload.rect)), Hit::Nothing);
         assert!(texts(&items).contains(&"No file access here.".to_owned()));
 
-        // Offline: nothing to launch.
+        // Offline: nothing to launch or transfer.
         f.details.online = false;
         f.details.capabilities.push("file_transfer".into());
         let chrome = f.chrome(1600, 2000);
         let (items, _) = chrome.panel_items();
-        assert!(items
-            .iter()
-            .all(|i| !matches!(i, Item::Button(b) if b.enabled)));
+        assert!(items.iter().all(|i| !matches!(i, Item::Button(b)
+            if b.enabled && matches!(b.action, Action::Launch(_) | Action::Upload | Action::Download))));
 
         // Busy: no second transfer.
         let f = Fixture::new();
@@ -1973,9 +1986,27 @@ mod tests {
         let (items, _) = chrome.panel_items();
         let texts = texts(&items).join(" ");
         assert!(texts.contains("Start the viewer from the TUI"), "{texts}");
-        assert!(items
+        // The session's own buttons need no API; the rest do.
+        let enabled: Vec<&str> = items
             .iter()
-            .all(|i| !matches!(i, Item::Button(b) if b.enabled)));
+            .filter_map(|i| match i {
+                Item::Button(b) if b.enabled => Some(b.label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            enabled,
+            [
+                "Disconnect",
+                "Full screen",
+                "Refresh",
+                "Ctrl+Alt+Del",
+                "Unlock vault",
+                "Ask user",
+                "Type",
+                "Forget"
+            ]
+        );
     }
 
     #[test]
@@ -2128,64 +2159,150 @@ mod tests {
             .collect()
     }
 
+    /// The panel's items from the VAULT heading up to the next one.
+    fn vault_section(chrome: &Chrome) -> Vec<Item> {
+        let (items, _) = chrome.panel_items();
+        let heading = |i: &Item, s: &str| matches!(i, Item::Text { text, .. } if text == s);
+        items
+            .into_iter()
+            .skip_while(|i| !heading(i, "VAULT"))
+            .skip(1)
+            .take_while(|i| !heading(i, "LENT PASSWORD"))
+            .collect()
+    }
+
+    fn button(items: &[Item], label: &str) -> Button {
+        items
+            .iter()
+            .find_map(|i| match i {
+                Item::Button(b) if b.label == label => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {label} button"))
+    }
+
     #[test]
-    fn the_vault_dialog_lists_items_and_offers_what_each_has() {
+    fn a_locked_vault_offers_only_to_unlock() {
         let mut f = Fixture::new();
-        f.overlay = Some(Overlay::Vault);
-        // Nothing found yet: nothing to type, but it can be closed.
-        let chrome = f.chrome(1600, 900);
-        let g = chrome.vault_geometry();
-        let labels: Vec<&str> = g.buttons.iter().map(|b| b.label.as_str()).collect();
+        let chrome = f.chrome(1600, 2000);
+        let section = vault_section(&chrome);
+        assert_eq!(texts(&section), ["[Unlock vault]"]);
         assert_eq!(
-            labels,
-            ["Username", "Password", "TOTP code", "Close", "Lock", "Sync"]
+            chrome.hit(centre(button(&section, "Unlock vault").rect)),
+            Hit::Action(Action::VaultUnlock)
         );
-        assert!(g.buttons[..3].iter().all(|b| !b.enabled) && g.rows.is_empty());
+        // Why it could not be unlocked shows under the button; while it is
+        // being checked the button waits.
+        f.vault.note = Some(("Wrong master password.".into(), true));
         assert_eq!(
-            chrome.hit(centre(g.buttons[3].rect)),
-            Hit::Action(Action::VaultClose)
+            texts(&vault_section(&f.chrome(1600, 2000))),
+            ["[Unlock vault]", "Wrong master password."]
         );
-        // Nothing behind it reacts.
-        assert_eq!(chrome.hit((5.0, 5.0)), Hit::Nothing);
+        f.vault.busy = Some("Unlocking...".into());
+        let section = vault_section(&f.chrome(1600, 2000));
+        assert!(!button(&section, "Unlock vault").enabled);
+        assert_eq!(texts(&section), ["[Unlock vault]", "Unlocking..."]);
+    }
+
+    #[test]
+    fn an_unlocked_vault_searches_lists_and_offers_what_each_item_has() {
+        let mut f = Fixture::new();
+        f.vault.unlocked = true;
+        f.vault.query = "contoso".into();
+        let chrome = f.chrome(1600, 2000);
+        let section = vault_section(&chrome);
+        assert_eq!(
+            texts(&section),
+            [
+                "<contoso>",
+                "[Username]",
+                "[Password]",
+                "[TOTP]",
+                "[Sync]",
+                "[Lock]",
+                "Click the field, type a",
+                "name and press Enter."
+            ]
+        );
+        // Nothing found yet: nothing to type. The field takes the keyboard.
+        assert!(["Username", "Password", "TOTP"]
+            .iter()
+            .all(|l| !button(&section, l).enabled));
+        let field = section
+            .iter()
+            .find_map(|i| match i {
+                Item::Field { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(chrome.hit(centre(field)), Hit::Action(Action::VaultFocus));
 
         f.vault.set_rows(vault_rows(20));
         f.vault.select(1);
-        let chrome = f.chrome(1600, 900);
-        let g = chrome.vault_geometry();
-        assert_eq!(g.rows.len(), VAULT_ROWS);
-        assert!(g.rows.iter().all(|(_, r)| g.rect.contains(centre(*r))));
-        assert!(g.buttons.iter().all(|b| g.rect.contains(centre(b.rect))));
+        let chrome = f.chrome(1600, 2000);
+        let section = vault_section(&chrome);
+        let panel = chrome.layout.panel.unwrap();
+        let rows: Vec<(usize, Rect, bool)> = section
+            .iter()
+            .filter_map(|i| match i {
+                Item::Row {
+                    rect,
+                    index,
+                    selected,
+                    ..
+                } => Some((*index, *rect, *selected)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), VAULT_ROWS);
+        assert!(rows.iter().all(|(_, r, _)| panel.contains(centre(*r))));
+        assert!(rows.iter().all(|(i, _, selected)| *selected == (*i == 1)));
         assert_eq!(
-            chrome.hit(centre(g.rows[2].1)),
+            chrome.hit(centre(rows[2].1)),
             Hit::Action(Action::VaultSelect(2))
         );
-        // Item 1 has a username but no password or code.
-        let enabled: Vec<bool> = g.buttons[..3].iter().map(|b| b.enabled).collect();
-        assert_eq!(enabled, [true, false, false]);
+        assert!(chrome.over_vault_rows(centre(rows[0].1)));
+        assert!(!chrome.over_vault_rows(centre(field)));
+        assert!(texts(&section).contains(&"20 found: scroll for more.".to_owned()));
+        // Item 1 has a username but no password or code; the three sit
+        // side by side inside the panel.
+        let kinds = ["Username", "Password", "TOTP"].map(|l| button(&section, l));
+        assert_eq!(kinds.clone().map(|b| b.enabled), [true, false, false]);
+        assert!(kinds.iter().all(|b| b.rect.y == kinds[0].rect.y));
+        assert!(kinds.iter().all(|b| b.rect.right() <= panel.right()));
         assert_eq!(
-            chrome.hit(centre(g.buttons[0].rect)),
+            chrome.hit(centre(kinds[0].rect)),
             Hit::Action(Action::VaultType(TextKind::Username))
         );
-        assert_eq!(chrome.hit(centre(g.buttons[1].rect)), Hit::Nothing);
+        assert_eq!(chrome.hit(centre(kinds[1].rect)), Hit::Nothing);
 
-        // Busy: only Close works.
+        // The list follows the selection.
+        f.vault.select(10);
+        let section = vault_section(&f.chrome(1600, 2000));
+        assert!(section.iter().any(|i| matches!(
+            i,
+            Item::Row {
+                index: 10,
+                selected: true,
+                ..
+            }
+        )));
+
+        // Busy: nothing can be typed, synced or locked meanwhile.
         f.vault.select(2);
         f.vault.busy = Some("Searching...".into());
-        let chrome = f.chrome(1600, 900);
-        let g = chrome.vault_geometry();
-        let enabled: Vec<&str> = g
-            .buttons
+        f.vault.focused = true;
+        let chrome = f.chrome(1600, 2000);
+        let section = vault_section(&chrome);
+        assert!(section
             .iter()
-            .filter(|b| b.enabled)
-            .map(|b| b.label.as_str())
-            .collect();
-        assert_eq!(enabled, ["Close"]);
+            .all(|i| !matches!(i, Item::Button(b) if b.enabled)));
 
-        let mut pixels = vec![0; 1600 * 900];
+        let mut pixels = vec![0; 1600 * 2000];
         let mut canvas = Canvas {
             pixels: &mut pixels,
             width: 1600,
-            height: 900,
+            height: 2000,
         };
         chrome.draw(&mut canvas);
         assert!(pixels.contains(&colors::ACTIVE) && pixels.contains(&colors::FIELD));
@@ -2240,21 +2357,9 @@ mod tests {
     #[test]
     fn tiny_windows_draw_without_panicking() {
         let mut f = Fixture::new();
+        f.vault.unlocked = true;
         f.vault.set_rows(vault_rows(3));
-        for overlay in [None, Some(Overlay::Vault)] {
-            f.overlay = overlay;
-            for (w, h) in [(1, 1), (40, 30), (300, 60)] {
-                let mut pixels = vec![0; (w * h) as usize];
-                let mut canvas = Canvas {
-                    pixels: &mut pixels,
-                    width: w,
-                    height: h,
-                };
-                f.chrome(w, h).draw(&mut canvas);
-            }
-        }
-        let f = Fixture::new();
-        for (w, h) in [(1, 1), (40, 30), (300, 60)] {
+        for (w, h) in [(1, 1), (40, 30), (300, 60), (900, 200)] {
             let mut pixels = vec![0; (w * h) as usize];
             let mut canvas = Canvas {
                 pixels: &mut pixels,

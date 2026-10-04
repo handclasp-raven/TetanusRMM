@@ -15,7 +15,9 @@ in the environment for the same reason) and the command buttons
 The text size picked in a viewer (its Text menu) is remembered: the viewer
 writes it to ``viewer.json`` in the TUI's data directory
 (``--remember-font-size``), and the next viewer starts at that size.
-Until one is picked, ``viewer_font_size`` from the config applies.
+Until one is picked, ``viewer_font_size`` from the config applies. The
+viewer keeps the display mode picked (its Display menu) in the same file
+and starts in it by itself.
 
 The viewer's Vault button uses Bitwarden's ``bw`` client (see
 ``bitwarden``). Once the vault is unlocked in the TUI, each viewer gets the

@@ -431,7 +431,14 @@ session token in `RMM_API_TOKEN` (the environment again), and one
 the server applies your access and audits what it does. It also gets
 `--remember-font-size <data dir>/viewer.json`: a text size you pick in a
 viewer is saved there, and the next viewer starts at it (see
-`viewer_font_size`).
+`viewer_font_size`). The display mode you pick (Scale, Stretch, Fill,
+Original size) is saved there too, and viewers start in the one used last.
+
+The viewer's toolbar holds the Display, FPS, Monitor and Text menus and the
+**Panel** toggle. Everything else is in the side panel: Disconnect, Full
+screen, Refresh and Ctrl+Alt+Del, [the vault](#bitwarden), the password the
+remote user lends, the agent's status, your command buttons and file
+transfer.
 
 **Quick assist** (`h`): for a computer with no agent installed.
 1. Tell the user the page address shown (**Copy** puts it on the clipboard).
@@ -460,7 +467,7 @@ panel has no buttons.
 
 ### Bitwarden
 
-The viewer's **Vault** button (`Ctrl+Alt+Shift+B`) searches your Bitwarden
+The **VAULT** section of the viewer's side panel searches your Bitwarden
 vault and has the agent type a username, password or one-time code where
 the remote keyboard focus is: at the lock screen and UAC prompts too.
 
@@ -472,14 +479,17 @@ bw login          # self-hosted: `bw config server https://...` first
 ```
 
 Then press `b` in the TUI and type your master password. Every viewer
-started from then on opens the vault without asking. A viewer started
-before that (or after the vault was locked) asks for the master password
-itself, for that window only.
+started from then on has the vault unlocked. A viewer started before that
+(or after the vault was locked) shows an **Unlock vault** button instead,
+which asks for the master password for that window only.
 
-In the vault dialog: type part of an item's name and press Enter, pick an
-item with the arrow keys or the mouse, then **Username**, **Password** or
-**TOTP code** (`Ctrl+U`, `Ctrl+P`, `Ctrl+T`). The dialog closes so you can
-click the next field on the remote machine; it reopens where it was.
+Unlocked, the section has a search field with the items found under it.
+Click the field (or press `Ctrl+Alt+Shift+B`) so that keys go to it rather
+than to the remote machine, type part of an item's name and press Enter.
+Pick an item with the arrow keys, the wheel or the mouse, then **Username**,
+**Password** or **TOTP** (`Ctrl+U`, `Ctrl+P`, `Ctrl+T`). Once a value is
+typed the keyboard goes back to the remote machine, as it does with Esc or
+a click on the picture; the search and its results stay where they are.
 
 What is kept, and where:
 

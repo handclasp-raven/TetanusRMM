@@ -14,7 +14,8 @@
 //! - [`render`]: placing the picture (scale, stretch or fill) and drawing
 //!   primitives with a bitmap font.
 //! - [`ui`]: the toolbar and side panel around the picture: display mode,
-//!   monitors, the agent's status, command buttons and file transfer.
+//!   monitors, the session's buttons, the vault, the agent's status,
+//!   command buttons and file transfer.
 //! - [`api`]: the server's HTTPS API behind the side panel.
 //! - [`keymap`]: physical keys to the scancodes the agent injects.
 //! - [`clipboard`]: two-way clipboard sync with the remote machine.
