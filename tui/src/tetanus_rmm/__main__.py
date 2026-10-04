@@ -102,10 +102,14 @@ def main(argv: list[str] | None = None) -> None:
         trust=trust,
     )
     try:
-        app.run()
+        result = app.run()
     finally:
         # The app closes them on unmount; this covers a crash before that.
         app.close_viewers()
+    from . import selfupdate
+
+    if isinstance(result, selfupdate.PendingUpdate):
+        selfupdate.finish(result)
 
 
 if __name__ == "__main__":

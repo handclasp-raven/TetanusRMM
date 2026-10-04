@@ -18,6 +18,8 @@ directly. What it does:
 - **Bitwarden:** unlock your vault once (`b`) and every viewer started
   afterwards can search it and type usernames, passwords and one-time codes
   on the remote machine. See [Bitwarden](#bitwarden).
+- **Updates itself:** when the server publishes a newer TUI, you are offered
+  it after signing in (or with `U`). See [Updating](#updating).
 - **Shell console:** interactive PowerShell on the agent, in a pane. Needs
   **no viewer**.
 - **Script runner:** runs a command or script on one or more agents, or on
@@ -145,6 +147,7 @@ poll_interval = 5                             # seconds between agent refreshes
 scripts_path = "~/rmm-scripts.json"           # optional; default is in the data dir
 viewer_font_size = 9                          # optional; the viewer's text size
 bw_path = "/usr/local/bin/bw"                 # optional: Bitwarden's CLI
+check_updates = true                          # optional: look for a newer TUI at sign-in
 ```
 
 | Setting | Flag | Default | |
@@ -157,6 +160,7 @@ bw_path = "/usr/local/bin/bw"                 # optional: Bitwarden's CLI
 | `scripts_path` | | data dir `/scripts.json` | The saved-script library. |
 | `viewer_font_size` | | *(viewer default, 10)* | Text size of the viewer's toolbar and side panel, in pixels (6–32), until you pick one in a viewer (**Text** menu, or `Ctrl+Alt+Shift+-`/`=`). From then on viewers start at the size you last picked, remembered in `viewer.json` in the data directory; delete that file to go back to this setting. |
 
+| `check_updates` | | `true` | Whether to look for a newer TUI on the server after signing in. `U` looks either way. See [Updating](#updating). |
 | `bw_path` | | `bw` on `PATH` | Bitwarden's command line client, for [the vault](#bitwarden). On Windows, name the `.exe` (or npm's `bw.cmd`) by its full path. |
 
 Relative paths in the file are relative to the file. Unknown keys are an
@@ -226,6 +230,7 @@ server-side session then expires on its own.
 | `e` | Theme editor: make, change and delete themes of your own |
 | `v` | Viewer buttons: the remote viewer's command buttons |
 | `b` | Bitwarden: unlock the vault for the viewers, or lock it again |
+| `U` | Check for updates: is there a newer TUI on the server? |
 | `F5` | Refresh now (the table also refreshes every `poll_interval`) |
 | `l` | Sign out |
 | `q` | Quit |
@@ -507,6 +512,25 @@ What is kept, and where:
   agent, which kind, and the vault item's name. Never the value. An agent
   types nothing the server cannot audit, and an agent that predates this
   does not type vault text at all (the viewer says so): update it.
+
+### Updating
+
+The server publishes one TUI build (the one its install page offers).
+After you sign in, the TUI asks the server which, and if it is newer than
+the one running it offers to update: **Update and restart** downloads the
+wheel from the server, checks it against the SHA-256 the server gives,
+closes the TUI (and the viewers it opened), installs it the way the TUI was
+installed (`uv tool`, `pipx`, or `pip` in its environment) and starts the
+TUI again. **Later** leaves things as they are until the next sign-in.
+
+`U` checks at any time; `check_updates = false` in the config turns the
+check at sign-in off. An older TUI can lack what the server and viewer
+have since learned, so it is worth taking.
+
+Where the TUI cannot install over itself it downloads the wheel and prints
+the command to run: on Windows (a running program cannot be replaced), and
+when it runs from a source checkout (update that with git). The same
+happens if the install fails; the version you have keeps working.
 
 ## Tests
 

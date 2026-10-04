@@ -50,6 +50,7 @@
 //! | GET    | /api/ca                     | none (the CA certificate is public) |
 //! | GET    | /api/viewer/{platform}/manifest | none |
 //! | GET    | /api/viewer/{platform}/binary   | none |
+//! | GET    | /api/tui/manifest           | none: the published TUI wheel (`install`) |
 //! | POST   | /api/assist-sessions        | session (admin, support_engineer): a quick assist code |
 //! | GET    | /api/assist-sessions/{id}   | session (whoever made it; admin) |
 //! | GET    | /assist                     | none: the quick assist page (`assist`) |

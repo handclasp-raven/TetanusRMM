@@ -116,6 +116,9 @@ class Config:
     #: Bitwarden's command line client, for the viewer's Vault button: a
     #: path, or a name looked up on PATH. ``None``: ``bw`` on PATH.
     bw_path: str | None = None
+    #: Whether to look for a newer TUI on the server after signing in (it
+    #: can always be looked for by hand).
+    check_updates: bool = True
 
     def __post_init__(self) -> None:
         check_server_url(self.server_url)

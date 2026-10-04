@@ -369,10 +369,28 @@ async fn the_install_page_offers_the_published_tui_and_viewer() {
         .unwrap()
         .contains("has not been published"));
 
+    // No wheel, no manifest: a TUI asking takes that as "no update".
+    assert_eq!(get("/api/tui/manifest").await.unwrap().status(), 404);
+
     let name = "tetanus_rmm-0.1.0-py3-none-any.whl";
     let wheel = f.dir.path().join(name);
     std::fs::write(&wheel, b"wheel bytes").unwrap();
     updates::publish_tui(&f.updates_dir(), &wheel).unwrap();
+    let manifest: serde_json::Value = get("/api/tui/manifest")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest,
+        serde_json::json!({
+            "file": name,
+            "version": "0.1.0",
+            "sha256": updates::sha256_hex(b"wheel bytes"),
+            "size": 11,
+        })
+    );
     let build = f.dir.path().join("viewer-build");
     std::fs::write(&build, b"viewer v0.3.0").unwrap();
     updates::publish_viewer(&f.updates_dir(), &build, "windows-x86_64", "0.3.0").unwrap();

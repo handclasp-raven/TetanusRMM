@@ -532,6 +532,25 @@ class ViewerBuild:
 
 
 @dataclass(frozen=True)
+class TuiBuild:
+    """The TUI wheel the server publishes."""
+
+    file: str
+    version: str
+    sha256: str
+    size: int
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> TuiBuild:
+        return cls(
+            file=d["file"],
+            version=d["version"],
+            sha256=d["sha256"],
+            size=int(d["size"]),
+        )
+
+
+@dataclass(frozen=True)
 class AuditEntry:
     id: int
     ts: datetime
@@ -889,6 +908,20 @@ class ApiClient:
             return ViewerBuild.from_json(response.json())
         except (ValueError, KeyError, TypeError) as e:
             raise ApiError(0, "the server sent a malformed viewer manifest") from e
+
+    async def tui_build(self) -> TuiBuild | None:
+        """The TUI wheel the server publishes; ``None`` if there is none (or
+        the server is too old to say)."""
+        try:
+            response = await self._request("GET", "/api/tui/manifest", auth=False)
+        except ApiError as e:
+            if e.status == 404:
+                return None
+            raise
+        try:
+            return TuiBuild.from_json(response.json())
+        except (ValueError, KeyError, TypeError) as e:
+            raise ApiError(0, "the server sent a malformed TUI manifest") from e
 
     async def create_viewer_session(self, agent_id: str) -> ViewerSession:
         response = await self._request(

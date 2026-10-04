@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -50,6 +52,8 @@ from .viewer import ViewerError
 
 if TYPE_CHECKING:
     from .app import RmmApp
+
+log = logging.getLogger(__name__)
 
 
 class SplashScreen(Screen):
@@ -359,6 +363,7 @@ class MainScreen(Screen):
         Binding("e", "themes", "Edit themes", show=False),
         Binding("v", "viewer_commands", "Viewer buttons", show=False),
         Binding("b", "bitwarden", "Bitwarden: unlock / lock", show=False),
+        Binding("U", "check_updates", "Check for updates", show=False),
         Binding("f5", "refresh", "Refresh", show=False),
         Binding("l", "logout", "Sign out", show=False),
         Binding("q", "app.quit", "Quit"),
@@ -378,7 +383,7 @@ class MainScreen(Screen):
         ],
         "View": ["search", "filter", "columns", "stats", "app.change_theme", "themes", "refresh"],
         "Manage": ["groups", "users", "audit", "viewer_commands"],
-        "Session": ["bitwarden", "logout", "app.quit"],
+        "Session": ["bitwarden", "check_updates", "logout", "app.quit"],
     }
 
     #: Actions on the selected agent, and the capability each needs there.
@@ -447,6 +452,37 @@ class MainScreen(Screen):
         self.refresh_agents()
         self.load_groups()
         self.set_interval(self.app.config.poll_interval, self.refresh_agents)
+        if self.app.config.check_updates:
+            self.check_for_update(announce=False)
+
+    def action_check_updates(self) -> None:
+        self.check_for_update(announce=True)
+
+    @work(exclusive=True, group="update")
+    async def check_for_update(self, announce: bool) -> None:
+        """Offer the TUI the server publishes if it is newer than this one.
+        ``announce``: also say when there is nothing to do, or why not."""
+        from . import __version__, selfupdate
+
+        app = self.app
+        try:
+            build = await app.session.api.tui_build()
+        except ApiError as e:
+            log.warning("could not check for a newer TUI: %s", e.message)
+            if announce:
+                app.notify(f"Could not check for updates: {e.message}", severity="error")
+            return
+        if build is None or not selfupdate.is_newer(build.version):
+            if announce:
+                app.notify(f"You are up to date ({__version__}).")
+            return
+
+        def chosen(wheel: Path | None) -> None:
+            if wheel is not None:
+                app.exit(selfupdate.PendingUpdate(build.version, wheel))
+
+        directory = app.log_dir / selfupdate.UPDATES_DIR
+        app.push_screen(selfupdate.UpdateScreen(app.session.api, build, directory), chosen)
 
     def _whoami(self) -> str:
         user = self.app.session.user

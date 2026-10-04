@@ -5,13 +5,14 @@
 //!
 //! The TUI is the wheel published with `server publish-tui`; the viewer is
 //! fetched by the TUI itself, and is linked here only for installing by
-//! hand.
+//! hand. A TUI already installed asks `GET /api/tui/manifest` which wheel
+//! is published, to offer to update itself from the same download.
 
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{Html, Redirect, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 
 use super::{serve_update_file, ApiError, AppState};
 use crate::updates;
@@ -26,6 +27,22 @@ pub fn routes() -> Router<AppState> {
         .route("/install", get(page))
         .route("/install/viewer/{platform}", get(viewer))
         .route("/install/{file}", get(wheel))
+        .route("/api/tui/manifest", get(tui_manifest))
+}
+
+/// Which TUI wheel is published: its version, and its hash to check the
+/// download against.
+async fn tui_manifest(
+    State(state): State<AppState>,
+) -> Result<Json<updates::TuiManifest>, ApiError> {
+    let dir = state.updates_dir.clone();
+    // Reads and hashes the wheel: off the async threads.
+    tokio::task::spawn_blocking(move || updates::tui_manifest(&dir))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map_err(internal)?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
 }
 
 fn internal(e: updates::UpdateError) -> ApiError {

@@ -26,7 +26,9 @@
 //! appends each server's settings to it (see `protocol::assist`).
 //!
 //! The support TUI's wheel is published as `<updates_dir>/tui/<wheel>`
-//! (`publish_tui`), under its own file name, for the install page.
+//! (`publish_tui`), under its own file name, for the install page. A TUI
+//! that is running asks which wheel that is (`tui_manifest`) to offer to
+//! update itself.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -338,6 +340,39 @@ pub fn publish_tui(updates_dir: &Path, file: &Path) -> Result<String, UpdateErro
     Ok(name)
 }
 
+/// The published TUI wheel, as a running TUI is told of it: enough to see
+/// whether it is newer, and to check the download (`/install/<file>`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TuiManifest {
+    pub file: String,
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// The version in a wheel's file name (`tetanus_rmm-0.1.6-py3-none-any.whl`).
+pub fn wheel_version(name: &str) -> Option<&str> {
+    name.split('-').nth(1).filter(|v| !v.is_empty())
+}
+
+/// What the published TUI wheel is, if there is one.
+pub fn tui_manifest(updates_dir: &Path) -> Result<Option<TuiManifest>, UpdateError> {
+    let Some(file) = tui_wheel(updates_dir)? else {
+        return Ok(None);
+    };
+    let Some(version) = wheel_version(&file).map(str::to_owned) else {
+        return Ok(None);
+    };
+    let path = updates_dir.join(TUI_DIR).join(&file);
+    let bytes = fs::read(&path).map_err(io_err(&path))?;
+    Ok(Some(TuiManifest {
+        version,
+        sha256: sha256_hex(&bytes),
+        size: bytes.len() as u64,
+        file,
+    }))
+}
+
 /// The published TUI wheel's file name, if any.
 pub fn tui_wheel(updates_dir: &Path) -> Result<Option<String>, UpdateError> {
     Ok(tui_wheels(&updates_dir.join(TUI_DIR))?.into_iter().max())
@@ -523,6 +558,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let updates = dir.path().join("updates");
         assert_eq!(tui_wheel(&updates).unwrap(), None);
+        assert_eq!(tui_manifest(&updates).unwrap(), None);
         for (name, bytes) in [
             ("rmm_tui-0.1.0-py3-none-any.whl", b"one"),
             ("tetanus_rmm-0.2.0-py3-none-any.whl", b"two"),
@@ -533,6 +569,15 @@ mod tests {
             assert_eq!(tui_wheel(&updates).unwrap().as_deref(), Some(name));
             assert_eq!(fs::read(updates.join(TUI_DIR).join(name)).unwrap(), bytes);
         }
+        assert_eq!(
+            tui_manifest(&updates).unwrap(),
+            Some(TuiManifest {
+                file: "tetanus_rmm-0.2.0-py3-none-any.whl".into(),
+                version: "0.2.0".into(),
+                sha256: sha256_hex(b"two"),
+                size: 3,
+            })
+        );
         assert_eq!(fs::read_dir(updates.join(TUI_DIR)).unwrap().count(), 1);
 
         let other = dir.path().join("something-else.whl");
