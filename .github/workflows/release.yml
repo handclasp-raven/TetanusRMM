@@ -4,7 +4,9 @@
 #   - the Windows agent (unsigned: each server signs it with its own key),
 #     the viewers, the quick assist client, the TUI wheel,
 #     docker-compose.yml and the install
-#     scripts, as assets of a GitHub release, with their SHA256SUMS.
+#     scripts, as assets of a GitHub release, with their SHA256SUMS;
+#   - a software bill of materials for each of those and for the server,
+#     as rmm-sboms.tar.gz in the same release.
 #
 # scripts/install.sh installs and upgrades servers from these.
 name: release
@@ -82,6 +84,18 @@ jobs:
           cp target/clients/tetanus_rmm-*.whl docker-compose.yml scripts/install.sh scripts/lib.sh dist/
           cd dist
           sha256sum -- * > SHA256SUMS
+
+      - uses: anchore/sbom-action/download-syft@v0
+        id: syft
+
+      # After SHA256SUMS: install.sh downloads every file listed there, and
+      # a server has no use for the SBOMs.
+      - name: Software bills of materials
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          scripts/build-sboms.sh "${{ steps.version.outputs.version }}"
+          tar -czf dist/rmm-sboms.tar.gz -C target sbom
 
       - uses: docker/login-action@v3
         with:
