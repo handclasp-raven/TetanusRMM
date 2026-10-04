@@ -6,8 +6,8 @@ a separate process. The token goes in the environment (``RMM_VIEWER_TOKEN``)
 rather than on the command line, so other local users cannot read it from
 the process list.
 
-The viewer's side panel (the agent's status, command buttons, file
-transfer) calls the HTTPS API as the signed-in technician, so it also gets
+The viewer's panels (the agent's status, command buttons, file
+transfer) call the HTTPS API as the signed-in technician, so it also gets
 the API address (``--api-url``), this session's token (``RMM_API_TOKEN``,
 in the environment for the same reason) and the command buttons
 (``--command LABEL=COMMAND``).
@@ -19,11 +19,15 @@ Until one is picked, ``viewer_font_size`` from the config applies. The
 viewer keeps the display mode picked (its Display menu) in the same file
 and starts in it by itself.
 
-The viewer's Vault button uses Bitwarden's ``bw`` client (see
+The viewer's Vault tab uses Bitwarden's ``bw`` client (see
 ``bitwarden``). Once the vault is unlocked in the TUI, each viewer gets the
 session key (``RMM_BW_SESSION``, in the environment like the tokens) and
 need not ask for the master password; ``bw_path`` from the config goes in
 ``RMM_BW``.
+
+The viewer wears the TUI's colours: the theme picked here goes to it as
+JSON in ``RMM_VIEWER_THEME`` (a theme of the terminal's own colours has
+none to give, and the viewer then uses the default theme's).
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from textual.theme import Theme
+
+from . import themes
 from .api import ViewerSession
 from .commands import QuickCommand
 from .config import DEFAULT_QUIC_PORT, VIEWER_FONT_SIZES, Config
@@ -66,6 +73,16 @@ def remembered_font_size(path: Path) -> int | None:
 
 class ViewerError(Exception):
     pass
+
+
+def theme_colors(theme: Theme) -> dict[str, str | bool] | None:
+    """What the viewer needs of ``theme`` to dress like the TUI: its
+    colours as ``#RRGGBB`` and whether it is a dark one. ``None`` for a
+    theme of terminal colours, which have no fixed value."""
+    colors = themes.colors_of(theme)
+    if colors is None:
+        return None
+    return {**colors, "dark": theme.dark}
 
 
 Resolver = Callable[[str, int], str]
@@ -120,13 +137,15 @@ def build_command(
     commands: Iterable[QuickCommand] = (),
     font_file: Path | None = None,
     bw_session: str | None = None,
+    theme: dict[str, str | bool] | None = None,
 ) -> ViewerCommand:
     """The viewer's command line and extra environment for ``session``.
     With ``api_token``, the side panel can use the API as this session.
     With ``font_file``, the viewer starts at the text size remembered there
     (else ``viewer_font_size``) and saves the one picked in it. With
-    ``bw_session``, its Vault button opens the Bitwarden vault without
-    asking for the master password."""
+    ``bw_session``, its Vault tab opens the Bitwarden vault without
+    asking for the master password. With ``theme`` (see
+    :func:`theme_colors`), it is drawn in those colours."""
     if config.ca_path is None:
         raise ViewerError("the viewer needs a CA certificate: set ca_path in the config")
     host, port = split_host_port(config.quic_addr or config.api_host, DEFAULT_QUIC_PORT)
@@ -157,6 +176,8 @@ def build_command(
         env["RMM_BW"] = config.bw_path
     if bw_session:
         env["RMM_BW_SESSION"] = bw_session
+    if theme:
+        env["RMM_VIEWER_THEME"] = json.dumps(theme, separators=(",", ":"))
     if api_token:
         argv += ["--api-url", config.server_url]
         env["RMM_API_TOKEN"] = api_token

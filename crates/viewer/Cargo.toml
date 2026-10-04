@@ -9,9 +9,10 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 arboard.workspace = true
+brand.workspace = true
 clap.workspace = true
 common.workspace = true
-font8x8.workspace = true
+fontdue.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 openh264.workspace = true

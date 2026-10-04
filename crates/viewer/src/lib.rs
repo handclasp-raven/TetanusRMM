@@ -12,11 +12,13 @@
 //! - [`decode`]: H.264 decoding with OpenH264. It is portable, unlike Media
 //!   Foundation, so the viewer builds everywhere.
 //! - [`render`]: placing the picture (scale, stretch or fill) and drawing
-//!   primitives with a bitmap font.
-//! - [`ui`]: the toolbar and side panel around the picture: display mode,
-//!   monitors, the session's buttons, the vault, the agent's status,
-//!   command buttons and file transfer.
-//! - [`api`]: the server's HTTPS API behind the side panel.
+//!   primitives: text in the built-in typeface, rounded boxes, icons.
+//! - [`ui`]: the header, the tab rail with its panels and the footer
+//!   around the picture: display mode, monitors, the session's buttons,
+//!   the vault, the agent's status, command buttons and file transfer.
+//! - [`theme`]: the colours, which follow the TUI's theme.
+//! - [`icons`]: the icons on the buttons and tabs.
+//! - [`api`]: the server's HTTPS API behind the panels.
 //! - [`keymap`]: physical keys to the scancodes the agent injects.
 //! - [`clipboard`]: two-way clipboard sync with the remote machine.
 //! - [`vault`]: the technician's Bitwarden vault, through the `bw` client,
@@ -26,7 +28,9 @@ pub mod api;
 pub mod client;
 pub mod clipboard;
 pub mod decode;
+pub mod icons;
 pub mod keymap;
 pub mod render;
+pub mod theme;
 pub mod ui;
 pub mod vault;

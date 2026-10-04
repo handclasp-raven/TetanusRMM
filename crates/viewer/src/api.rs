@@ -1,4 +1,4 @@
-//! The server's HTTPS API, for the side panel: the agent's status, the
+//! The server's HTTPS API, for the panels: the agent's status, the
 //! command buttons and file transfer.
 //!
 //! The viewer's own connection (see [`crate::client`]) only carries the
@@ -66,7 +66,7 @@ pub struct Disk {
     pub used_bytes: u64,
 }
 
-/// What the side panel shows, from `GET /api/agents/{id}`. Everything the
+/// What the Status tab shows, from `GET /api/agents/{id}`. Everything the
 /// agent reports is optional: an older agent, or one that has not reported
 /// yet, leaves it out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]

@@ -1,6 +1,6 @@
 """Unlocking the technician's Bitwarden vault for the viewers.
 
-A viewer's Vault button searches the vault through Bitwarden's command
+A viewer's Vault tab searches the vault through Bitwarden's command
 line client, ``bw``, and has a username, password or one-time code typed on
 the remote machine. So that the master password is not asked for in every
 viewer, the TUI can unlock once: ``bw unlock`` returns a *session key*,

@@ -2,34 +2,38 @@
 //! short-lived viewer-session token, shows the agent's screen, and sends
 //! mouse and keyboard input and clipboard changes to it.
 //!
-//! Around the picture: a toolbar (display mode, frame rate, monitor, text
-//! size, and the side panel's toggle) and a side panel with the session's
-//! buttons (disconnect, full screen, refresh, Ctrl+Alt+Del), the
-//! technician's Bitwarden vault, the password the remote user lends for
-//! the session, the agent's status, command buttons and file transfer (see
-//! `viewer::ui`). The display mode and text size picked are remembered for
-//! the next viewer (`--remember`). The panel
-//! uses the server's HTTPS API as the signed-in technician; the TUI passes
-//! the API address and its session token (`RMM_API_TOKEN`, never on the
-//! command line) when it starts the viewer.
+//! Around the picture: a header (the machine's name, display mode, frame
+//! rate, monitor, text size, and the session's buttons: refresh, full
+//! screen, Ctrl+Alt+Del, disconnect), a rail of tabs that opens one panel
+//! at a time (the technician's Bitwarden vault and the password the
+//! remote user lends for the session; the agent's status; command buttons
+//! and file transfer), and a footer saying how the session is going (see
+//! `viewer::ui`). A file dropped on the window is uploaded. The colours
+//! are the TUI's theme (`RMM_VIEWER_THEME`, see `viewer::theme`). The
+//! display mode, text size and open tab are remembered for the next
+//! viewer (`--remember`). The panel uses the server's HTTPS API as the
+//! signed-in technician; the TUI passes the API address and its session
+//! token (`RMM_API_TOKEN`, never on the command line) when it starts the
+//! viewer.
 //!
 //! Every key goes to the remote machine except these viewer shortcuts, all
 //! with Ctrl+Alt+Shift held: M opens the monitor menu, 1-9 picks a monitor,
-//! P shows or hides the panel, F toggles full screen, - and + make the
+//! P closes the panel or opens the tab open last, F toggles full screen, - and + make the
 //! controls' text smaller or larger, F5 asks for a fresh keyframe, Del
 //! presses Ctrl+Alt+Del on the remote machine (for its logon and lock
 //! screens; the technician's own Ctrl+Alt+Del never reaches the viewer),
-//! B puts the keyboard in the vault's search field, Q quits. While a menu or dialog is open, keys go to it (Esc closes it;
-//! in the monitor menu 1-9 pick).
+//! B opens the Vault tab with the keyboard in its search field, Q quits.
+//! While a menu or dialog is open, keys go to it (Esc closes it; in the
+//! monitor menu 1-9 pick).
 //!
-//! The panel's vault section searches the technician's Bitwarden vault
+//! The Vault tab searches the technician's Bitwarden vault
 //! through the `bw` client (see `viewer::vault`) and has the agent type a
 //! username, password or one-time code where the remote keyboard focus is.
 //! Keys go to its search field once it is clicked (or with the B
 //! shortcut): Enter searches, the arrow keys pick an item, Ctrl+U, Ctrl+P
 //! and Ctrl+T type its username, password and code, and Esc or a click on
 //! the picture gives the keyboard back to the remote machine. Locked, the
-//! section has an unlock button instead. The master password is
+//! tab has an unlock button instead. The master password is
 //! asked for when the vault is locked and never kept; the TUI can unlock
 //! once for every viewer it starts (the session key comes in
 //! `RMM_BW_SESSION`, never on the command line). What is typed is sealed
@@ -63,8 +67,9 @@ use viewer::api::{remote_file_name, AgentDetails, ApiClient};
 use viewer::client::{self, Pending, ViewerEvent, ViewerHandle, ViewerOptions, Welcome};
 use viewer::decode::{Picture, VideoDecoder};
 use viewer::keymap;
-use viewer::render::{self, DisplayMode, Rect, View};
-use viewer::ui::{self, Action, Chrome, Hit, Metrics, Notice, Overlay, QuickCommand};
+use viewer::render::{self, DisplayMode, Glyphs, Rect, View};
+use viewer::theme::Theme;
+use viewer::ui::{self, Action, Chrome, Hit, Metrics, Notice, Overlay, QuickCommand, Tab};
 use viewer::vault::{self, Bw, SessionKey, VaultError};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -74,7 +79,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 use zeroize::{Zeroize, Zeroizing};
 
-/// How often the side panel's status is refreshed.
+/// How often the agent's status is refreshed.
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 /// How long notices stay up.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
@@ -127,12 +132,12 @@ struct Cli {
     #[arg(long)]
     monitor: Option<u32>,
     /// The server's HTTPS API (e.g. https://rmm.example.com:8443), for the
-    /// side panel. Also needs the session token in RMM_API_TOKEN.
+    /// panels. Also needs the session token in RMM_API_TOKEN.
     #[arg(long, env = "RMM_API_URL")]
     api_url: Option<String>,
-    /// A command button for the side panel, as LABEL=COMMAND (e.g.
+    /// A command button for the Tools tab, as LABEL=COMMAND (e.g.
     /// "Network connections=ncpa.cpl"). Repeat for more. Without any, the
-    /// panel offers cmd, ncpa.cpl and mstsc.
+    /// tab offers cmd, ncpa.cpl and mstsc.
     #[arg(long = "command", value_name = "LABEL=COMMAND")]
     commands: Vec<QuickCommand>,
     /// No command buttons, rather than the defaults, when --command is not
@@ -146,26 +151,28 @@ struct Cli {
     #[arg(long)]
     display: Option<DisplayMode>,
     /// Frames a second to ask for: auto (the agent picks by network
-    /// speed), max, or a number such as 60. Also in the toolbar's FPS menu.
+    /// speed), max, or a number such as 60. Also in the header's FPS menu.
     #[arg(long, env = "RMM_VIEWER_FPS", default_value = "auto")]
     fps: FrameRate,
-    /// Bitwarden's command line client, for the Vault button. It must be
+    /// Bitwarden's command line client, for the Vault tab. It must be
     /// signed in (`bw login`). A session key in RMM_BW_SESSION (from the
     /// TUI) opens the vault without asking for the master password.
     #[arg(long, env = "RMM_BW", default_value = "bw", value_name = "PATH")]
     bw: PathBuf,
-    /// Start with the side panel hidden.
+    /// Start with no tab's panel open.
     #[arg(long)]
     no_panel: bool,
-    /// Text size of the toolbar, panel, menus and dialogs, in pixels
-    /// (before the display's scaling). Also in the toolbar's Text menu.
+    /// Text size of the header, panel, menus and dialogs (before the
+    /// display's scaling; 9 is the design's size). Also in the header's
+    /// Text menu.
     #[arg(long, env = "RMM_VIEWER_FONT_SIZE", default_value_t = ui::DEFAULT_FONT_PX,
           value_parser = clap::value_parser!(u32).range(i64::from(ui::MIN_FONT_PX)..=i64::from(ui::MAX_FONT_PX)))]
     font_size: u32,
-    /// Save the text size and display mode here whenever they are changed
-    /// in the viewer, as `{"font_size": N, "display": "fill"}`. The next
-    /// viewer starts in that display mode, and whoever starts it (the TUI)
-    /// can start it at that text size.
+    /// Save the text size, display mode and open tab here whenever they
+    /// are changed in the viewer, as `{"font_size": N, "display": "fill",
+    /// "panel": "vault"}`. The next viewer starts in that display mode
+    /// with that tab open, and whoever starts it (the TUI) can start it at
+    /// that text size.
     #[arg(long, alias = "remember-font-size", value_name = "FILE")]
     remember: Option<PathBuf>,
     /// Headless: decode frames, write the last one to this PPM file, exit.
@@ -214,7 +221,7 @@ fn main() -> anyhow::Result<()> {
     let api = match (&cli.api_url, api_token) {
         (Some(url), Some(token)) => Some(ApiClient::new(url, token, &ca_pem)?),
         (Some(_), None) => {
-            warn!("--api-url given without RMM_API_TOKEN: the side panel stays empty");
+            warn!("--api-url given without RMM_API_TOKEN: the status and tools stay empty");
             None
         }
         _ => None,
@@ -232,7 +239,14 @@ fn main() -> anyhow::Result<()> {
             .or_else(|| cli.remember.as_deref().and_then(ui::load_display))
             .unwrap_or_default(),
         frame_rate: cli.fps,
-        show_panel: !cli.no_panel,
+        tab: if cli.no_panel {
+            None
+        } else {
+            cli.remember
+                .as_deref()
+                .and_then(ui::load_panel)
+                .unwrap_or(Some(Tab::Vault))
+        },
         font_px: cli.font_size,
         settings_file: cli.remember,
         bw: Bw::new(cli.bw),
@@ -333,7 +347,7 @@ struct PanelSetup {
     commands: Vec<QuickCommand>,
     display: DisplayMode,
     frame_rate: FrameRate,
-    show_panel: bool,
+    tab: Option<Tab>,
     font_px: u32,
     settings_file: Option<PathBuf>,
     bw: Bw,
@@ -355,7 +369,7 @@ enum UserEvent {
     Vault(VaultEvent),
     Path(protocol::e2e::Path),
     Closed(String),
-    /// The agent's status for the side panel, or why it could not be had.
+    /// The agent's status for the panels, or why it could not be had.
     Details(Result<Box<AgentDetails>, String>),
     Notice {
         text: String,
@@ -561,7 +575,11 @@ fn windowed(options: ViewerOptions, monitor: Option<u32>, setup: PanelSetup) -> 
         frame_rate: setup.frame_rate,
         streamed_fps: None,
         window_title: String::new(),
-        show_panel: setup.show_panel,
+        tab: setup.tab,
+        last_tab: setup.tab.unwrap_or(Tab::Vault),
+        theme: Theme::from_env(),
+        glyphs: Glyphs::new(),
+        lent: None,
         fullscreen: false,
         scroll: 0,
         overlay: None,
@@ -888,7 +906,16 @@ struct App {
     streamed_fps: Option<u32>,
     /// The window title as last set (setting it is not free).
     window_title: String,
-    show_panel: bool,
+    /// The tab whose panel is open, and the one to open when the panel is
+    /// asked for without saying which.
+    tab: Option<Tab>,
+    last_tab: Tab,
+    /// The colours (the TUI's theme), and the typeface and icons as pixels.
+    theme: Theme,
+    glyphs: Glyphs,
+    /// Whether the agent holds a password the user lent, once it has said
+    /// something that tells.
+    lent: Option<bool>,
     fullscreen: bool,
     /// How far the panel is scrolled, in pixels.
     scroll: u32,
@@ -934,32 +961,55 @@ impl App {
             .unwrap_or_else(|| "-".into());
         // Sessions are end-to-end encrypted on either path.
         format!(
-            "RMM Viewer - {agent} - {monitor} - {:.0} fps - encrypted, {}",
+            "TetanusRMM Viewer - {agent} - {monitor} - {:.0} fps - encrypted, {}",
             self.fps, self.path
         )
     }
 
+    /// What the footer says of the session: how it is carried, or why
+    /// there is none.
     fn info(&self) -> String {
-        format!("{:.0} fps | encrypted, {}", self.fps, self.path)
+        match &self.status {
+            Some(status) => status.clone(),
+            None => format!("encrypted · {}", self.path),
+        }
+    }
+
+    /// The machine's name for the header, once the agent's details or at
+    /// least its id are known.
+    fn host(&self) -> &str {
+        self.details
+            .as_ref()
+            .and_then(|d| d.hostname.as_deref())
+            .or(self.agent_id.as_deref())
+            .unwrap_or("Connecting")
     }
 
     fn layout(&self) -> ui::Layout {
-        ui::layout(self.size.0, self.size.1, &self.metrics, self.show_panel)
+        ui::layout(self.size.0, self.size.1, &self.metrics, self.tab.is_some())
     }
 
     fn chrome<'a>(&'a self, info: &'a str) -> Chrome<'a> {
         Chrome {
             metrics: self.metrics,
             layout: self.layout(),
+            theme: &self.theme,
+            glyphs: &self.glyphs,
+            tab: self.tab,
             toolbar: ui::Toolbar {
+                host: self.host(),
                 display: self.display,
                 frame_rate: self.frame_rate,
                 streamed_fps: self.streamed_fps,
                 monitors: &self.monitors,
                 active_monitor: self.active,
-                panel: self.show_panel,
                 font_px: self.font_px,
-                info,
+                fullscreen: self.fullscreen,
+            },
+            footer: ui::Footer {
+                link: info,
+                live: self.status.is_none(),
+                fps: self.fps.round() as u32,
             },
             panel: ui::Panel {
                 api: self.api,
@@ -967,7 +1017,7 @@ impl App {
                 error: self.details_error.as_deref(),
                 commands: &self.commands,
                 busy: self.busy.as_deref(),
-                fullscreen: self.fullscreen,
+                lent: self.lent,
             },
             scroll: self.scroll,
             overlay: self.overlay.as_ref(),
@@ -1016,8 +1066,9 @@ impl App {
                 width,
                 desktop,
                 view,
+                self.theme.backdrop,
             ),
-            None => buffer.fill(render::BACKGROUND),
+            None => buffer.fill(self.theme.backdrop),
         }
         let mut canvas = render::Canvas {
             pixels: &mut buffer,
@@ -1031,12 +1082,19 @@ impl App {
                 (p.width, p.height),
                 view.pan,
                 (self.metrics.font / 4).max(3),
-                ui::colors::MUTED,
+                self.theme.muted,
             );
         }
         if let Some(status) = &self.status {
             // A little larger than the controls' text: it is the only thing there.
-            render::draw_status(&mut canvas, desktop, self.metrics.font * 4 / 3, status);
+            render::draw_status(
+                &mut canvas,
+                &self.glyphs,
+                desktop,
+                self.metrics.value(),
+                self.theme.text,
+                status,
+            );
         }
         chrome.draw(&mut canvas);
         let _ = buffer.present();
@@ -1396,7 +1454,7 @@ impl App {
         true
     }
 
-    /// The toolbar button for `action`, to hang its menu from.
+    /// The header's select box for `action`, to hang its menu from.
     fn anchor(&self, action: &Action) -> Rect {
         let info = String::new();
         self.chrome(&info)
@@ -1431,7 +1489,7 @@ impl App {
         }
     }
 
-    /// Do what a toolbar, panel or dialog button says.
+    /// Do what a header, rail, panel or dialog button says.
     fn act(&mut self, event_loop: &ActiveEventLoop, action: Action) {
         match action {
             Action::DisplayMenu
@@ -1511,8 +1569,8 @@ impl App {
                 }
             }
             Action::VaultFocus => {
-                // The B shortcut works with the panel hidden: show it.
-                self.show_panel = true;
+                // The B shortcut works whatever is open: show the vault.
+                self.open_tab(Some(Tab::Vault));
                 if self.vault.unlocked {
                     self.release_all();
                     self.vault.focused = true;
@@ -1557,10 +1615,9 @@ impl App {
                         .set_fullscreen(self.fullscreen.then_some(Fullscreen::Borderless(None)));
                 }
             }
+            Action::Tab(tab) => self.open_tab((self.tab != Some(tab)).then_some(tab)),
             Action::TogglePanel => {
-                self.vault.focused = false;
-                self.show_panel = !self.show_panel;
-                self.scroll = 0;
+                self.open_tab(self.tab.is_none().then_some(self.last_tab));
             }
             Action::Disconnect => event_loop.exit(),
             Action::Launch(index) => {
@@ -1689,8 +1746,59 @@ impl App {
         self.request_redraw();
     }
 
-    /// Save a choice (`font_size`, `display`) for the next viewer, if
-    /// asked to.
+    /// Open `tab`'s panel (`None`: close the panel), and remember it for
+    /// the next viewer.
+    fn open_tab(&mut self, tab: Option<Tab>) {
+        if tab == self.tab {
+            return;
+        }
+        // The search field goes out of sight: keys go to the remote again.
+        self.vault.focused = false;
+        self.tab = tab;
+        self.scroll = 0;
+        self.hover = None;
+        if let Some(tab) = tab {
+            self.last_tab = tab;
+        }
+        self.remember("panel", tab.map_or(ui::PANEL_CLOSED, Tab::key).into());
+    }
+
+    /// A file was dropped on the window: upload it, if that can be done
+    /// now.
+    fn dropped(&mut self, local: PathBuf) {
+        let allowed = self
+            .details
+            .as_ref()
+            .is_some_and(|d| d.online && d.can("file_transfer"));
+        if !allowed {
+            self.notify("Files cannot be uploaded to this agent now.", true);
+        } else if self.busy.is_some() || self.overlay.is_some() {
+            self.notify("Finish what is open first, then drop the file again.", true);
+        } else if !local.is_file() {
+            self.notify("Only single files can be uploaded.", true);
+        } else {
+            self.ask_upload_path(local);
+        }
+        self.request_redraw();
+    }
+
+    /// Ask where on the agent to put `local`.
+    fn ask_upload_path(&mut self, local: PathBuf) {
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = format!("{}{name}", self.remote_dir());
+        self.open(Overlay::Prompt(ui::Prompt {
+            title: format!("Upload {name} to which path on the agent?"),
+            text,
+            purpose: ui::PromptPurpose::Upload { local },
+            masked: false,
+        }));
+    }
+
+    /// Save a choice (`font_size`, `display`, `panel`) for the next
+    /// viewer, if asked to.
     fn remember(&self, key: &str, value: serde_json::Value) {
         let Some(path) = &self.settings_file else {
             return;
@@ -1714,7 +1822,7 @@ impl App {
     fn scroll_panel(&mut self, lines: f64) {
         let info = String::new();
         let max = self.chrome(&info).max_scroll();
-        let step = f64::from(self.metrics.line_h()) * 3.0;
+        let step = f64::from(self.metrics.button_h()) * 1.5;
         let scroll = (f64::from(self.scroll) - lines * step).clamp(0.0, f64::from(max));
         self.scroll = scroll as u32;
         self.request_redraw();
@@ -1795,6 +1903,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::DroppedFile(path) => self.dropped(path),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(size) => {
                 self.size = (size.width, size.height);
@@ -1969,6 +2078,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Credential(event) => {
                 info!(%event, "lent password");
+                match event {
+                    CredentialEvent::Stored | CredentialEvent::Typed => self.lent = Some(true),
+                    CredentialEvent::Forgotten | CredentialEvent::NotStored => {
+                        self.lent = Some(false)
+                    }
+                    CredentialEvent::Requested
+                    | CredentialEvent::Declined
+                    | CredentialEvent::Unavailable => {}
+                }
                 let (text, error) = credential_notice(event);
                 self.notify(text, error);
             }
@@ -2004,17 +2122,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Busy(busy) => self.busy = busy,
             UserEvent::UploadPicked(local) => {
                 self.busy = None;
-                let name = local
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let text = format!("{}{name}", self.remote_dir());
-                self.open(Overlay::Prompt(ui::Prompt {
-                    title: format!("Upload {name} to which path on the agent?"),
-                    text,
-                    purpose: ui::PromptPurpose::Upload { local },
-                    masked: false,
-                }));
+                self.ask_upload_path(local);
             }
             UserEvent::UploadExists { local, remote } => {
                 self.busy = None;
@@ -2043,7 +2151,7 @@ fn credential_notice(event: CredentialEvent) -> (&'static str, bool) {
         CredentialEvent::Requested => ("Asking the user for a password...", false),
         CredentialEvent::Stored => (
             "The user typed a password. It stays on their computer until the last \
-             session ends: use Type under LENT PASSWORD.",
+             session ends: use Type under LENT PASSWORD in the Vault tab.",
             false,
         ),
         CredentialEvent::Declined => ("The user did not give a password.", true),

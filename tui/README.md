@@ -12,9 +12,10 @@ directly. What it does:
   ID.
 - **Remote desktop:** starts the native viewer for the selected agent. The
   TUI doesn't render video itself. Quitting the TUI closes every viewer
-  window it opened. The viewer's side panel shows the agent's status and
-  has command buttons (`cmd`, `ncpa.cpl`, `mstsc`, ...) that you choose in
-  the TUI (`v`), plus file upload and download.
+  window it opened. The viewer's tabs show the agent's status and have
+  command buttons (`cmd`, `ncpa.cpl`, `mstsc`, ...) that you choose in
+  the TUI (`v`), plus file upload and download. Each viewer is drawn in
+  the colour theme picked in the TUI when it starts.
 - **Bitwarden:** unlock your vault once (`b`) and every viewer started
   afterwards can search it and type usernames, passwords and one-time codes
   on the remote machine. See [Bitwarden](#bitwarden).
@@ -160,7 +161,7 @@ check_updates = true                          # optional: look for a newer TUI a
 | `quic_addr` | `--quic-addr` | API host, port `4433` | The server's QUIC listener, for the viewer. The name is resolved to an address (IPv4 preferred), and the viewer checks the certificate against the name. |
 | `poll_interval` | | `5` | At least 1. |
 | `scripts_path` | | data dir `/scripts.json` | The saved-script library. |
-| `viewer_font_size` | | *(viewer default, 10)* | Text size of the viewer's toolbar and side panel, in pixels (6–32), until you pick one in a viewer (**Text** menu, or `Ctrl+Alt+Shift+-`/`=`). From then on viewers start at the size you last picked, remembered in `viewer.json` in the data directory; delete that file to go back to this setting. |
+| `viewer_font_size` | | *(viewer default, 9)* | Text size of the viewer's header and panels (6–32), until you pick one in a viewer (**Text** menu, or `Ctrl+Alt+Shift+-`/`=`). From then on viewers start at the size you last picked, remembered in `viewer.json` in the data directory; delete that file to go back to this setting. |
 
 | `check_updates` | | `true` | Whether to look for a newer TUI on the server after signing in. `U` looks either way. See [Updating](#updating). |
 | `bw_path` | | `bw` on `PATH` | Bitwarden's command line client, for [the vault](#bitwarden). On Windows, name the `.exe` (or npm's `bw.cmd`) by its full path. |
@@ -433,20 +434,32 @@ The token is passed in the `RMM_VIEWER_TOKEN` environment variable, not on
 the command line, so other local users can't read it from the process list.
 The viewer runs detached from the TUI, and you can open several at once.
 
-For its side panel the viewer also gets `--api-url <server_url>`, your
+For its panels the viewer also gets `--api-url <server_url>`, your
 session token in `RMM_API_TOKEN` (the environment again), and one
 `--command "LABEL=COMMAND"` per button. It acts through the API as you, so
 the server applies your access and audits what it does. It also gets
 `--remember-font-size <data dir>/viewer.json`: a text size you pick in a
 viewer is saved there, and the next viewer starts at it (see
 `viewer_font_size`). The display mode you pick (Scale, Stretch, Fill,
-Original size) is saved there too, and viewers start in the one used last.
+Original size) and the tab you leave open are saved there too, and viewers
+start as the last one was left.
 
-The viewer's toolbar holds the Display, FPS, Monitor and Text menus and the
-**Panel** toggle. Everything else is in the side panel: Disconnect, Full
-screen, Refresh and Ctrl+Alt+Del, [the vault](#bitwarden), the password the
-remote user lends, the agent's status, your command buttons and file
-transfer.
+The viewer's header shows the machine's name and holds the Display, FPS,
+Monitor and Text menus and the session's buttons: Refresh, Full screen,
+Ctrl+Alt+Del and Disconnect. The rail down the right edge has three tabs,
+each opening a panel beside the picture (click the open one to close it,
+or press `Ctrl+Alt+Shift+P`): **Vault** ([the vault](#bitwarden) and the
+password the remote user lends), **Status** (what the agent says about its
+machine) and **Tools** (your command buttons and file transfer; a file
+dropped on the window is uploaded too, except under Wayland). The footer
+says how the session is carried, how fast, who is signed in and how full
+the first disk is.
+
+The viewer is drawn in the TUI's colour theme: the one picked when the
+viewer starts (`t`, or one of your own from `e`) goes to it in the
+`RMM_VIEWER_THEME` environment variable. A viewer already open keeps the
+colours it started with, and with a theme of the terminal's own colours
+(Textual's `ansi` themes) viewers use the default theme's.
 
 **Quick assist** (`h`): for a computer with no agent installed.
 1. Tell the user the page address shown (**Copy** puts it on the clipboard).
@@ -462,8 +475,8 @@ buttons. The session lasts until they close quick assist. Until then their
 computer is in the agent table, so if you close the viewer, press `d` on it
 to open another (they are asked again).
 
-**Viewer buttons** (`v`): the command buttons shown in the viewer's side
-panel. Each starts its command on the agent's desktop as the signed-in
+**Viewer buttons** (`v`): the command buttons shown in the viewer's Tools
+tab. Each starts its command on the agent's desktop as the signed-in
 user, like the Run dialog: `cmd`, `ncpa.cpl`, `mstsc /v:server01`,
 `services.msc`... Add one with a label and a command (**Enter** in the
 command field adds it too), remove the highlighted one with **Remove** or
@@ -471,11 +484,11 @@ command field adds it too), remove the highlighted one with **Remove** or
 the standard set (Command prompt, Network connections, Remote desktop, Task
 manager, Services, Event viewer), and **Save** keeps the list in
 `state.json`. Viewers started afterwards show it; with an empty list the
-panel has no buttons.
+tab has no buttons.
 
 ### Bitwarden
 
-The **VAULT** section of the viewer's side panel searches your Bitwarden
+The viewer's **Vault** tab searches your Bitwarden
 vault and has the agent type a username, password or one-time code where
 the remote keyboard focus is: at the lock screen and UAC prompts too.
 
@@ -491,11 +504,11 @@ started from then on has the vault unlocked. A viewer started before that
 (or after the vault was locked) shows an **Unlock vault** button instead,
 which asks for the master password for that window only.
 
-Unlocked, the section has a search field with the items found under it.
+Unlocked, the tab has a search field with the items found under it.
 Click the field (or press `Ctrl+Alt+Shift+B`) so that keys go to it rather
 than to the remote machine, type part of an item's name and press Enter.
-Pick an item with the arrow keys, the wheel or the mouse, then **Username**,
-**Password** or **TOTP** (`Ctrl+U`, `Ctrl+P`, `Ctrl+T`). Once a value is
+Pick an item with the arrow keys, the wheel or the mouse, then **Type
+username**, **Type password** or **Type TOTP** (`Ctrl+U`, `Ctrl+P`, `Ctrl+T`). Once a value is
 typed the keyboard goes back to the remote machine, as it does with Esc or
 a click on the picture; the search and its results stay where they are.
 

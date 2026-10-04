@@ -24,7 +24,14 @@ from .scripts import ScriptLibrary
 from .state import UiState
 from .themes import DEFAULT_THEME, PREVIEW, THEMES
 from .trust import TrustStore, fetch_ca
-from .viewer import FONT_FILE, ViewerCommand, ViewerError, build_command, close_all
+from .viewer import (
+    FONT_FILE,
+    ViewerCommand,
+    ViewerError,
+    build_command,
+    close_all,
+    theme_colors,
+)
 from .viewer import launch as launch_process
 
 Launcher = Callable[[ViewerCommand, Path], "subprocess.Popen[bytes]"]
@@ -196,6 +203,7 @@ class RmmApp(App):
             commands=commands,
             font_file=self.state.path.with_name(FONT_FILE),
             bw_session=self.bw_session,
+            theme=theme_colors(self.current_theme),
         )
         return self.launch_viewer(command)
 

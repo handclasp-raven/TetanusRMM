@@ -18,6 +18,7 @@ from tetanus_rmm.api import Agent, ViewerSession
 from tetanus_rmm.commands import DEFAULT_COMMANDS, CommandError, QuickCommand, from_json
 from tetanus_rmm.config import Config, ConfigError, load, normalize_server_url
 from tetanus_rmm.state import UiState
+from tetanus_rmm.themes import THEMES
 from tetanus_rmm.viewer import (
     ViewerCommand,
     ViewerError,
@@ -26,6 +27,7 @@ from tetanus_rmm.viewer import (
     launch,
     pick_address,
     split_host_port,
+    theme_colors,
 )
 
 SESSION = ViewerSession("secret-token", datetime(2026, 9, 30, tzinfo=UTC), "agt-1", True)
@@ -538,3 +540,39 @@ def test_the_vault_session_key_and_bw_path_go_in_the_environment() -> None:
     # Locked, and no path configured: nothing about the vault is passed.
     plain = build_command(replace(config, bw_path=None), SESSION, resolve)
     assert plain.env == {"RMM_VIEWER_TOKEN": "secret-token"}
+
+
+def test_the_viewer_gets_the_tuis_theme_in_the_environment() -> None:
+    import json
+
+    from textual.theme import BUILTIN_THEMES
+
+    config = Config(
+        server_url="https://rmm.example.com:8443",
+        ca_path=Path("/ca.pem"),
+        viewer_path="/opt/viewer",
+    )
+    resolve = fake_resolve({"rmm.example.com": "203.0.113.5"})
+    tetanus = theme_colors(THEMES[0])
+    assert tetanus is not None
+    cmd = build_command(config, SESSION, resolve, theme=tetanus)
+    # In the environment: a viewer too old to know it is not put off.
+    assert not any("theme" in arg.lower() for arg in cmd.argv)
+    passed = json.loads(cmd.env["RMM_VIEWER_THEME"])
+    assert passed["primary"] == "#FF9000" and passed["background"] == "#020003"
+    assert passed["dark"] is True
+    # Every colour the viewer asks for, of every theme of ours, as #RRGGBB.
+    wanted = {"primary", "accent", "foreground", "background", "surface", "panel"}
+    wanted |= {"success", "warning", "error"}
+    for theme in THEMES:
+        colors = theme_colors(theme)
+        assert colors is not None and wanted <= colors.keys(), theme.name
+        assert all(len(str(colors[key])) == 7 for key in wanted), theme.name
+        assert colors["dark"] is theme.dark
+    assert theme_colors(next(t for t in THEMES if t.name == "github-light"))["dark"] is False
+    # A theme of the terminal's own colours has none to give: the viewer
+    # keeps its default.
+    ansi = next(t for t in BUILTIN_THEMES.values() if t.ansi)
+    assert theme_colors(ansi) is None
+    plain = build_command(config, SESSION, resolve, theme=theme_colors(ansi))
+    assert "RMM_VIEWER_THEME" not in plain.env

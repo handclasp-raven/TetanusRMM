@@ -7,7 +7,7 @@ Example ``config.toml``::
     viewer_path = "/opt/rmm/viewer"      # optional; default: the server's build
     quic_addr = "rmm.example.com:4433"   # optional; default: API host, port 4433
     poll_interval = 5
-    viewer_font_size = 9                 # optional; the viewer's default is 10
+    viewer_font_size = 9                 # optional; the viewer's default is 9
 
 None of it is required: the server is typed on the login screen, its CA is
 accepted there the first time (see ``trust``), and the viewer is downloaded
@@ -110,10 +110,10 @@ class Config:
     poll_interval: float = 5.0
     #: Saved-script library.
     scripts_path: Path = field(default_factory=lambda: data_dir() / "scripts.json")
-    #: Text size of the viewer's toolbar and panel, in pixels. ``None``: the
-    #: viewer's own default.
+    #: Text size of the viewer's header and panels (9 is the design's
+    #: size). ``None``: the viewer's own default.
     viewer_font_size: int | None = None
-    #: Bitwarden's command line client, for the viewer's Vault button: a
+    #: Bitwarden's command line client, for the viewer's Vault tab: a
     #: path, or a name looked up on PATH. ``None``: ``bw`` on PATH.
     bw_path: str | None = None
     #: Whether to look for a newer TUI on the server after signing in (it

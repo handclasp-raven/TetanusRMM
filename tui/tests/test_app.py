@@ -198,7 +198,10 @@ async def test_remote_desktop_launches_the_viewer_with_a_fresh_token(tmp_path) -
         BASE,
         *buttons,
     ]
-    # Both tokens stay out of the process list.
+    # Both tokens stay out of the process list; the viewer is dressed in
+    # the TUI's theme.
+    theme = json.loads(command.env.pop("RMM_VIEWER_THEME"))
+    assert theme["primary"] == "#FF9000" and theme["dark"] is True
     assert command.env == {"RMM_VIEWER_TOKEN": "vtok", "RMM_API_TOKEN": "sess"}
     assert "sess" not in command.argv
 
@@ -257,7 +260,7 @@ async def test_quick_assist_shows_a_code_and_opens_the_viewer_once_it_is_typed(t
     (command,) = launched
     # No command buttons in a quick assist session.
     assert "--no-default-commands" in command.argv and "--command" not in command.argv
-    assert command.env == {"RMM_VIEWER_TOKEN": "vtok", "RMM_API_TOKEN": "sess"}
+    assert set(command.env) == {"RMM_VIEWER_TOKEN", "RMM_API_TOKEN", "RMM_VIEWER_THEME"}
 
 
 async def test_an_expired_quick_assist_code_says_so_and_a_new_one_can_be_made(tmp_path) -> None:

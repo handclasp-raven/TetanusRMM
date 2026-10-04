@@ -114,7 +114,7 @@ winit = "0.30"
 # XDG desktop portal).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 softbuffer = "0.4"
-font8x8 = "0.3"
+fontdue = "0.9"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
